@@ -49,11 +49,10 @@ public class ZstdPaperEncoder extends ZstdBatchEncoderBase {
 
     @Override
     protected void onFrame(int rawBytes, int wireBytes, boolean compressed) {
-
         ZstdPaperMonitor.record(rawBytes, wireBytes);
         ZstdPaperChannelManager m = manager;
         if (m != null) {
-            m.stats.record(rawBytes, wireBytes, compressed);
+            m.stats.record(rawBytes, wireBytes);
         }
     }
 

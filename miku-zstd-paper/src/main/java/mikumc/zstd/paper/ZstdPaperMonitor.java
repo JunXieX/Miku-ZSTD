@@ -47,10 +47,29 @@ public final class ZstdPaperMonitor {
     private ZstdPaperMonitor() {
     }
 
-    // ─────────────── 数据采集 ───────────────
+    // ── 数据采集 ──
+
+    /**
+     * 采集开关（由 BossBar 监控开关控制）。
+     *
+     * <p>与 Velocity 端的 {@code ZstdTrafficStats} 保持一致：没人看的时候不必累计。
+     * 关闭时 {@link #record} 只剩一次 volatile 读，编码器热路径仍然极便宜。</p>
+     */
+    private static volatile boolean enabled;
+
+    public static void setEnabled(boolean value) {
+        enabled = value;
+    }
+
+    public static boolean isEnabled() {
+        return enabled;
+    }
 
     /** 编码器每次成帧后调用（热路径，仅两次加法）。 */
     public static void record(int rawBytes, int wireBytes) {
+        if (!enabled) {
+            return;
+        }
         TOTAL_RAW.add(rawBytes);
         TOTAL_WIRE.add(wireBytes);
     }
@@ -61,10 +80,6 @@ public final class ZstdPaperMonitor {
 
     public static void playerDeactivated() {
         ACTIVE_ZSTD.updateAndGet(v -> v > 0 ? v - 1 : 0);
-    }
-
-    public static int activePlayers() {
-        return ACTIVE_ZSTD.get();
     }
 
     /** 采样快照：本周期速率与压缩率。 */
@@ -115,6 +130,7 @@ public final class ZstdPaperMonitor {
         owner = player;
         bossBar = Bukkit.createBossBar("§bMiku-ZSTD", BarColor.GREEN, BarStyle.SEGMENTED_20);
         bossBar.addPlayer(player);
+        setEnabled(true);
         // 先取一次基线，避免第一次算速率时把历史累计当成 1 秒的量
         sample();
         MikuZstdPaper plugin = org.bukkit.plugin.java.JavaPlugin.getPlugin(MikuZstdPaper.class);
@@ -132,10 +148,7 @@ public final class ZstdPaperMonitor {
             bossBar = null;
         }
         owner = null;
-    }
-
-    public static synchronized boolean isRunning() {
-        return bossBar != null;
+        setEnabled(false);
     }
 
     private static void refresh() {

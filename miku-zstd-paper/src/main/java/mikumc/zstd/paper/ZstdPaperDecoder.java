@@ -31,25 +31,26 @@ public class ZstdPaperDecoder extends ZstdBatchDecoderBase {
         // 预留：入站统计出口
     }
 
-    /** 采样：解压帧按包拆开逐个提交（与编码器同理：整帧样本又大又少，达不到门槛）。 */
+    /** 直存帧也是字典收益的主战场（它们都是"小到不值得压缩"的包），必须采样。 */
+    @Override
+    protected boolean wantsStoredPayload() {
+        return true;
+    }
+
+    /** 直存帧采样：格式与解压帧相同，直接整帧批量提交。 */
+    @Override
+    protected void onStoredPayload(byte[] data) {
+        ZstdPaperTrainer.submitDecoderBatch(data, data.length);
+    }
+
+    /**
+     * 解压帧采样：整帧批量提交给训练器（与编码侧同一个做法）。
+     *
+     * <p>以前逐包 {@code new byte[]} + {@code arraycopy}，给每个入站包都在 event loop
+     * 上加一次堆分配，还顺带手写了一遍 varint 解析。</p>
+     */
     @Override
     protected void onDecodedPayload(byte[] data) {
-        if (data == null || data.length == 0) return;
-        int pos = 0;
-        while (pos < data.length) {
-            int pktLen = 0;
-            int shift = 0;
-            while (pos < data.length && shift <= 28) {
-                byte b = data[pos++];
-                pktLen |= (b & 0x7F) << shift;
-                if ((b & 0x80) == 0) break;
-                shift += 7;
-            }
-            if (pktLen <= 0 || pos + pktLen > data.length) break;
-            byte[] sample = new byte[pktLen];
-            System.arraycopy(data, pos, sample, 0, pktLen);
-            ZstdPaperTrainer.submitDecoderSample(sample);
-            pos += pktLen;
-        }
+        ZstdPaperTrainer.submitDecoderBatch(data, data.length);
     }
 }

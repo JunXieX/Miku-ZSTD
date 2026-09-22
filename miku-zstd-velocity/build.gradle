@@ -40,18 +40,9 @@ dependencies {
 // 所以把模块名放在 classifier 上，正好得到「版本号在前、模块名在后」的目标格式。
 
 // ── native 库瘦身 ────────────────────────────────────────────────────────────
-// zstd-jni 会把【所有平台】的原生库都打进来（18 个，约占 jar 体积的 93%），
-// 而 zstd 运行时只会加载匹配当前平台的那一个——其余平台既不占内存也不参与加载，
-// 纯粹是磁盘占用与分发耗时。
-// 这里只保留主流平台：Windows(x64/arm64)、Linux(x64/arm64)、macOS(x64/arm64)，
-// 足以覆盖本插件的实际部署与迁移场景。若将来要跑在别的架构上，
-// 从下面这个列表里删掉对应项即可（而不是整个删掉本段）。
-def slimNativeExcludes = [
-        'aix/**', 'freebsd/**',
-        'linux/riscv64/**', 'linux/ppc64/**', 'linux/ppc64le/**', 'linux/mips64/**',
-        'linux/loongarch64/**', 'linux/s390x/**', 'linux/i386/**', 'linux/arm/**',
-        'win/x86/**',
-]
+// 真正的裁剪规则是下面 shadowJar 里那一组 exclude；要改保留平台就直接改那里。
+// （这里曾有一个 def slimNativeExcludes 列表，定义了却从未被引用——
+//  它和 exclude 两组内容重复，只会在改配置时让人以为改它就生效了。）
 
 shadowJar {
     archiveClassifier.set('Velocity')

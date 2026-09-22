@@ -41,7 +41,7 @@ import static mikumc.zstd.protocol.ZstdDictAdoption.shouldAdoptDict;
  * <ol>
  *   <li><b>样本环不再永久冻结</b>：3.0.0 只在"采纳新字典"分支清空样本环，
  *       而未达改进阈值（默认 3%，真实流量下是常态）时直接 return——此时环已满
- *       （{@code sampleBytes >= sampleSize}），{@code addSample} 会永远早退，
+ *       （{@code sampleBytes >= sampleSize}），入环会永远早退，
  *       字典从此只会在同一批陈旧样本上重训。现在无论是否采纳，每轮训练结束后
  *       都会归档并清空样本环。</li>
  *   <li><b>历史样本不再重复累积</b>：旧实现每次保存都"读回历史 + 追加整个环 + 写回"，
@@ -162,17 +162,14 @@ public class ZstdSampleTrainer {
         ZstdDictRegistry.shutdown();
     }
 
-    public static void submitEncoderSample(byte[] packetBytes) {
-        ZstdSampleTrainer t = encoderInstance;
-        if (t != null) t.addSample(packetBytes);
-    }
-
-    public static void submitDecoderSample(byte[] packetBytes) {
-        ZstdSampleTrainer t = decoderInstance;
-        if (t != null) t.addSample(packetBytes);
-    }
-
-    /** 批量提交一帧（{@code [varint pktLen][pkt]...}）；见 {@link #addBatch}。 */
+    /**
+     * 批量提交一帧（{@code [varint pktLen][pkt]...}）；见 {@link #addBatch}。
+     *
+     * <p>编码方向与解码方向都走这里：两端各只有这一个入口。早期的"逐包提交"
+     * 入口（{@code submitEncoderSample} / {@code submitDecoderSample}）连同它们
+     * 依赖的 {@code addSample} 已删除——编码侧改成批量化后就没人调用了，
+     * 解码侧也在 3.1.0 补齐成批量提交。</p>
+     */
     public static void submitEncoderBatch(byte[] raw, int length) {
         ZstdSampleTrainer t = encoderInstance;
         if (t != null) t.addBatch(raw, length);
@@ -251,7 +248,7 @@ public class ZstdSampleTrainer {
      * <p>必须按包拆分——整批当一个样本的话，样本"个数"增长极慢（实测 1MB 数据只有 26 个），
      * 永远够不到 min_samples，字典训练形同虚设。</p>
      *
-     * <p>与逐包 {@link #addSample} 的区别：把「解析 + 过滤 + 复制」放在<b>锁外</b>完成，
+     * <p>要点：把「解析 + 过滤 + 复制」放在<b>锁外</b>完成，
      * 只在入环那一刻加一次锁。原来一帧几十个包就要几十次加锁 + 几十次训练判定，
      * 网络线程上这是白白的争用。（解析不放进锁内，是为了不让它拖长持锁时间。）</p>
      */
@@ -306,22 +303,6 @@ public class ZstdSampleTrainer {
         }
     }
 
-    private void addSample(byte[] packetBytes) {
-        if (packetBytes == null || packetBytes.length == 0) return;
-        if (!shouldKeep(packetBytes)) return;
-
-        int size;
-        synchronized (this) {
-            if (sampleBytes >= sampleSize) return;
-            sampleRing.add(packetBytes);
-            sampleBytes += packetBytes.length;
-            size = sampleRing.size();
-        }
-        if (size >= minSamples) {
-            maybeTrain();
-        }
-    }
-
     /** 判断是否满足训练条件（满足则以 training 原子标志占位，异步执行）。 */
     private void maybeTrain() {
         synchronized (this) {
@@ -346,7 +327,7 @@ public class ZstdSampleTrainer {
      * 训练 + 评估 + 采纳 + 归档 + 清空样本环（训练线程调用）。
      *
      * <p>关键：<b>无论是否采纳新字典，样本环都会归档并清空</b>。否则环一旦攒满，
-     * {@code addSample} 的容量早退会让它永久拒绝新样本，字典再无进化可能。</p>
+     * 入环时的容量早退会让它永久拒绝新样本，字典再无进化可能。</p>
      */
     private void trainAndAdopt() {
         try {

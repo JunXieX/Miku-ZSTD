@@ -38,7 +38,6 @@ public final class ZstdCompressPool {
     private static final LongAdder TOTAL_NANOS = new LongAdder();
     private static final AtomicLong SLOW_TASKS = new AtomicLong();
     private static final AtomicLong MAX_NANOS = new AtomicLong();
-    private static final AtomicLong REJECTED = new AtomicLong();
 
     private ZstdCompressPool() {
     }
@@ -70,7 +69,14 @@ public final class ZstdCompressPool {
         });
     }
 
-    /** 提交一个压缩任务（未初始化时按默认值自动初始化）。 */
+    /**
+     * 提交一个压缩任务（未初始化时按默认值自动初始化）。
+     *
+     * <p><b>队列无界，但实际有界</b>：编码器对每条连接最多只允许一个在途压缩任务
+     *（{@code ZstdBatchEncoderBase} 的 {@code compressing} 门），所以积压上限 ≈ 连接数。
+     * 这也是刻意不做反压的原因——拒绝任务等于丢包，而"队列短暂积压"只表现为延迟变大；
+     * {@link #backlogged()} 就是把这个信号暴露给运维，让他们去降 level 或加线程。</p>
+     */
     public static void execute(Runnable task) {
         if (pool == null) {
             init(0, 0);
@@ -95,7 +101,6 @@ public final class ZstdCompressPool {
         } catch (Throwable t) {
             // 池被关闭等极端情况：把计数还原，避免 ACTIVE 永久偏高
             ACTIVE.decrementAndGet();
-            REJECTED.incrementAndGet();
             throw t;
         }
     }

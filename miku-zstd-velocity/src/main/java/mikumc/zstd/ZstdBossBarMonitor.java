@@ -90,10 +90,6 @@ public final class ZstdBossBarMonitor {
         }
     }
 
-    public static boolean isRunning() {
-        return bossBar != null;
-    }
-
     private static void refresh() {
         BossBar bar = bossBar;
         Player viewer = owner;

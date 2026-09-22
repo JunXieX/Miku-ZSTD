@@ -66,17 +66,16 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
     /** 在途压缩任务持有的 promise（仅 event loop 线程读写）；通道关闭时需一并失败化 */
     private List<ChannelPromise> inflightPromises;
 
-    /**
-     * 压缩线程池（共享实现见 {@link ZstdCompressPool}）。
-     *
-     * <p><b>为什么压缩必须离开 event loop</b>：在 event loop 上同步压缩时，一个玩家的大批次
-     * （几毫秒）会阻塞<b>同一 event loop 上所有其他玩家</b>的包处理 —— 表现为"延迟随在线人数
-     * 放大"的抖动，而且在 ping 上看不出来（它是突发性的，不是固定开销）。</p>
-     *
-     * <p>池的规模、活跃/排队数、单次耗时都在 {@code ZstdCompressPool} 里统一统计，
-     * 命令层可直接取摘要——"要不要降 level / 加线程"只能靠这些数字判断。</p>
-     */
-
+    // ── 压缩线程池 ───────────────────────────────────────────────────────────
+    // 共享实现在 ZstdCompressPool，本类只调用它的静态入口。
+    //
+    // 为什么压缩必须离开 event loop：在 event loop 上同步压缩时，一个玩家的大批次
+    //（几毫秒）会阻塞同一 event loop 上所有其他玩家的包处理——表现为"延迟随在线人数
+    // 放大"的抖动，而且 ping 上看不出来（它是突发性的，不是固定开销）。
+    //
+    // 池的规模、活跃/排队数、单次耗时都在 ZstdCompressPool 里统一统计，
+    // 命令层可直接取摘要——"要不要降 level / 加线程"只能靠这些数字判断。
+    //（这里原本挂了一段 javadoc，但其后紧跟的是别的字段，等于一段没有归属的注释。）
 
     private int batchWindowMs = 3;
     private int batchMaxPackets = 64;
@@ -195,7 +194,7 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
     }
 
     /**
-     * 成帧并写出。压缩路径会<b>卸载到 {@link #COMPRESS_POOL}</b>，
+     * 成帧并写出。压缩路径会<b>卸载到 {@link ZstdCompressPool}</b>，
      * 直存路径（小包）仍在 event loop 上完成——它本来就不调用 zstd，多绕一次线程池不划算。
      */
     private void emitBatch(ChannelHandlerContext ctx) {

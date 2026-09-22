@@ -27,8 +27,8 @@ public class ZstdPaperChannelManager {
 
     public static final AttributeKey<ZstdPaperChannelManager> KEY =
             AttributeKey.valueOf("miku-zstd:manager");
+    /** 协商协议版本（三端必须一致）。帧长度上限见 {@link ZstdVarInts#DEFAULT_MAX_VALUE}。 */
     public static final int PROTOCOL_VERSION = 4;
-    public static final int MAX_COMPRESSED_FRAME_SIZE = ZstdVarInts.DEFAULT_MAX_VALUE;
 
     /** 本连接的压缩统计（/mikuzstd top 用），close 时注销 */
     public final mikumc.zstd.protocol.ZstdConnStats stats = new mikumc.zstd.protocol.ZstdConnStats();

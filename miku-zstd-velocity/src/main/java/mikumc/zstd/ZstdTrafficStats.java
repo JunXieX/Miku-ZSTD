@@ -52,10 +52,6 @@ public final class ZstdTrafficStats {
         ACTIVE_ZSTD.updateAndGet(v -> v > 0 ? v - 1 : 0);
     }
 
-    public static int activePlayers() {
-        return ACTIVE_ZSTD.get();
-    }
-
     /** 重置采样基线：开启监控时先调一次，避免把历史累计当成 1 秒的量。 */
     public static synchronized void resetBaseline() {
         lastSampleMs = System.currentTimeMillis();

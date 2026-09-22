@@ -142,17 +142,13 @@ public final class ZstdPaperTrainer {
         if (d != null) d.archiveUnsaved();
     }
 
-    public static void submitEncoderSample(byte[] packetBytes) {
-        ZstdPaperTrainer t = encoderInstance;
-        if (t != null) t.addSample(packetBytes);
-    }
-
-    public static void submitDecoderSample(byte[] packetBytes) {
-        ZstdPaperTrainer t = decoderInstance;
-        if (t != null) t.addSample(packetBytes);
-    }
-
-    /** 批量提交一帧（{@code [varint pktLen][pkt]...}）；见 {@link #addBatch}。 */
+    /**
+     * 批量提交一帧（{@code [varint pktLen][pkt]...}）；见 {@link #addBatch}。
+     *
+     * <p>编码与解码两个方向都走这里。早期的"逐包提交"入口
+     *（{@code submitEncoderSample} / {@code submitDecoderSample}）及其依赖的
+     * {@code addSample} 已删除——编码侧批量化后就没人调用，解码侧也已改为批量提交。</p>
+     */
     public static void submitEncoderBatch(byte[] raw, int length) {
         ZstdPaperTrainer t = encoderInstance;
         if (t != null) t.addBatch(raw, length);
@@ -218,29 +214,13 @@ public final class ZstdPaperTrainer {
         te.execute(this::trainAndAdopt);
     }
 
-    private void addSample(byte[] packetBytes) {
-        if (packetBytes == null || packetBytes.length == 0) return;
-        if (!shouldKeep(packetBytes)) return;
-
-        int size;
-        synchronized (this) {
-            if (sampleBytes >= sampleSize) return;
-            ring.add(packetBytes);
-            sampleBytes += packetBytes.length;
-            size = ring.size();
-        }
-        if (size >= minSamples) {
-            maybeTrain();
-        }
-    }
-
     /**
      * 拆分整帧并批量入环：帧格式为 {@code [varint pktLen][pkt]...}。
      *
      * <p>必须按包拆分——整批当一个样本的话，样本"个数"增长极慢，永远够不到 min_samples，
      * 字典训练形同虚设。</p>
      *
-     * <p>与逐包 {@link #addSample} 的区别：「解析 + 过滤 + 复制」都在<b>锁外</b>完成，
+     * <p>要点：「解析 + 过滤 + 复制」都在<b>锁外</b>完成，
      * 只在入环那一刻加一次锁。原来一帧几十个包就要几十次加锁与训练判定，
      * 在 Netty 网络线程上是白白的争用。</p>
      */

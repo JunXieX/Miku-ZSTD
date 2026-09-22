@@ -61,7 +61,7 @@ public class ZstdBatchEncoder extends ZstdBatchEncoderBase {
         ZstdTrafficStats.record(rawBytes, wireBytes);
         ZstdChannelManager m = manager;
         if (m != null) {
-            m.stats.record(rawBytes, wireBytes, compressed);
+            m.stats.record(rawBytes, wireBytes);
         }
     }
 

@@ -110,8 +110,35 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
      * 解压帧的数据采样回调（供字典训练使用）。
      *
      * <p>默认空实现。传入的 {@code data} 是本帧独占的新数组，采样方可直接持有引用。</p>
+     *
+     * <p><b>实现建议</b>：整帧一次性交给采样方（格式与直存帧相同，都是
+     * {@code [varint pktLen][pkt]...}），由采样方在锁外解析、只为真正入库的样本拷贝。
+     * 早期实现在这里逐包 {@code new byte[]} + {@code arraycopy}，等于给每个入站包
+     * 都加了一次堆分配——而编码侧早已改成整批提交。</p>
      */
     protected void onDecodedPayload(byte[] data) {
+    }
+
+    /**
+     * 直存帧的负载采样回调（{@code data} 的格式与解压帧相同：{@code [varint pktLen][pkt]...}）。
+     *
+     * <p>默认空实现。<b>直存帧恰恰是字典收益的主战场</b>——按定义它们都是"小到不值得压缩"
+     * 的包。早期实现只对解压帧采样，于是入站训练集里只有大包，字典在最该发力的地方
+     * 反而没有样本。只对服务端两侧有意义（客户端不训练字典）。</p>
+     *
+     * <p>需要采样的子类必须同时覆写 {@link #wantsStoredPayload()} 返回 {@code true}，
+     * 否则本方法不会被调用——这样不需要采样的一端不必为此付出一次拷贝。</p>
+     */
+    protected void onStoredPayload(byte[] data) {
+    }
+
+    /**
+     * 是否需要直存帧的负载采样。
+     *
+     * <p>默认 {@code false}：不需要采样的一端（Fabric 客户端）连拷贝都不会发生。</p>
+     */
+    protected boolean wantsStoredPayload() {
+        return false;
     }
 
     /**
@@ -162,6 +189,13 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
         if (rawSize == 0) {
             // 直存帧：payload 就在输入缓冲里，用 retained slice 零拷贝切分
             onStoredFrame(remaining);
+            if (wantsStoredPayload()) {
+                // 直存帧按定义一定不大（超过阈值就会被压缩），整帧拷一份的代价可忽略；
+                // 但采样方要求"独占数组"（帧缓冲会被复用），所以这里必须拷。
+                byte[] stored = new byte[remaining];
+                in.getBytes(in.readerIndex(), stored, 0, remaining);
+                onStoredPayload(stored);
+            }
             splitAndEmit(ctx, in, remaining, out);
             return;
         }

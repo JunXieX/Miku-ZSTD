@@ -35,7 +35,7 @@ public final class ZstdConnStats {
     }
 
     /** 编码器每帧回调（热路径，只做三次加法）。 */
-    public void record(int raw, int wire, boolean compressed) {
+    public void record(int raw, int wire) {
         rawBytes.add(raw);
         wireBytes.add(wire);
         frames.increment();
@@ -44,11 +44,6 @@ public final class ZstdConnStats {
     /** 连接关闭时注销（由 ChannelManager#close 调用）。 */
     public void remove() {
         ACTIVE.remove(this);
-    }
-
-    /** 当前活跃的 zstd 连接数。 */
-    public static int activeCount() {
-        return ACTIVE.size();
     }
 
     /** 按「原始字节」降序取前 n 条摘要，供命令输出。 */

@@ -31,9 +31,7 @@ public class ZstdChannelManager {
     public static final AttributeKey<TransportState> ZSTD_STATE = AttributeKey.valueOf("zstd:state");
     public static final AttributeKey<ZstdChannelManager> KEY = AttributeKey.valueOf("zstd:manager");
 
-    /** 单帧长度上限：32MB（26.x configuration 阶段存在超大 Registry 包） */
-    public static final int MAX_COMPRESSED_FRAME_SIZE = ZstdVarInts.DEFAULT_MAX_VALUE;
-    /** 协议 v3：帧头精简 + 一帧多包批处理 */
+    /** 协商协议版本（三端必须一致）。帧长度上限见 {@link ZstdVarInts#DEFAULT_MAX_VALUE}。 */
     public static final int PROTOCOL_VERSION = 4;
 
     private final ZstdCompressCtx compressCtx;
