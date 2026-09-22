@@ -16,6 +16,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.fail;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -139,8 +140,8 @@ class FrameLayoutTest {
         assertEquals(0, rawSize);
         assertEquals(afterBodyLen, bodyLen);
 
-        assertArrayEquals(new byte[][]{p1, p2, p3}, drainPackets(frame),
-                "三个包应按顺序出现在同一帧里");
+        assertArrayEquals(new byte[][]{fullPacket(p1), fullPacket(p2), fullPacket(p3)},
+                drainPackets(frame), "三个包应按顺序出现在同一帧里");
         assertEquals(1, encoder.frames.size(), "三包应只产生一帧");
         assertNull(readFrame(ch), "不应有第二帧");
     }
@@ -182,8 +183,12 @@ class FrameLayoutTest {
 
         feed(in, frame);
         List<byte[]> got = drainInbound(in);
-        assertEquals(1, got.size());
-        assertArrayEquals(payload, got.get(0), "解压后应与原始包一致");
+        if (got.isEmpty()) {
+            // 解码器拒绝帧时会自行 LOGGER.warn 出原因（测试用 slf4j-simple 打到 stderr），
+            // 这里补一句上下文，免得只看到"没产出包"而无从下手
+            fail("解压帧未被还原：channelOpen=" + in.isOpen() + "，帧体=" + frame.readableBytes() + "B");
+        }
+        assertArrayEquals(fullPacket(payload), got.get(0), "解压后应与原始包一致（含包 id）");
     }
 
     // ────────────────────────────────────────────────────────────────
@@ -271,9 +276,9 @@ class FrameLayoutTest {
 
         List<byte[]> sent = new ArrayList<>();
         for (int i = 0; i < total; i++) {
-            byte[] p = repetitive(20 + i);
-            sent.add(p);
-            out.writeOutbound(packet(p));
+            byte[] payload = repetitive(20 + i);
+            sent.add(fullPacket(payload)); // 编码器看到的是含包 id 的完整包
+            out.writeOutbound(packet(payload));
         }
 
         List<byte[]> got = new ArrayList<>();
@@ -374,6 +379,14 @@ class FrameLayoutTest {
             }
         }
         return null;
+    }
+
+    /** 造一个"编码器看到的完整包"字节数组（1 字节包 id + 负载）。 */
+    private static byte[] fullPacket(byte[] payload) {
+        byte[] out = new byte[payload.length + 1];
+        out[0] = 0x2A;
+        System.arraycopy(payload, 0, out, 1, payload.length);
+        return out;
     }
 
     /** 编码器收到的就是"已含包 id 的裸包"，这里补一个单字节包 id。 */
