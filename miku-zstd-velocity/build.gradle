@@ -1,0 +1,114 @@
+plugins {
+    id 'java'
+    id 'com.gradleup.shadow' version '8.3.9'
+}
+
+group = 'mikumc.zstd'
+version = '4.2.3-Beta'
+
+repositories {
+    mavenCentral()
+    maven {
+        name = "papermc-repo"
+        url = "https://repo.papermc.io/repository/maven-public/"
+    }
+}
+
+dependencies {
+    // Velocity 4.x API（4.2.0 为当前最新正式版，兼容 4.0.0+ 运行时）
+    compileOnly("com.velocitypowered:velocity-api:4.2.0")
+    // Velocity 内部类型（SetCompressionPacket / LoginPluginResponsePacket / MinecraftPacket）
+    // 已改为运行期反射访问（见 ZstdHijacker 的同名字段），编译只依赖下面的 velocity-api，
+    // 不再需要 velocity-proxy.jar —— 该 jar 不在任何公开 Maven 仓库里，以前缺了就根本编不过。
+    // 本地若恰好有同版本 proxy jar，仍可用 -PvelocityProxyJar=<路径> 挂上（仅供 IDE 补全/交叉检查），
+    // 缺失不影响编译与产物。
+    def proxyJar = file(findProperty('velocityProxyJar') ?: 'libs/velocity-proxy.jar')
+    if (proxyJar.exists()) {
+        compileOnly(files(proxyJar))
+    }
+    annotationProcessor("com.velocitypowered:velocity-api:4.2.0")
+    // Netty 由 Velocity 运行时提供，仅用于编译
+    compileOnly("io.netty:netty-all:4.1.107.Final")
+    // zstd-jni：原生库随 shadowJar 打包
+    implementation("com.github.luben:zstd-jni:1.5.7-17")
+    // Velocity 4 可能不再自带 snakeyaml，随插件打包兜底
+    implementation("org.yaml:snakeyaml:2.2")
+}
+
+// 产物命名：Miku-ZSTD-<版本>-Velocity.jar
+// Gradle 的文件名格式固定为 archivesName-archiveVersion-archiveClassifier，
+// 所以把模块名放在 classifier 上，正好得到「版本号在前、模块名在后」的目标格式。
+
+// ── native 库瘦身 ────────────────────────────────────────────────────────────
+// zstd-jni 会把【所有平台】的原生库都打进来（18 个，约占 jar 体积的 93%），
+// 而 zstd 运行时只会加载匹配当前平台的那一个——其余平台既不占内存也不参与加载，
+// 纯粹是磁盘占用与分发耗时。
+// 这里只保留主流平台：Windows(x64/arm64)、Linux(x64/arm64)、macOS(x64/arm64)，
+// 足以覆盖本插件的实际部署与迁移场景。若将来要跑在别的架构上，
+// 从下面这个列表里删掉对应项即可（而不是整个删掉本段）。
+def slimNativeExcludes = [
+        'aix/**', 'freebsd/**',
+        'linux/riscv64/**', 'linux/ppc64/**', 'linux/ppc64le/**', 'linux/mips64/**',
+        'linux/loongarch64/**', 'linux/s390x/**', 'linux/i386/**', 'linux/arm/**',
+        'win/x86/**',
+]
+
+shadowJar {
+    archiveClassifier.set('Velocity')
+
+    // 裁掉不会部署本插件的平台（18 个原生库约占 jar 体积的 93%，而运行时只会
+    // 加载匹配当前平台的那一个——其余既不占内存也不参与加载，纯粹是磁盘与分发开销）。
+    // 保留：Windows(x64/arm64)、Linux(x64/arm64)、macOS(x64/arm64)。
+    // 要跑在别的架构上时，从下面删掉对应那一行即可。
+    exclude 'aix/**'
+    exclude 'freebsd/**'
+    exclude 'linux/riscv64/**'
+    exclude 'linux/ppc64/**'
+    exclude 'linux/ppc64le/**'
+    exclude 'linux/mips64/**'
+    exclude 'linux/loongarch64/**'
+    exclude 'linux/s390x/**'
+    exclude 'linux/i386/**'
+    exclude 'linux/arm/**'
+    exclude 'win/x86/**'
+}
+
+def targetJavaVersion = 25
+java {
+    toolchain.languageVersion = JavaLanguageVersion.of(targetJavaVersion)
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release.set(targetJavaVersion)
+    // 开启全部静态检查。其中 -processing 被显式关掉：
+    // Velocity 的注解处理器只消费 @Plugin，而 @DataDirectory/@Subscribe/@Inject
+    // 本来就不该被它消费，javac 会为此报"注解未被处理"——属噪声，非问题。
+    options.compilerArgs << '-Xlint:all' << '-Xlint:-processing'
+}
+
+def templateSource = file('src/main/templates')
+def templateDest = layout.buildDirectory.dir('generated/sources/templates')
+def generateTemplates = tasks.register('generateTemplates', Copy) { task ->
+    def props = ['version': project.version]
+    task.inputs.properties props
+
+    task.from templateSource
+    task.into templateDest
+    task.expand props
+}
+
+sourceSets.main.java.srcDir(generateTemplates.map { it.outputs })
+
+// ── 共享协议模块 ─────────────────────────────────────────────────────────────
+// 两端引用同一份源码（miku-zstd-protocol/）：帧格式、VarInt、批处理与切包逻辑
+// 对"逐字节对称"的要求极高，单一实现可在结构上杜绝跨端漂移。
+// 该模块不是独立 Gradle 工程（本项目两个模块各自独立构建），因此用 srcDir
+// 引用共享源码目录——共享代码会被编译进各自的 jar，无需额外的打包配置。
+sourceSets {
+    main {
+        java {
+            srcDir(new File(rootDir.parentFile, 'miku-zstd-protocol/src/main/java'))
+        }
+    }
+}

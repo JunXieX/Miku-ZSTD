@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "id": "miku_zstd",
+  "version": "4.2.3-Beta",
+  "name": "Miku-ZSTD",
+  "description": "面向 Minecraft 26.2+ / Velocity 4.x 的高性能 zstd 压缩管道：替代原版 zlib，带宽占用大幅降低。需搭配服务端 Miku-ZSTD 插件使用。",
+  "authors": [
+    "JunXieX"
+  ],
+  "contact": {
+    "homepage": "https://modrinth.com/plugin/miku-zstd-velocity"
+  },
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "cn.miku.zstd.fabric.client.ZstdFabricClient"
+    ]
+  },
+  "mixins": [
+    "miku_zstd.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.19.3",
+    "minecraft": ">=26.2",
+    "java": ">=25",
+    "fabric-api": "*"
+  }
+}

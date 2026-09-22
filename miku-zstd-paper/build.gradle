@@ -1,0 +1,82 @@
+plugins {
+    id 'java'
+    id 'com.gradleup.shadow' version '8.3.9'
+}
+
+group = 'mikumc.zstd'
+version = '4.2.3-Beta'
+
+base {
+    archivesName = 'Miku-ZSTD'
+}
+
+repositories {
+    mavenCentral()
+    maven { url = 'https://repo.papermc.io/repository/maven-public/' }
+}
+
+dependencies {
+    // 纯 Paper：只依赖 paper-api（不引入 spigot-api / bukkit 兼容层）
+    compileOnly("io.papermc.paper:paper-api:26.2.build.124-stable")
+    // Netty 由服务端提供（MC 26.x 未混淆，反射即可访问管线）
+    compileOnly("io.netty:netty-all:4.1.107.Final")
+    // zstd：Paper 服务端自带 zstd-jni 1.5.7-15（在 META-INF/libraries 中），
+    // 但插件类加载器访问不到，因此随插件打包 1.5.7-17，避免版本/可见性歧义。
+    implementation("com.github.luben:zstd-jni:1.5.7-17")
+    implementation("org.yaml:snakeyaml:2.2")
+}
+
+// 共享协议模块（与 Velocity / Fabric 端同一份源码）
+sourceSets {
+    main {
+        java {
+            srcDir(new File(rootDir.parentFile, 'miku-zstd-protocol/src/main/java'))
+        }
+    }
+}
+
+def targetJavaVersion = 25
+java {
+    toolchain.languageVersion = JavaLanguageVersion.of(targetJavaVersion)
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release.set(targetJavaVersion)
+    options.compilerArgs << '-Xlint:all' << '-Xlint:-processing'
+}
+
+
+// ── native 库瘦身 ────────────────────────────────────────────────────────────
+// zstd-jni 会把【所有平台】的原生库都打进来（18 个，约占 jar 体积的 93%），
+// 而 zstd 运行时只会加载匹配当前平台的那一个——其余平台既不占内存也不参与加载，
+// 纯粹是磁盘占用与分发耗时。
+// 这里只保留主流平台：Windows(x64/arm64)、Linux(x64/arm64)、macOS(x64/arm64)，
+// 足以覆盖本插件的实际部署与迁移场景。若将来要跑在别的架构上，
+// 从下面这个列表里删掉对应项即可（而不是整个删掉本段）。
+def slimNativeExcludes = [
+        'aix/**', 'freebsd/**',
+        'linux/riscv64/**', 'linux/ppc64/**', 'linux/ppc64le/**', 'linux/mips64/**',
+        'linux/loongarch64/**', 'linux/s390x/**', 'linux/i386/**', 'linux/arm/**',
+        'win/x86/**',
+]
+
+shadowJar {
+    archiveClassifier.set('Paper')
+
+    // 裁掉不会部署本插件的平台（18 个原生库约占 jar 体积的 93%，而运行时只会
+    // 加载匹配当前平台的那一个——其余既不占内存也不参与加载，纯粹是磁盘与分发开销）。
+    // 保留：Windows(x64/arm64)、Linux(x64/arm64)、macOS(x64/arm64)。
+    // 要跑在别的架构上时，从下面删掉对应那一行即可。
+    exclude 'aix/**'
+    exclude 'freebsd/**'
+    exclude 'linux/riscv64/**'
+    exclude 'linux/ppc64/**'
+    exclude 'linux/ppc64le/**'
+    exclude 'linux/mips64/**'
+    exclude 'linux/loongarch64/**'
+    exclude 'linux/s390x/**'
+    exclude 'linux/i386/**'
+    exclude 'linux/arm/**'
+    exclude 'win/x86/**'
+}

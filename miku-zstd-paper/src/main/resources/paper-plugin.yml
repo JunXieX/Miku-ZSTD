@@ -1,0 +1,8 @@
+# Miku-ZSTD — Paper 端（纯 Paper，无 Bukkit/Spigot 兼容层）
+name: Miku-ZSTD
+version: 4.2.3-Beta
+main: mikumc.zstd.paper.MikuZstdPaper
+api-version: 1.26
+authors: [JunXieX]
+description: 用 zstd 替代原版 zlib 压缩玩家连接的网络流量（需客户端安装 Miku-ZSTD 模组）
+website: https://github.com/JunXieX

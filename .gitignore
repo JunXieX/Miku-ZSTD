@@ -1,0 +1,49 @@
+# ===== 构建产物 =====
+build/
+target/
+out/
+*.jar
+*.war
+*.zip
+*.tar.gz
+
+# Gradle Wrapper 的 jar 属于构建工具本体，必须入库。
+# 注意必须写成 **/ 形式：三个模块是各自独立的 Gradle 工程，wrapper 在各模块目录里，
+# 只写 gradle/wrapper/... 会被 Git 当成锚定到仓库根目录，子模块的 wrapper jar 就漏掉了。
+!**/gradle/wrapper/gradle-wrapper.jar
+
+# ===== 构建缓存 =====
+.gradle/
+gradle-app.setting
+.mvn/wrapper/maven-wrapper.jar
+
+# ===== 本地构建依赖目录（velocity-proxy.jar 等第三方 jar，不入库） =====
+libs/
+
+# ===== IDE =====
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+*.swp
+*.swo
+
+# ===== 运行环境 / 日志 =====
+run/
+runs/
+logs/
+plugins/
+*.log
+crash-reports/
+
+# ===== 系统 =====
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== 本地工作记录（不属于插件源码） =====
+.workbuddy/
+
+# ===== 本地整理的内部文档（不随仓库发布） =====
+MikuZSTD-源码解读.md

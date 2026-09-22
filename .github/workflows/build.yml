@@ -1,0 +1,92 @@
+name: Build
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  # 三个模块各自是独立的 Gradle 工程（各有自己的 wrapper），并行构建互不干扰。
+  velocity:
+    name: Velocity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: 'temurin'
+          cache: gradle
+      - name: Build
+        working-directory: miku-zstd-velocity
+        run: |
+          chmod +x ./gradlew
+          ./gradlew shadowJar --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Miku-ZSTD-Velocity
+          path: miku-zstd-velocity/build/libs/Miku-ZSTD-*-Velocity.jar
+          if-no-files-found: error
+
+  paper:
+    name: Paper
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: 'temurin'
+          cache: gradle
+      - name: Build
+        working-directory: miku-zstd-paper
+        run: |
+          chmod +x ./gradlew
+          ./gradlew shadowJar --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Miku-ZSTD-Paper
+          path: miku-zstd-paper/build/libs/Miku-ZSTD-*-Paper.jar
+          if-no-files-found: error
+
+  fabric:
+    name: Fabric
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: 'temurin'
+          cache: gradle
+      - name: Build
+        working-directory: miku-zstd-fabric
+        run: |
+          chmod +x ./gradlew
+          ./gradlew build --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Miku-ZSTD-Fabric
+          path: miku-zstd-fabric/build/libs/Miku-ZSTD-*-Fabric.jar
+          if-no-files-found: error
+
+  release:
+    name: Release
+    needs: [velocity, paper, fabric]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: List artifacts
+        run: ls -R dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.jar
+          prerelease: ${{ contains(github.ref_name, 'Beta') }}
+          generate_release_notes: true

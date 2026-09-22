@@ -1,0 +1,156 @@
+plugins {
+    id 'java'
+    // Minecraft 26.1+ 起游戏未混淆，Loom 换用新插件 ID，且不再需要 mappings
+    id 'net.fabricmc.fabric-loom' version '1.17.21'
+}
+
+group = project.maven_group
+version = project.mod_version
+
+base {
+    archivesName = project.archives_base_name
+}
+
+// 产物命名：Miku-ZSTD-<版本>-Fabric.jar（模块名走 classifier，与 Velocity 端保持一致）
+// 注意：MC 26.x 起游戏未混淆，Loom 不再产生 remapJar 任务，主产物直接来自 jar 任务。
+tasks.named('jar') {
+    archiveClassifier = 'Fabric'
+}
+
+repositories {
+    mavenCentral()
+    maven { url = 'https://maven.aliyun.com/repository/public' }
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+
+    // zstd 原生库与 YAML 解析，随 mod jar 嵌套打包
+    implementation 'com.github.luben:zstd-jni:1.5.7-17'
+    include 'com.github.luben:zstd-jni:1.5.7-17'
+    implementation 'org.yaml:snakeyaml:2.2'
+    include 'org.yaml:snakeyaml:2.2'
+}
+
+def targetJavaVersion = 25
+java {
+    toolchain.languageVersion = JavaLanguageVersion.of(targetJavaVersion)
+    withSourcesJar()
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release.set(targetJavaVersion)
+    // 开启全部静态检查。其中 -processing 被显式关掉：
+    // Velocity 的注解处理器只消费 @Plugin，而 @DataDirectory/@Subscribe/@Inject
+    // 本来就不该被它消费，javac 会为此报"注解未被处理"——属噪声，非问题。
+    options.compilerArgs << '-Xlint:all' << '-Xlint:-processing'
+}
+
+// ── 共享协议模块 ─────────────────────────────────────────────────────────────
+// 两端引用同一份源码（miku-zstd-protocol/）：帧格式、VarInt、批处理与切包逻辑
+// 对"逐字节对称"的要求极高，单一实现可在结构上杜绝跨端漂移。
+// 该模块不是独立 Gradle 工程（本项目两个模块各自独立构建），因此用 srcDir
+// 引用共享源码目录——共享代码会被编译进各自的 jar，无需额外的打包配置。
+sourceSets {
+    main {
+        java {
+            srcDir(new File(rootDir.parentFile, 'miku-zstd-protocol/src/main/java'))
+        }
+    }
+}
+
+
+// ── native 库瘦身（Fabric 专用）────────────────────────────────────────────────
+// 本模组的 zstd-jni 是经 `include` 以【嵌套 jar】形式放在 META-INF/jars/ 里的；
+// 外层 jar 的 exclude 碰不到嵌套内容，所以这里做一次后处理：解开嵌套 jar、
+// 剔除非主流平台的 .so/.dll/.dylib、再原样写回。
+// 保留：Windows(x64/arm64)、Linux(x64/arm64)、macOS(x64/arm64)。
+//
+// ⚠️ 必须用「逐 entry 读」的写法：对 ZipInputStream 调 Groovy 的 `.bytes`
+// 会一路读到流末尾，后续 nextEntry() 直接抛 "Stream closed"。
+def slimmingKeepPrefixes = ['win/amd64', 'win/aarch64',
+                            'linux/amd64', 'linux/aarch64',
+                            'darwin/x86_64', 'darwin/aarch64']
+
+/** 读 ZipInputStream 当前 entry 的全部字节。 */
+def readEntryBytes = { java.util.zip.ZipInputStream zin ->
+    def bos = new ByteArrayOutputStream()
+    byte[] buf = new byte[65536]
+    int n
+    while ((n = zin.read(buf)) != -1) {
+        bos.write(buf, 0, n)
+    }
+    return bos.toByteArray()
+}
+
+/** 从一个 zip 的字节里剔除指定平台的 native 库，返回新 zip 字节。 */
+def slimZipBytes = { byte[] src, List<String> keep ->
+    def out = new ByteArrayOutputStream()
+    def zin = new java.util.zip.ZipInputStream(new ByteArrayInputStream(src))
+    def zout = new java.util.zip.ZipOutputStream(out)
+    try {
+        def e
+        while ((e = zin.nextEntry) != null) {
+            String n = e.name
+            if (!e.isDirectory()) {
+                boolean isLib = n.endsWith('.so') || n.endsWith('.dll') || n.endsWith('.dylib')
+                if (isLib && !keep.any { String k -> n.startsWith(k + '/') }) {
+                    continue
+                }
+            }
+            zout.putNextEntry(new java.util.zip.ZipEntry(n))
+            if (!e.isDirectory()) {
+                zout.write(readEntryBytes(zin))
+            }
+            zout.closeEntry()
+        }
+    } finally {
+        zin.close()
+        zout.close()
+    }
+    return out.toByteArray()
+}
+
+tasks.register('slimNestedNative') {
+    dependsOn tasks.named('jar')
+    doLast {
+        def modJar = tasks.named('jar').get().archiveFile.get().asFile
+        if (!modJar.exists()) {
+            return
+        }
+        def tmpFile = new File(modJar.parentFile, modJar.name + '.slim')
+        def zin = new java.util.zip.ZipInputStream(new FileInputStream(modJar))
+        def zout = new java.util.zip.ZipOutputStream(new FileOutputStream(tmpFile))
+        try {
+            def e
+            while ((e = zin.nextEntry) != null) {
+                if (e.isDirectory()) {
+                    zout.putNextEntry(new java.util.zip.ZipEntry(e.name))
+                    zout.closeEntry()
+                    continue
+                }
+                byte[] raw = readEntryBytes(zin)
+                if (e.name.startsWith('META-INF/jars/zstd-jni-') && e.name.endsWith('.jar')) {
+                    raw = slimZipBytes(raw, slimmingKeepPrefixes)
+                }
+                zout.putNextEntry(new java.util.zip.ZipEntry(e.name))
+                zout.write(raw)
+                zout.closeEntry()
+            }
+        } finally {
+            zin.close()
+            zout.close()
+        }
+        modJar.delete()
+        if (!tmpFile.renameTo(modJar)) {
+            throw new GradleException("无法替换 mod jar: " + modJar)
+        }
+        println "[slim] 已裁剪嵌套 native 库 -> " + modJar.name +
+                String.format(" (%.2f MB)", modJar.length() / 1048576.0)
+    }
+}
+
+tasks.named('jar') { finalizedBy 'slimNestedNative' }
