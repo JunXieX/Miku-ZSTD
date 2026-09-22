@@ -299,9 +299,7 @@ Use `/mikuzstd status` to check the current sample count and dictionary id.
 ## Commands
 **命令**
 
-Available on both Velocity and Paper:
-
-服务端执行（Velocity 与 Paper 通用）：
+Availability differs by module: the Velocity side has the full set; the Paper side has only `/mikuzstd`, `status`, `top` and `bar`; the client mod has no command at all (press F8 to toggle the HUD).
 
 | Command | Description |
 |---|---|
@@ -309,8 +307,11 @@ Available on both Velocity and Paper:
 | `/mikuzstd status` | Compression settings, player count, dictionary state, compression thread pool, decompress buffer |
 | `/mikuzstd top` | Per-connection compression ranking by traffic, to find out who is dragging |
 | `/mikuzstd bar` | Toggle the live BossBar, which refreshes every second |
-| `/mikuzstd reload` | Hot-reload the config file |
-| `/mikuzstd train` | Trigger a dictionary training round immediately |
+| `/mikuzstd reload` | Hot-reload the config file (Velocity only) |
+| `/mikuzstd train` | Trigger a training round once enough samples have been collected (Velocity only) |
+| `/mikuzstd train force` | Trigger a training round regardless of the sample threshold (Velocity only) |
+
+各端可用的子命令不同：Velocity 端是全集；Paper 端只有 `/mikuzstd`、`status`、`top`、`bar`；客户端模组没有任何命令（按 F8 开关 HUD）。
 
 | 命令 | 功能 |
 |---|---|
@@ -318,16 +319,17 @@ Available on both Velocity and Paper:
 | `/mikuzstd status` | 压缩参数、在线人数、字典训练状态、压缩线程池、解压缓冲 |
 | `/mikuzstd top` | 各连接的压缩统计排行（按流量降序，用来定位是谁在拖后腿） |
 | `/mikuzstd bar` | 开关 BossBar 实时监控（每秒刷新，显示使用人数与压缩率） |
-| `/mikuzstd reload` | 热重载配置文件 |
-| `/mikuzstd train` | 立即触发一轮字典训练 |
+| `/mikuzstd reload` | 热重载配置文件（仅 Velocity 端） |
+| `/mikuzstd train` | 样本足够时触发一轮字典训练（仅 Velocity 端） |
+| `/mikuzstd train force` | 忽略样本门槛，强制触发一轮训练（仅 Velocity 端） |
 
-> `reload` only swaps the config object, so `level` and `window_log` apply only to connections created afterwards. Existing connections keep the old values until the server restarts.
+> `reload` only swaps the config object: `level`, `window_log` and `threads` apply only to connections created afterwards (the compression thread pool is sized at startup, so `threads` needs a proxy restart). `logging.debug` and `bossbar.format` take effect immediately.
 
-> `reload` 只替换配置，因此 `level` 与 `window_log` 只对之后新建立的连接生效；已有连接仍在用旧值，需要重启服务端才会全部更新。
+> `reload` 只替换配置：`level`、`window_log`、`threads` 只对之后新建立的连接生效（压缩线程池在启动时就定下来了，改 `threads` 需要重启代理）；`logging.debug` 与 `bossbar.format` 立即生效。
 
-The permission node is `mikuzstd.command`, and the Velocity side also accepts `zstd.command`. Read-only subcommands are open to everyone, because Velocity has no built-in permission system; install a permissions plugin to restrict `reload` and `train`.
+Read-only subcommands (`status`, `top`) are open to everyone, because Velocity has no built-in permission system. `bar`, `reload` and `train` require `mikuzstd.command` — the Velocity side also accepts `zstd.command`. Note that `bar` is not merely a view: the monitor is single-owner and toggling it also starts or stops the traffic counters, so it is gated as well. On the Paper side the same node is declared in `paper-plugin.yml` and defaults to op.
 
-权限节点是 `mikuzstd.command`，Velocity 端同时兼容 `zstd.command`。只读子命令对所有人开放，因为 Velocity 自身没有内置权限系统；装了权限插件后可以对 `reload` 与 `train` 加限制。
+只读子命令（`status`、`top`）对所有人开放，因为 Velocity 自身没有内置权限系统。`bar`、`reload`、`train` 需要 `mikuzstd.command`——Velocity 端同时兼容 `zstd.command`。注意 `bar` 不只是一个视图：监控是单人持有的，且开关它会同时启停流量统计，所以同样加了权限门槛。Paper 端在 `paper-plugin.yml` 里声明了同一权限节点，默认仅 OP。
 
 ---
 
