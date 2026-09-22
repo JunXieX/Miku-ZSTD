@@ -102,10 +102,9 @@ public final class ZstdStatsData {
                 fmtBytes(avgRxOut), fmtBytes(avgRxIn), colorRatio(rxRatio));
     }
 
+    /** 带宽格式化：统一走共享实现，避免项目里出现第二套 KB/MB 口径。 */
     private static String fmtBytes(long bps) {
-        if (bps < 1000) return String.format("%4dB/s", bps);
-        if (bps < 1_000_000) return String.format("%4.1fKB/s", bps / 1000.0);
-        return String.format("%4.1fMB/s", bps / 1_000_000.0);
+        return String.format("%7s", mikumc.zstd.protocol.ZstdBossBarFormat.rate(bps));
     }
 
     /**

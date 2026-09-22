@@ -5,6 +5,7 @@ import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelPipeline;
 import io.netty.handler.codec.MessageToMessageDecoder;
+import mikumc.zstd.protocol.ZstdVarInts;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -122,33 +123,27 @@ public class ZstdHandshakeSniffer extends MessageToMessageDecoder<ByteBuf> {
 
     /**
      * 解析 handshake 包：id(varint=0) + protocol(varint) + host(string) + port(ushort) + nextState(varint)。
-     * 解析失败返回 null。
+     *
+     * <p>用共享的 {@link ZstdVarInts#readOr}，并<b>显式做边界检查</b>——
+     * 旧实现用 {@code ByteBuffer} 的 {@code position()+hostLen} 与 {@code getShort()}，
+     * 越界只靠抛异常再兜住，读起来看不出"哪些情况算非法"。解析失败返回 null，
+     * 调用方必须保守处理（不可当作登录连接）。</p>
      */
     private static Integer parseHandshakeNextState(byte[] data) {
-        try {
-            java.nio.ByteBuffer buf = java.nio.ByteBuffer.wrap(data);
-            int id = readVarint(buf);
-            if (id != 0) return null;
-            readVarint(buf); // protocolVersion
-            int hostLen = readVarint(buf);
-            buf.position(buf.position() + hostLen); // host
-            buf.getShort(); // port
-            return readVarint(buf); // nextState
-        } catch (Exception e) {
+        int[] cursor = {0};
+        int id = ZstdVarInts.readOr(data, cursor, ZstdVarInts.INVALID);
+        if (id != 0) {
             return null;
         }
-    }
-
-    private static int readVarint(java.nio.ByteBuffer buf) {
-        int result = 0;
-        int shift = 0;
-        while (true) {
-            byte b = buf.get();
-            result |= (b & 0x7F) << shift;
-            if ((b & 0x80) == 0) return result;
-            shift += 7;
-            if (shift > 35) throw new IllegalArgumentException("varint too big");
+        ZstdVarInts.readOr(data, cursor, ZstdVarInts.INVALID); // protocolVersion（不关心）
+        int hostLen = ZstdVarInts.readOr(data, cursor, ZstdVarInts.INVALID);
+        if (hostLen < 0 || cursor[0] + hostLen + 2 > data.length) {
+            return null; // host 或 port 越界
         }
+        cursor[0] += hostLen; // host
+        cursor[0] += 2;       // port（unsigned short）
+        int nextState = ZstdVarInts.readOr(data, cursor, ZstdVarInts.INVALID);
+        return nextState == ZstdVarInts.INVALID ? null : nextState;
     }
 
     private static boolean contains(byte[] haystack, byte[] needle) {

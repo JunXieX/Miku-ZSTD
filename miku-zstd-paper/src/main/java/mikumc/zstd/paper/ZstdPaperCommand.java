@@ -43,13 +43,20 @@ public final class ZstdPaperCommand implements BasicCommand {
             return;
         }
         if (args.length > 0 && "bar".equalsIgnoreCase(args[0])) {
+            // ⚠️ bar 要权限：它看起来只是"开个显示"，实际是全局状态
+            //（单人持有，且开关时连带启停 ZstdPaperMonitor 的采集）。
+            // 只读的 status / top 不设门槛，与 Velocity 端策略保持一致。
+            if (!sender.hasPermission("mikuzstd.command")) {
+                sender.sendMessage("§c你没有权限执行这个子命令（需要 mikuzstd.command）。");
+                return;
+            }
             sender.sendMessage("§b[Miku-ZSTD]§r " + ZstdPaperMonitor.toggle(sender));
             return;
         }
         ZstdPaperConfig cfg = ZstdPaperConfig.INSTANCE;
 
         sender.sendMessage("§6═══ Miku-ZSTD (Paper) 状态 ═══");
-        sender.sendMessage("§7  用法: /mikuzstd §f| §7/mikuzstd bar §8（BossBar 实时监控）");
+        sender.sendMessage("§7  用法: /mikuzstd [status|top|bar]");
 
         int threshold = ZstdPaperCommandSupport.readCompressionThreshold();
         sender.sendMessage("§e── 环境 ──");
@@ -109,9 +116,18 @@ public final class ZstdPaperCommand implements BasicCommand {
         return out;
     }
 
+    /**
+     * 本命令<b>不设整树权限门槛</b>：只读子命令（status / top）对所有人开放，
+     * 与 Velocity 端策略一致（那一端的注释解释了为什么整树门控会让命令彻底消失）。
+     * 有副作用的 {@code bar} 在 {@link #execute} 里单独校验 {@code mikuzstd.command}。
+     *
+     * <p>返回 {@code null} 表示"没有额外权限要求"。以前这里返回
+     * {@code "mikuzstd.command"}，而 {@code paper-plugin.yml} 又没声明该权限、
+     * 非 OP 默认不持有——于是普通玩家连只读的 status 都用不了。</p>
+     */
     @Override
     public String permission() {
-        return "mikuzstd.command";
+        return null;
     }
 
     private static void showTrainer(CommandSender sender, String label, ZstdPaperTrainer t, int minSamples) {

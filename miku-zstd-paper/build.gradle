@@ -18,8 +18,11 @@ repositories {
 dependencies {
     // 纯 Paper：只依赖 paper-api（不引入 spigot-api / bukkit 兼容层）
     compileOnly("io.papermc.paper:paper-api:26.2.build.124-stable")
-    // Netty 由服务端提供（MC 26.x 未混淆，反射即可访问管线）
-    compileOnly("io.netty:netty-all:4.1.107.Final")
+    // Netty 由服务端提供（MC 26.x 未混淆，反射即可访问管线），仅用于编译。
+    // ⚠️ 对齐运行期主版本：MC 26.2 内置 Netty **4.2.15.Final**。
+    // 以前写 4.1.107.Final 会造成"编译期 4.1 / 运行期 4.2"，跨大版本的风险在于
+    // 签名变更时本地编译不报错、运行期才炸。
+    compileOnly("io.netty:netty-all:4.2.15.Final")
     // zstd：Paper 服务端自带 zstd-jni 1.5.7-15（在 META-INF/libraries 中），
     // 但插件类加载器访问不到，因此随插件打包 1.5.7-17，避免版本/可见性歧义。
     implementation("com.github.luben:zstd-jni:1.5.7-17")

@@ -88,6 +88,8 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
     private byte[] scratch = new byte[0];
     /** {@link #readVarIntAt} 的结束位置出参（避免热路径上每包一次 int[] 分配） */
     private int varintEnd;
+    /** 传给 {@link ZstdVarInts#readAt} 的出参容器（复用，零分配） */
+    private final int[] varintEndCursor = new int[1];
 
     // ────────────────────────────────────────────────────────────────
     // 子类钩子：两端唯一的差异点
@@ -289,23 +291,13 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
     /**
      * 从 {@code data[pos]} 起读一个 varint，结束位置写回 {@link #varintEnd}。
      *
-     * <p>用字段而非 {@code int[]} 出参：这个方法在热路径上每个包调用一次，
-     * 每次 new 一个小数组纯属浪费（本处理器只跑在事件循环上，无并发问题）。</p>
+     * <p>委托给共享的 {@link ZstdVarInts#readAt}；这里的 {@code int[]} 只作为出参容器
+     * 复用（每连接一个，热路径上无分配）。</p>
      */
     private int readVarIntAt(byte[] data, int pos) {
-        int result = 0;
-        int shift = 0;
-        while (pos < data.length && shift <= 28) {
-            byte b = data[pos++];
-            result |= (b & 0x7F) << shift;
-            if ((b & 0x80) == 0) {
-                varintEnd = pos;
-                return result < 0 ? ZstdVarInts.INVALID : result;
-            }
-            shift += 7;
-        }
-        varintEnd = pos;
-        return ZstdVarInts.INVALID;
+        int value = ZstdVarInts.readAt(data, pos, varintEndCursor);
+        varintEnd = varintEndCursor[0];
+        return value;
     }
 
     /**

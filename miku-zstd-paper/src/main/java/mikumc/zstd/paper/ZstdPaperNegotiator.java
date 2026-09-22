@@ -5,6 +5,7 @@ import io.netty.channel.Channel;
 import io.netty.channel.ChannelDuplexHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelPromise;
+import mikumc.zstd.protocol.ZstdDictId;
 import mikumc.zstd.protocol.ZstdNegotiateStatus;
 import mikumc.zstd.protocol.ZstdVarInts;
 import org.slf4j.Logger;
@@ -97,9 +98,9 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
                     if (payload != null && payload.length >= 2) {
                         int[] cursor = {0};
                         enc = ZstdNegotiateStatus.sanitize(
-                                readVarInt(payload, cursor, ZstdNegotiateStatus.FALLBACK));
+                                ZstdVarInts.readOr(payload, cursor, ZstdNegotiateStatus.FALLBACK));
                         dec = ZstdNegotiateStatus.sanitize(
-                                readVarInt(payload, cursor, ZstdNegotiateStatus.FALLBACK));
+                                ZstdVarInts.readOr(payload, cursor, ZstdNegotiateStatus.FALLBACK));
                     }
                     LOGGER.debug("[Zstd] 捕获{}应答: {} tx={} enc={} dec={} success={}",
                             isDict ? "字典" : "协商", cn, tx, enc, dec, success);
@@ -183,10 +184,9 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
         }
     }
 
+    /** 线上字典帧：{@code [int crc32][int len][bytes]}；crc 必须与字典 id 同源。 */
     private static void writeDictBytes(ByteBuf buf, byte[] dict) {
-        java.util.zip.CRC32 crc = new java.util.zip.CRC32();
-        crc.update(dict);
-        buf.writeInt((int) crc.getValue());
+        buf.writeInt(ZstdDictId.wireChecksum(dict));
         buf.writeInt(dict.length);
         buf.writeBytes(dict);
     }
@@ -420,18 +420,6 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
             c = c.getSuperclass();
         }
         return null;
-    }
-
-    private static int readVarInt(byte[] data, int[] cursor, int fallback) {
-        int result = 0;
-        int shift = 0;
-        while (cursor[0] < data.length && shift <= 28) {
-            byte b = data[cursor[0]++];
-            result |= (b & 0x7F) << shift;
-            if ((b & 0x80) == 0) return result;
-            shift += 7;
-        }
-        return fallback;
     }
 
     private static Class<?> tryLoad(String name) {

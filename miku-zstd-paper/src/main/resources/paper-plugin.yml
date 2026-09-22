@@ -5,4 +5,9 @@ main: mikumc.zstd.paper.MikuZstdPaper
 api-version: 1.26
 authors: [JunXieX]
 description: 用 zstd 替代原版 zlib 压缩玩家连接的网络流量（需客户端安装 Miku-ZSTD 模组）
-website: https://github.com/JunXieX
+website: https://github.com/JunXieX/Miku-ZSTD
+
+permissions:
+  mikuzstd.command:
+    description: 使用 /mikuzstd 的 BossBar 监控开关（status / top 等只读子命令对所有人开放）
+    default: op

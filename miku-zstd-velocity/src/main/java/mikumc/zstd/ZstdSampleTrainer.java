@@ -20,8 +20,8 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.zip.CRC32;
-import java.util.zip.Checksum;
+import mikumc.zstd.protocol.ZstdDictId;
+import mikumc.zstd.protocol.ZstdVarInts;
 
 import mikumc.zstd.protocol.ZstdDictAdoption.EvalResult;
 
@@ -228,7 +228,31 @@ public class ZstdSampleTrainer {
         return lastTrainTime;
     }
 
-    /** 手动触发训练（/mikuzstd train 命令入口），绕过采样门槛与冷却。 */
+    /**
+     * 手动请求一次训练（{@code /mikuzstd train} 入口）。
+     *
+     * <p>与 {@link #forceTrain()} 的区别：本方法<b>仍要求样本达到 minSamples</b>，
+     * 只是绕过冷却与"环满 / 兜底超时"两个门槛。<br>
+     * 以前两个子命令都直接调 {@code forceTrain()}，{@code force} 只改了提示文案——
+     * 等于一个没有任何作用的子命令。</p>
+     *
+     * @return 是否真的启动了训练
+     */
+    public boolean requestTrain() {
+        int samples;
+        synchronized (this) {
+            samples = sampleRing.size();
+        }
+        if (samples < minSamples) {
+            LOGGER.info("[Zstd] {} 样本不足，未训练（{} < {}）；如需忽略门槛请用 train force",
+                    name, samples, minSamples);
+            return false;
+        }
+        forceTrain();
+        return true;
+    }
+
+    /** 强制触发训练（{@code /mikuzstd train force}），绕过采样门槛与冷却。 */
     public void forceTrain() {
         ExecutorService te = trainExecutor;
         if (te == null) return;
@@ -257,24 +281,16 @@ public class ZstdSampleTrainer {
             return;
         }
         List<byte[]> batch = null;
-        int pos = 0;
-        while (pos < length) {
-            int pktLen = 0;
-            int shift = 0;
-            while (pos < length && shift <= 28) {
-                byte b = raw[pos++];
-                pktLen |= (b & 0x7F) << shift;
-                if ((b & 0x80) == 0) {
-                    break;
-                }
-                shift += 7;
-            }
-            if (pktLen <= 0 || pos + pktLen > length) {
+        int[] cursor = {0};
+        while (cursor[0] < length) {
+            // 共享的 varint 读取器：以前这里手写了一遍，与其它 5 处各自实现等价但可能漂移
+            int pktLen = ZstdVarInts.readOr(raw, cursor, ZstdVarInts.INVALID);
+            if (pktLen <= 0 || cursor[0] + pktLen > length) {
                 break;
             }
             byte[] sample = new byte[pktLen];
-            System.arraycopy(raw, pos, sample, 0, pktLen);
-            pos += pktLen;
+            System.arraycopy(raw, cursor[0], sample, 0, pktLen);
+            cursor[0] += pktLen;
             if (!shouldKeep(sample)) {
                 continue;
             }
@@ -349,9 +365,7 @@ public class ZstdSampleTrainer {
             if (newDict == null || newDict.length == 0) {
                 LOGGER.warn("[Zstd] {} training produced empty dict", name);
             } else {
-                Checksum crc = new CRC32();
-                crc.update(newDict, 0, newDict.length);
-                long dictId = crc.getValue();
+                long dictId = ZstdDictId.of(newDict);
 
                 if (currentDict != null && currentDictId == dictId) {
                     LOGGER.info("[Zstd] {} dict unchanged, skipping", name);
@@ -562,7 +576,7 @@ public class ZstdSampleTrainer {
             Path dictFile = dictDir.resolve(name + "_dict.bin");
             if (Files.exists(dictFile)) {
                 currentDict = Files.readAllBytes(dictFile);
-                currentDictId = crc32(currentDict);
+                currentDictId = ZstdDictId.of(currentDict);
                 LOGGER.info("[Zstd] {} loaded dict from disk: id={} size={}", name, currentDictId, currentDict.length);
             } else {
                 // 迁移：旧版 *_dict_<crc>.bin 文件按修改时间取最新
@@ -574,7 +588,7 @@ public class ZstdSampleTrainer {
                     if (!legacy.isEmpty()) {
                         Path latest = legacy.get(legacy.size() - 1);
                         currentDict = Files.readAllBytes(latest);
-                        currentDictId = crc32(currentDict);
+                        currentDictId = ZstdDictId.of(currentDict);
                         LOGGER.info("[Zstd] {} loaded legacy dict {} (by mtime): id={} size={}",
                                 name, latest.getFileName(), currentDictId, currentDict.length);
                     }
@@ -596,12 +610,6 @@ public class ZstdSampleTrainer {
         } catch (IOException e) {
             LOGGER.warn("[Zstd] {} failed to load from disk", name, e);
         }
-    }
-
-    private static long crc32(byte[] data) {
-        Checksum crc = new CRC32();
-        crc.update(data, 0, data.length);
-        return crc.getValue();
     }
 
     private long lastModified(Path p) {

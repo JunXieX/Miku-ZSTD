@@ -1,5 +1,6 @@
 package mikumc.zstd;
 
+import mikumc.zstd.protocol.ZstdBossBarFormat;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -56,10 +57,16 @@ public final class ZstdBandwidthProfiler {
     private ZstdBandwidthProfiler() {
     }
 
-    /** 启动周期上报（由插件初始化时调用；debug 关闭时不启动，零开销）。 */
-    public static void start(boolean debugEnabled, int intervalSeconds) {
+    /**
+     * 启动周期上报（由插件初始化时调用；debug 关闭时不启动，零开销）。
+     *
+     * <p><b>幂等</b>：{@code /mikuzstd reload} 会再调一次——若不判重，每 reload 一次就会
+     * 多出一个上报线程，带宽剖析越看越花。</p>
+     */
+    public static synchronized void start(boolean debugEnabled, int intervalSeconds) {
         enabled = debugEnabled;
         if (!debugEnabled) return;
+        if (scheduler != null) return; // 已在运行
         scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "miku-zstd-bwprof");
             t.setDaemon(true);
@@ -70,7 +77,7 @@ public final class ZstdBandwidthProfiler {
         LOGGER.info("[Zstd] 带宽剖析已启用，每 {}s 输出一次（关闭 logging.debug 可停用）", intervalSeconds);
     }
 
-    public static void shutdown() {
+    public static synchronized void shutdown() {
         if (scheduler != null) {
             scheduler.shutdown();
             scheduler = null;
@@ -122,9 +129,8 @@ public final class ZstdBandwidthProfiler {
         }
     }
 
+    /** 字节格式化：统一走 {@link ZstdBossBarFormat#fmtBytes}，避免项目里两套 KB/MB 口径。 */
     private static String fmt(long bytes) {
-        if (bytes < 1024) return bytes + "B";
-        if (bytes < 1024 * 1024) return String.format("%.1fKB", bytes / 1024.0);
-        return String.format("%.2fMB", bytes / 1048576.0);
+        return ZstdBossBarFormat.fmtBytes(bytes);
     }
 }

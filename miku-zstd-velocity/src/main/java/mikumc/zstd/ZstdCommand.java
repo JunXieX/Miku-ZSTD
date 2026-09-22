@@ -25,9 +25,11 @@ import mikumc.zstd.protocol.ZstdCompressPool;
 public final class ZstdCommand {
 
     private final ProxyServer proxy;
+    private final MikuZstdVelocity plugin;
 
-    public ZstdCommand(ProxyServer proxy) {
+    public ZstdCommand(ProxyServer proxy, MikuZstdVelocity plugin) {
         this.proxy = proxy;
+        this.plugin = plugin;
     }
 
     /** 构建命令树：{@code /mikuzstd [status|bar|reload|train [force]]}。 */
@@ -56,12 +58,17 @@ public final class ZstdCommand {
                             showTop(ctx.getSource());
                             return 1;
                         }))
+                // ⚠️ bar 有权限门槛：它看起来只是"开个显示"，实际是<b>全局</b>状态
+                //（单人持有、且开关时会连带启停 ZstdTrafficCounter 采集）。
+                // 以前它和只读子命令一样对所有人开放，于是任何玩家都能把管理员
+                // 正在看的监控关掉，并顺带让统计归零——这是状态变更，不是一个视图开关。
                 .then(BrigadierCommand.literalArgumentBuilder("bar")
+                        .requires(ZstdCommand::hasPermission)
                         .executes(ctx -> {
                             ctx.getSource().sendMessage(ZstdBossBarMonitor.toggle(ctx.getSource()));
                             return 1;
                         }))
-                // 下面两个会真的改动服务端状态（重载配置 / 强制训练），保留权限门槛：
+                // 下面两个会真的改动服务端状态（重载配置 / 触发训练），保留权限门槛：
                 // 装了权限插件后授予 mikuzstd.command（或 zstd.command）即可。
                 // 注意 requires 沿链累积，force 会自动继承 train 的限制。
                 .then(BrigadierCommand.literalArgumentBuilder("reload")
@@ -154,13 +161,19 @@ public final class ZstdCommand {
 
     private void reload(CommandSource source) {
         ZstdVelocityConfig.reload();
+        // 让 logging.debug 的改动也生效（启动时只应用过一次）：
+        // 否则改完配置 reload 会显示 "debug: true"，日志却一条都不多——比不写这个开关更糟。
+        if (plugin != null) {
+            plugin.applyDebugFromConfig();
+        }
+        ZstdBandwidthProfiler.start(ZstdVelocityConfig.INSTANCE.debug, 60);
         source.sendMessage(Component.text("Config reloaded.", NamedTextColor.GREEN));
-        // ⚠️ 必须说清楚作用范围：compressCtx 的 level / window_log 只在【连接建立时】应用到
-        // 该连接的上下文上（见 ZstdChannelManager 构造器）。reload 只替换配置单例，
-        // 已经建立的连接仍拿着旧参数——不提示的话，管理员会以为 reload 没生效。
+        // ⚠️ 必须说清楚作用范围，否则管理员会以为 reload 没生效。三类参数都不会作用于已有连接：
+        //   · level / window_log：连接建立时应用到该连接的 zstd 上下文（见 ZstdChannelManager 构造器）；
+        //   · threads：线程池是首次 init 时就固定下来的（ZstdCompressPool.init 幂等）；
         source.sendMessage(Component.text(
-                "注意：level / window_log 等参数只对【之后新建立的连接】生效；"
-                        + "已有连接仍在用旧值，需要【重启代理】才会全部更新。",
+                "注意：level / window_log / threads 只对【之后新建立的连接】（线程池则需重启代理）生效；"
+                        + "已有连接仍在用旧值。logging.debug 与 bossbar.format 已即时生效。",
                 NamedTextColor.YELLOW));
     }
 
@@ -168,17 +181,19 @@ public final class ZstdCommand {
         ZstdSampleTrainer enc = ZstdSampleTrainer.getEncoder();
         ZstdSampleTrainer dec = ZstdSampleTrainer.getDecoder();
 
-        // `/mikuzstd train` 与 `/mikuzstd train force` 语义一致：都是立即触发一轮训练
-        // （forceTrain 本就绕过采样门槛与冷却）。
-        if (enc != null) {
-            enc.forceTrain();
-        }
-        if (dec != null) {
-            dec.forceTrain();
-        }
+        // train       ：样本达标才训练（绕过冷却与"环满 / 兜底超时"门槛）
+        // train force ：连样本门槛一起绕过（小服 / 测试环境用）
+        boolean encStarted = triggerTrain(enc, forced);
+        boolean decStarted = triggerTrain(dec, forced);
 
-        Component msg = Component.text(forced ? "Force training triggered. " : "Training triggered. ",
-                NamedTextColor.GREEN);
+        Component msg;
+        if (!forced && !encStarted && !decStarted) {
+            msg = Component.text("两端样本都不足，本次未触发训练。"
+                    + "可用 /mikuzstd train force 绕过样本门槛。", NamedTextColor.YELLOW);
+        } else {
+            msg = Component.text(forced ? "Force training triggered. " : "Training triggered. ",
+                    NamedTextColor.GREEN);
+        }
         if (enc != null) {
             msg = msg.append(Component.text("Encoder: " + enc.getSampleCount() + " samples, dict="
                     + enc.getCurrentDictId() + "  ", NamedTextColor.GRAY));
@@ -188,5 +203,17 @@ public final class ZstdCommand {
                     + dec.getCurrentDictId(), NamedTextColor.GRAY));
         }
         source.sendMessage(msg);
+    }
+
+    /** 按 {@code forced} 选择"绕过一切"还是"仍要求样本达标"。 */
+    private static boolean triggerTrain(ZstdSampleTrainer trainer, boolean forced) {
+        if (trainer == null) {
+            return false;
+        }
+        if (forced) {
+            trainer.forceTrain();
+            return true;
+        }
+        return trainer.requestTrain();
     }
 }

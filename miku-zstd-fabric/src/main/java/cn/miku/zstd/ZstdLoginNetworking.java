@@ -15,7 +15,8 @@ import cn.miku.zstd.mixin.ConnectionAccessor;
 
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
-import java.util.zip.CRC32;
+import mikumc.zstd.protocol.ZstdDictId;
+import mikumc.zstd.protocol.ZstdNegotiateStatus;
 
 /**
  * 登录协商：{@code zstd:negotiate}（轻量握手）+ {@code zstd:dict}（按需推送字典）。
@@ -77,19 +78,21 @@ public final class ZstdLoginNetworking {
             }
             final ZstdChannelManager mgr = existing;
 
-            // 每个方向：0 = 已就绪（无需字典或本地已缓存），1 = 需要服务端推送字典
+            // 每个方向：READY = 已就绪（无需字典或本地已缓存），NEED_DICT = 需要服务端推送
             byte encoderStatus = resolve(mgr, encoderDictId, true);
             byte decoderStatus = resolve(mgr, decoderDictId, false);
 
-            boolean refuse = encoderStatus == 2 || decoderStatus == 2;
-            boolean needDict = encoderStatus == 1 || decoderStatus == 1;
+            boolean refuse = encoderStatus == ZstdNegotiateStatus.VANILLA
+                    || decoderStatus == ZstdNegotiateStatus.VANILLA;
+            boolean needDict = encoderStatus == ZstdNegotiateStatus.NEED_DICT
+                    || decoderStatus == ZstdNegotiateStatus.NEED_DICT;
             // 需要字典时先保持 PLAIN：等 zstd:dict 到达并加载成功后才进入 NEGOTIATING。
             // 这样即便服务端最终没推字典，客户端也只是保持原版，不会形成单侧 zstd。
             channel.attr(ZstdChannelManager.ZSTD_STATE).set(refuse || needDict
                     ? ZstdChannelManager.TransportState.PLAIN
                     : ZstdChannelManager.TransportState.NEGOTIATING);
 
-            LOGGER.info("[Zstd] LoginPlugin negotiated: encId={} encStatus={} decId={} decStatus={} -> {}",
+            LOGGER.debug("[Zstd] LoginPlugin negotiated: encId={} encStatus={} decId={} decStatus={} -> {}",
                     encoderDictId, encoderStatus, decoderDictId, decoderStatus,
                     refuse ? "staying vanilla" : (needDict ? "awaiting dict" : "will activate zstd"));
 
@@ -114,8 +117,9 @@ public final class ZstdLoginNetworking {
             }
 
             byte flags = data.readByte();
-            byte encoderStatus = 2;
-            byte decoderStatus = 2;
+            // 未被 flags 点名的方向按"不可用"处理：服务端会据此回落，而不是单侧激活
+            byte encoderStatus = ZstdNegotiateStatus.VANILLA;
+            byte decoderStatus = ZstdNegotiateStatus.VANILLA;
             if ((flags & 1) != 0) {
                 encoderStatus = loadOne(mgr, data, true);
             }
@@ -123,12 +127,13 @@ public final class ZstdLoginNetworking {
                 decoderStatus = loadOne(mgr, data, false);
             }
 
-            boolean ok = encoderStatus == 0 && decoderStatus == 0;
+            boolean ok = encoderStatus == ZstdNegotiateStatus.READY
+                    && decoderStatus == ZstdNegotiateStatus.READY;
             if (ok) {
                 channel.attr(ZstdChannelManager.ZSTD_STATE)
                         .set(ZstdChannelManager.TransportState.NEGOTIATING);
             }
-            LOGGER.info("[Zstd] dict delivered: encStatus={} decStatus={} -> {}",
+            LOGGER.debug("[Zstd] dict delivered: encStatus={} decStatus={} -> {}",
                     encoderStatus, decoderStatus, ok ? "will activate zstd" : "staying vanilla");
             return CompletableFuture.completedFuture(answer(encoderStatus, decoderStatus));
         } catch (Exception e) {
@@ -140,67 +145,81 @@ public final class ZstdLoginNetworking {
     /**
      * 判断一个方向是否需要字典。
      *
-     * @return 0 = 已就绪；1 = 需要服务端推送；2 = 不可用
+     * <p>⚠️ 装载失败一律改报 {@link ZstdNegotiateStatus#NEED_DICT}（而不是 VANILLA）：
+     * 让服务端推一份过来就能继续用 zstd，比直接放弃整条链路好。关键是<b>绝不能谎报就绪</b>——
+     * 那会造成服务端带字典压缩、本端无字典解压的必断连组合。</p>
+     *
+     * @return {@link ZstdNegotiateStatus#READY} 或 {@link ZstdNegotiateStatus#NEED_DICT}
      */
     private static byte resolve(ZstdChannelManager mgr, long dictId, boolean isEncoder) {
-        if (dictId == 0L) {
-            return 0; // 服务端尚无字典：协议没问题，照常参与 zstd
+        if (dictId == ZstdDictId.NONE) {
+            return ZstdNegotiateStatus.READY; // 服务端尚无字典：协议没问题，照常参与 zstd
         }
         if (!DictCache.contains(dictId)) {
-            return 1; // 本地无缓存：请求服务端推送
+            return ZstdNegotiateStatus.NEED_DICT; // 本地无缓存：请求服务端推送
         }
-        return loadCached(mgr, dictId, isEncoder) ? (byte) 0 : (byte) 2;
+        return loadCached(mgr, dictId, isEncoder)
+                ? (byte) ZstdNegotiateStatus.READY
+                : (byte) ZstdNegotiateStatus.NEED_DICT;
     }
 
     private static boolean loadCached(ZstdChannelManager mgr, long dictId, boolean isEncoder) {
         try {
             byte[] cached = DictCache.get(dictId);
-            if (isEncoder) {
-                mgr.loadEncoderDict(cached, dictId);
-            } else {
-                mgr.loadDecoderDict(cached, dictId);
+            if (cached == null) {
+                // 缓存查到了 id 却取不到字节 = 状态不一致。绝不能"假装成功"。
+                LOGGER.warn("[Zstd] 缓存中取不到字典 id={} \u2014 改报需要服务端推送", dictId);
+                return false;
             }
-            return true;
+            boolean ok = isEncoder
+                    ? mgr.loadEncoderDict(cached, dictId)
+                    : mgr.loadDecoderDict(cached, dictId);
+            if (!ok) {
+                LOGGER.warn("[Zstd] 装载缓存字典失败 id={} \u2014 改报需要服务端推送", dictId);
+            }
+            return ok;
         } catch (Exception e) {
             LOGGER.warn("[Zstd] Failed to load cached dict id={} \u2014 reporting unavailable", dictId, e);
             return false;
         }
     }
 
-    /** 按 {@code [int crc][int len][bytes]} 读取一个方向的字典并装载。 */
+    /**
+     * 按 {@code [int crc][int len][bytes]} 读取一个方向的字典并装载。
+     *
+     * <p>这里的 crc 就是<b>字典 id 本身</b>（见 {@link ZstdDictId}）——服务端用它声明、
+     * 客户端用它做缓存键，两端必须是同一个算法。校验通过后按同一数值入库，
+     * 这样重连时 {@code DictCache.contains(id)} 才命中，否则每次登录都要重下几百 KB。</p>
+     */
     private static byte loadOne(ZstdChannelManager mgr, FriendlyByteBuf in, boolean isEncoder) {
         try {
             int crc = in.readInt();
             int len = in.readInt();
             if (len <= 0 || len > 0x100000) {
                 LOGGER.warn("[Zstd] dict size out of range: {} \u2014 reporting unavailable", len);
-                return 2;
+                return (byte) ZstdNegotiateStatus.VANILLA;
             }
             byte[] bytes = new byte[len];
             in.readBytes(bytes);
-            CRC32 crcCheck = new CRC32();
-            crcCheck.update(bytes);
-            if ((int) crcCheck.getValue() != crc) {
+            long dictId = ZstdDictId.of(bytes);
+            if ((int) dictId != crc) {
                 LOGGER.warn("[Zstd] dict CRC mismatch \u2014 reporting unavailable");
-                return 2;
+                return (byte) ZstdNegotiateStatus.VANILLA;
             }
-            DictCache.put(crcOf(bytes), bytes);
-            if (isEncoder) {
-                mgr.loadEncoderDict(bytes, crcOf(bytes));
-            } else {
-                mgr.loadDecoderDict(bytes, crcOf(bytes));
+            DictCache.put(dictId, bytes);
+            boolean loaded = isEncoder
+                    ? mgr.loadEncoderDict(bytes, dictId)
+                    : mgr.loadDecoderDict(bytes, dictId);
+            if (!loaded) {
+                // 不能谎报就绪：服务端会据此带字典压缩，而本端实际没有该字典 → 断连
+                LOGGER.warn("[Zstd] 装载推送的字典失败 \u2014 reporting unavailable");
+                return (byte) ZstdNegotiateStatus.VANILLA;
             }
-            return 0;
+            return (byte) ZstdNegotiateStatus.READY;
         } catch (Exception e) {
             LOGGER.warn("[Zstd] Failed to read dict \u2014 reporting unavailable", e);
-            return 2;
+            return (byte) ZstdNegotiateStatus.VANILLA;
         }
-    }
-
-    private static long crcOf(byte[] data) {
-        CRC32 crc = new CRC32();
-        crc.update(data, 0, data.length);
-        return crc.getValue();
     }
 
     private static FriendlyByteBuf answer(int encStatus, int decStatus) {
@@ -210,7 +229,8 @@ public final class ZstdLoginNetworking {
         return buf;
     }
 
+    /** 无法参与 zstd：两个方向都按"保持原版"上报，服务端会据此回落。 */
     private static FriendlyByteBuf unavailable() {
-        return answer(2, 2);
+        return answer(ZstdNegotiateStatus.VANILLA, ZstdNegotiateStatus.VANILLA);
     }
 }

@@ -27,8 +27,12 @@ dependencies {
         compileOnly(files(proxyJar))
     }
     annotationProcessor("com.velocitypowered:velocity-api:4.2.0")
-    // Netty 由 Velocity 运行时提供，仅用于编译
-    compileOnly("io.netty:netty-all:4.1.107.Final")
+    // Netty 由 Velocity 运行时提供，仅用于编译。
+    // ⚠️ 必须对齐运行期的主版本：实测 Velocity 4.1.1 内置 Netty **4.2.16.Final**
+    //（见其 META-INF/io.netty.versions.properties）。以前这里写 4.1.107.Final，
+    // 于是"编译期 4.1 / 运行期 4.2"——跨大版本编译虽然当前能跑（只用到 buffer/codec/
+    // transport 里最稳定的一批 API），但一旦某个签名变了，本地编译不会报错、运行期才炸。
+    compileOnly("io.netty:netty-all:4.2.16.Final")
     // zstd-jni：原生库随 shadowJar 打包
     implementation("com.github.luben:zstd-jni:1.5.7-17")
     // Velocity 4 可能不再自带 snakeyaml，随插件打包兜底

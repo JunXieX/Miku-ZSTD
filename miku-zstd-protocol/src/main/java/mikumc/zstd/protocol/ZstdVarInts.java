@@ -95,6 +95,56 @@ public final class ZstdVarInts {
         return 5;
     }
 
+    /**
+     * 从 {@code data[pos]} 起读一个 varint，结束位置写回 {@code endOut[0]}。
+     *
+     * <p>非法（超过 5 字节仍未结束）或结果为负时返回 {@link #INVALID}。</p>
+     *
+     * <p>存在的意义：帧格式解析（按内层 {@code pktLen} 切包）需要在 <b>byte[]</b> 上读 varint，
+     * 而 {@link #tryRead} 面向 ByteBuf。以前每个需要它的类都自己写了一遍循环
+     *（解码器基类、握手嗅探器、应答嗅探器、Paper 协商器、两个训练器……），
+     * 这类"看着照抄不会错"的代码恰恰是最容易悄悄漂移的。</p>
+     */
+    public static int readAt(byte[] data, int pos, int[] endOut) {
+        int result = 0;
+        int shift = 0;
+        int cursor = pos;
+        while (cursor < data.length && shift <= 28) {
+            byte b = data[cursor++];
+            result |= (b & 0x7F) << shift;
+            if ((b & 0x80) == 0) {
+                endOut[0] = cursor;
+                return result < 0 ? INVALID : result;
+            }
+            shift += 7;
+        }
+        endOut[0] = cursor;
+        return INVALID;
+    }
+
+    /**
+     * 游标版读取：{@code cursor[0]} 既是入参起点、也是出参终点；失败返回 {@code fallback}。
+     *
+     * <p>与 {@link #readAt} 的区别：这里<b>不</b>把负数判成非法——调用方通常紧接着用
+     * {@code <= 0} 自行判断（例如"包长必须为正"）。需要严格语义时用 {@link #readAt}。</p>
+     */
+    public static int readOr(byte[] data, int[] cursor, int fallback) {
+        int pos = cursor[0];
+        int result = 0;
+        int shift = 0;
+        while (pos < data.length && shift <= 28) {
+            byte b = data[pos++];
+            result |= (b & 0x7F) << shift;
+            if ((b & 0x80) == 0) {
+                cursor[0] = pos;
+                return result;
+            }
+            shift += 7;
+        }
+        cursor[0] = pos;
+        return fallback;
+    }
+
     /** 写 UTF-8 字符串（VarInt 长度前缀 + 字节）。 */
     public static void writeString(ByteBuf buf, String s) {
         byte[] bytes = s.getBytes(java.nio.charset.StandardCharsets.UTF_8);

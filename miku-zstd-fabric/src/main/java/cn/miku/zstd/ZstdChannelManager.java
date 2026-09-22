@@ -100,28 +100,43 @@ public class ZstdChannelManager {
         return decompressCtx;
     }
 
-    /** 加载"服务端→客户端"方向的解压字典（客户端解压用）。 */
-    public void loadEncoderDict(byte[] dictBytes, long dictId) {
+    /**
+     * 加载"服务端→客户端"方向的解压字典（客户端解压用）。
+     *
+     * @return 是否确实装载成功；{@code false} 时调用方<b>不能</b>按"已就绪"上报
+     *（否则服务端会带字典压缩、而本端无字典解压 → 断连）
+     */
+    public boolean loadEncoderDict(byte[] dictBytes, long dictId) {
         synchronized (compressLock) {
-        ZstdDictRegistry.Entry e = ZstdDictRegistry.acquireDecompressDict(dictBytes, dictId);
-        if (e == null) return;
-        releaseQuietly(encoderDictEntry);
-        encoderDictEntry = e;
-        decompressCtx.loadDict(e.decompressDict());
-        applySlimFrameFormat(); // loadDict 后幂等重申，避免参数被重置
+            ZstdDictRegistry.Entry e = ZstdDictRegistry.acquireDecompressDict(dictBytes, dictId);
+            if (e == null) {
+                return false;
+            }
+            releaseQuietly(encoderDictEntry);
+            encoderDictEntry = e;
+            decompressCtx.loadDict(e.decompressDict());
+            applySlimFrameFormat(); // loadDict 后幂等重申，避免参数被重置
+            return true;
         }
     }
 
-    /** 加载"客户端→服务端"方向的压缩字典（客户端压缩用）。 */
-    public void loadDecoderDict(byte[] dictBytes, long dictId) {
+    /**
+     * 加载"客户端→服务端"方向的压缩字典（客户端压缩用）。
+     *
+     * @return 是否确实装载成功（同上：失败必须上报"未就绪"）
+     */
+    public boolean loadDecoderDict(byte[] dictBytes, long dictId) {
         synchronized (compressLock) {
-        ZstdDictRegistry.Entry e = ZstdDictRegistry.acquireCompressDict(
-                dictBytes, dictId, ZstdConfig.INSTANCE.level);
-        if (e == null) return;
-        releaseQuietly(decoderDictEntry);
-        decoderDictEntry = e;
-        compressCtx.loadDict(e.compressDict());
-        applySlimFrameFormat(); // loadDict 后幂等重申，避免参数被重置
+            ZstdDictRegistry.Entry e = ZstdDictRegistry.acquireCompressDict(
+                    dictBytes, dictId, ZstdConfig.INSTANCE.level);
+            if (e == null) {
+                return false;
+            }
+            releaseQuietly(decoderDictEntry);
+            decoderDictEntry = e;
+            compressCtx.loadDict(e.compressDict());
+            applySlimFrameFormat(); // loadDict 后幂等重申，避免参数被重置
+            return true;
         }
     }
 

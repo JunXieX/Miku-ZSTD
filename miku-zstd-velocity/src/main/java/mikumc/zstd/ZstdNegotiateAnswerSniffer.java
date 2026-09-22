@@ -4,6 +4,7 @@ import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.MessageToMessageDecoder;
 import mikumc.zstd.protocol.ZstdNegotiateStatus;
+import mikumc.zstd.protocol.ZstdVarInts;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -113,31 +114,32 @@ public class ZstdNegotiateAnswerSniffer extends MessageToMessageDecoder<ByteBuf>
         if (end - start < 3) return false;
         if ((in.getByte(start) & 0xFF) != PACKET_ID_ANSWER) return false;
 
-        // 解析 txId（无副作用读取）
-        long value = 0;
-        int shift = 0;
-        int pos = start + 1;
-        while (true) {
-            if (pos >= end || shift > 35) return false;
-            byte b = in.getByte(pos++);
-            value |= (long) (b & 0x7F) << shift;
-            if ((b & 0x80) == 0) break;
-            shift += 7;
-        }
-        int txId = (int) value;
+        // 无副作用读取 txId：借共享的 ByteBuf 版读取器，读完把读位置还原。
+        // （不能依赖 tryRead 内部的 mark/reset——它会把标记覆盖成 varint 的起点。）
+        // 成功后 tryRead 会把读位置推到 varint 之后，正好就是 success 位的下标，
+        // 这比用 length(txId) 重算更可靠（对非最小编码也成立）。
+        in.readerIndex(start + 1);
+        int txId = ZstdVarInts.tryRead(in, Integer.MAX_VALUE);
+        int successPos = in.readerIndex();
+        in.readerIndex(start);
+        if (txId < 0) return false;
+
         boolean isNegotiate = negotiateTxId > 0 && txId == negotiateTxId;
         boolean isDict = dictTxId > 0 && txId == dictTxId;
         if (!isNegotiate && !isDict) return false;
 
-        boolean success = pos < end && in.getByte(pos) != 0;
+        // 包结构： [varint txId][bool success][varint encStatus][varint decStatus]
+        boolean success = successPos < end && in.getByte(successPos) != 0;
         int encStatus = ZstdNegotiateStatus.VANILLA;
         int decStatus = ZstdNegotiateStatus.VANILLA;
-        if (success && pos + 1 < end) {
-            byte[] tail = new byte[end - pos - 1];
-            in.getBytes(pos + 1, tail);
+        if (success && successPos + 1 < end) {
+            byte[] tail = new byte[end - successPos - 1];
+            in.getBytes(successPos + 1, tail);
             int[] cursor = {0};
-            encStatus = ZstdNegotiateStatus.sanitize(readVarInt(tail, cursor, ZstdNegotiateStatus.FALLBACK));
-            decStatus = ZstdNegotiateStatus.sanitize(readVarInt(tail, cursor, ZstdNegotiateStatus.FALLBACK));
+            encStatus = ZstdNegotiateStatus.sanitize(
+                    ZstdVarInts.readOr(tail, cursor, ZstdNegotiateStatus.FALLBACK));
+            decStatus = ZstdNegotiateStatus.sanitize(
+                    ZstdVarInts.readOr(tail, cursor, ZstdNegotiateStatus.FALLBACK));
         }
 
         if (isNegotiate && ZstdHijacker.needsDictPush(encStatus, decStatus)) {
@@ -157,17 +159,5 @@ public class ZstdNegotiateAnswerSniffer extends MessageToMessageDecoder<ByteBuf>
         // 立即触发激活（若 SetCompression 已写出），省掉最长 100ms 的轮询等待
         ZstdHijacker.notifyDictResponse(ctx.channel());
         return true;
-    }
-
-    private static int readVarInt(byte[] data, int[] cursor, int fallback) {
-        int result = 0;
-        int shift = 0;
-        while (cursor[0] < data.length && shift <= 28) {
-            byte b = data[cursor[0]++];
-            result |= (b & 0x7F) << shift;
-            if ((b & 0x80) == 0) return result;
-            shift += 7;
-        }
-        return fallback;
     }
 }

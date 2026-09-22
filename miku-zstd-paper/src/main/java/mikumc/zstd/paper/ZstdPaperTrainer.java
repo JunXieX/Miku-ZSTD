@@ -19,8 +19,6 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.zip.CRC32;
-import java.util.zip.Checksum;
 
 import mikumc.zstd.protocol.ZstdDictAdoption.EvalResult;
 
@@ -229,24 +227,17 @@ public final class ZstdPaperTrainer {
             return;
         }
         List<byte[]> batch = null;
-        int pos = 0;
-        while (pos < length) {
-            int pktLen = 0;
-            int shift = 0;
-            while (pos < length && shift <= 28) {
-                byte b = raw[pos++];
-                pktLen |= (b & 0x7F) << shift;
-                if ((b & 0x80) == 0) {
-                    break;
-                }
-                shift += 7;
-            }
-            if (pktLen <= 0 || pos + pktLen > length) {
+        int[] cursor = {0};
+        while (cursor[0] < length) {
+            // 共享的 varint 读取器（与 Velocity 端、解码器基类同一份实现）
+            int pktLen = mikumc.zstd.protocol.ZstdVarInts.readOr(
+                    raw, cursor, mikumc.zstd.protocol.ZstdVarInts.INVALID);
+            if (pktLen <= 0 || cursor[0] + pktLen > length) {
                 break;
             }
             byte[] sample = new byte[pktLen];
-            System.arraycopy(raw, pos, sample, 0, pktLen);
-            pos += pktLen;
+            System.arraycopy(raw, cursor[0], sample, 0, pktLen);
+            cursor[0] += pktLen;
             if (!shouldKeep(sample)) {
                 continue;
             }
@@ -309,9 +300,7 @@ public final class ZstdPaperTrainer {
             if (newDict == null || newDict.length == 0) {
                 LOGGER.warn("[Zstd] {} 训练结果为空", name);
             } else {
-                Checksum crc = new CRC32();
-                crc.update(newDict, 0, newDict.length);
-                long dictId = crc.getValue();
+                long dictId = mikumc.zstd.protocol.ZstdDictId.of(newDict);
 
                 if (currentDict != null && currentDictId == dictId) {
                     LOGGER.info("[Zstd] {} 字典未变化，跳过", name);
@@ -494,9 +483,7 @@ public final class ZstdPaperTrainer {
             Path dictFile = dictDir.resolve(name + "_dict.bin");
             if (Files.exists(dictFile)) {
                 currentDict = Files.readAllBytes(dictFile);
-                Checksum crc = new CRC32();
-                crc.update(currentDict, 0, currentDict.length);
-                currentDictId = crc.getValue();
+                currentDictId = mikumc.zstd.protocol.ZstdDictId.of(currentDict);
                 LOGGER.info("[Zstd] {} 已从磁盘加载字典 id={} size={}B", name, currentDictId, currentDict.length);
             }
             List<byte[]> history = loadHistory();

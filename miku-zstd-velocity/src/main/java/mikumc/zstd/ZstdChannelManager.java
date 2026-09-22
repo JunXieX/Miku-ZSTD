@@ -4,6 +4,7 @@ import com.github.luben.zstd.ZstdCompressCtx;
 import com.github.luben.zstd.ZstdDecompressCtx;
 import io.netty.channel.Channel;
 import io.netty.util.AttributeKey;
+import mikumc.zstd.protocol.ZstdTrafficCounter;
 import mikumc.zstd.protocol.ZstdVarInts;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -275,9 +276,9 @@ public class ZstdChannelManager {
         }
         this.replaced = v;
         if (v) {
-            ZstdTrafficStats.playerActivated();
+            ZstdTrafficCounter.playerActivated();
         } else {
-            ZstdTrafficStats.playerDeactivated();
+            ZstdTrafficCounter.playerDeactivated();
         }
     }
 

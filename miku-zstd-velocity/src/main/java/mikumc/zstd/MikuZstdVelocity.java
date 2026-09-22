@@ -51,7 +51,7 @@ public class MikuZstdVelocity {
         ZstdBossBarMonitor.init(proxy, this);
         // ⚠️ 必须注册 BrigadierCommand（显式建树）。用 metaBuilder + SimpleCommand 会生成
         // "不接受参数的光杆 literal"，导致 /mikuzstd bar 报 Incorrect argument 且 TAB 无提示。
-        com.velocitypowered.api.command.BrigadierCommand mikuCommand = new ZstdCommand(proxy).build();
+        com.velocitypowered.api.command.BrigadierCommand mikuCommand = new ZstdCommand(proxy, this).build();
         proxy.getCommandManager().register(
                 proxy.getCommandManager().metaBuilder(mikuCommand)
                         .plugin(this)
@@ -187,6 +187,20 @@ public class MikuZstdVelocity {
                 logger.error("[Zstd] Failed to activate zstd negotiation, falling back to vanilla", e);
             }
         });
+    }
+
+    /**
+     * 按当前配置应用 debug 日志等级。
+     *
+     * <p>启动时调一次，{@code /mikuzstd reload} 后再调一次——否则改完配置 reload 会显示
+     * {@code debug: true} 而日志一条都不多，比不提供这个开关更糟。</p>
+     *
+     * <p>只处理"开启"：关闭需要人工改日志框架，插件不去重置等级（会误伤其它插件）。</p>
+     */
+    void applyDebugFromConfig() {
+        if (ZstdVelocityConfig.INSTANCE.debug) {
+            applyDebugLogLevel();
+        }
     }
 
     private void applyDebugLogLevel() {

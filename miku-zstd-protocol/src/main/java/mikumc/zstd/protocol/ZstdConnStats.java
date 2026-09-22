@@ -66,16 +66,16 @@ public final class ZstdConnStats {
             wire += s.wireBytes.sum();
         }
         double ratio = raw > 0 ? 100.0 * wire / raw : 100.0;
-        return String.format("活跃 %d 条 | 合计原始 %.1fMB → %.1fMB (%.1f%%)",
-                ACTIVE.size(), raw / 1048576.0, wire / 1048576.0, ratio);
+        return String.format("活跃 %d 条 | 合计原始 %s → %s (%.1f%%)",
+                ACTIVE.size(), ZstdBossBarFormat.fmtBytes(raw), ZstdBossBarFormat.fmtBytes(wire), ratio);
     }
 
     private String describe() {
         long raw = rawBytes.sum();
         long wire = wireBytes.sum();
         double ratio = raw > 0 ? 100.0 * wire / raw : 100.0;
-        return String.format("%-6s 原始 %7.1fMB → %7.1fMB (%5.1f%%)  帧 %6d  存活 %ds",
-                id, raw / 1048576.0, wire / 1048576.0, ratio, frames.sum(),
+        return String.format("%-6s 原始 %9s → %9s (%5.1f%%)  帧 %6d  存活 %ds",
+                id, ZstdBossBarFormat.fmtBytes(raw), ZstdBossBarFormat.fmtBytes(wire), ratio, frames.sum(),
                 (System.currentTimeMillis() - startedAt) / 1000);
     }
 }

@@ -5,6 +5,7 @@ import com.velocitypowered.api.proxy.Player;
 import com.velocitypowered.api.proxy.ProxyServer;
 import com.velocitypowered.api.scheduler.ScheduledTask;
 import mikumc.zstd.protocol.ZstdBossBarFormat;
+import mikumc.zstd.protocol.ZstdTrafficCounter;
 import net.kyori.adventure.bossbar.BossBar;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
@@ -19,8 +20,9 @@ import java.time.Duration;
  * <b>代理 ↔ 客户端</b>这一段生效的，所以只有代理端看到的字节数才等于玩家真实带宽。
  * 子服侧若有插件，统计的是"子服 ↔ 代理"那一段，口径不同。</p>
  *
- * <p>数据来自 {@link ZstdTrafficStats}（统计与显示刻意分开：那个类零平台依赖，
- * 因为编码器热路径会调用它，而协议回归测试的 classpath 里没有 Adventure）。
+ * <p>数据来自共享的 {@link ZstdTrafficCounter}（统计与显示刻意分开：那个类零平台依赖，
+ * 因为编码器热路径会调用它，而协议回归测试的 classpath 里没有 Adventure；
+ * 它的实现同样被 Paper 端复用，两端口径必然一致）。
  * 统计口径只覆盖<b>走 zstd 的连接</b>。</p>
  */
 public final class ZstdBossBarMonitor {
@@ -62,9 +64,9 @@ public final class ZstdBossBarMonitor {
         owner = player;
         BossBar bar = BossBar.bossBar(Component.empty(), 1.0f, BossBar.Color.GREEN, BossBar.Overlay.NOTCHED_20);
         bossBar = bar;
-        ZstdTrafficStats.setEnabled(true);
+        ZstdTrafficCounter.setEnabled(true);
         player.showBossBar(bar);
-        ZstdTrafficStats.resetBaseline(); // 先取基线，避免把历史累计当成 1 秒的量
+        ZstdTrafficCounter.resetBaseline(); // 先取基线，避免把历史累计当成 1 秒的量
 
         refreshTask = proxy.getScheduler()
                 .buildTask(plugin, ZstdBossBarMonitor::refresh)
@@ -82,7 +84,7 @@ public final class ZstdBossBarMonitor {
         }
         BossBar bar = bossBar;
         bossBar = null;
-        ZstdTrafficStats.setEnabled(false);
+        ZstdTrafficCounter.setEnabled(false);
         Player viewer = owner;
         owner = null;
         if (bar != null && viewer != null && viewer.isActive()) {
@@ -102,7 +104,7 @@ public final class ZstdBossBarMonitor {
             return;
         }
 
-        ZstdTrafficStats.Snapshot s = ZstdTrafficStats.sample();
+        ZstdTrafficCounter.Snapshot s = ZstdTrafficCounter.sample();
         String text = ZstdBossBarFormat.substitute(
                 ZstdVelocityConfig.INSTANCE.bossbarFormat, s.players, s.rawPerSec, s.wirePerSec, s.ratio);
         // ⚠️ Adventure 5.x 把 BossBar#title 改名成了 #name（4.x 才叫 title）

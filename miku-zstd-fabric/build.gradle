@@ -114,8 +114,10 @@ def slimZipBytes = { byte[] src, List<String> keep ->
     return out.toByteArray()
 }
 
+// 由 jar 任务 finalizedBy 触发（见文件末尾），因此这里<b>不能</b>再写 dependsOn jar：
+// 那会构成 jar → slimNestedNative → jar 的回边，Gradle 虽能容忍，但任务依赖图会变得
+// 难以推理（也无法安全启用配置缓存）。finalizer 已经保证"jar 跑完才轮到本任务"。
 tasks.register('slimNestedNative') {
-    dependsOn tasks.named('jar')
     doLast {
         def modJar = tasks.named('jar').get().archiveFile.get().asFile
         if (!modJar.exists()) {

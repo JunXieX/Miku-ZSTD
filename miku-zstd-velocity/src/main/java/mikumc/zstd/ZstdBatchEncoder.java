@@ -3,6 +3,7 @@ package mikumc.zstd;
 import com.github.luben.zstd.ZstdCompressCtx;
 import io.netty.channel.ChannelHandlerContext;
 import mikumc.zstd.protocol.ZstdBatchEncoderBase;
+import mikumc.zstd.protocol.ZstdTrafficCounter;
 
 /**
  * Miku-ZSTD 编码器（服务端 → 客户端）协议 <b>v3</b>。
@@ -58,7 +59,7 @@ public class ZstdBatchEncoder extends ZstdBatchEncoderBase {
     @Override
     protected void onFrame(int rawBytes, int wireBytes, boolean compressed) {
         ZstdBandwidthProfiler.record(rawBytes, wireBytes, compressed);
-        ZstdTrafficStats.record(rawBytes, wireBytes);
+        ZstdTrafficCounter.record(rawBytes, wireBytes);
         ZstdChannelManager m = manager;
         if (m != null) {
             m.stats.record(rawBytes, wireBytes);
