@@ -93,3 +93,129 @@ jobs:
           files: dist/*.jar
           prerelease: ${{ contains(github.ref_name, 'Beta') }}
           generate_release_notes: true
+
+  # Modrinth 只在**正式版**（tag 不含 Beta）发布：测试版完全跳过，连 job 都不进。
+  # 发布逻辑内联在这里，不往仓库里加脚本文件（仓库只允许源码与 README）。
+  modrinth:
+    name: Modrinth
+    needs: [velocity, paper, fabric]
+    if: startsWith(github.ref, 'refs/tags/') && !contains(github.ref_name, 'Beta')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish to Modrinth
+        env:
+          MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MODRINTH_PROJECT: qQZo9ztT
+          GAME_VERSIONS: "26.2,26.3"
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request, urllib.error, uuid
+
+          TOKEN = os.environ["MODRINTH_TOKEN"]
+          PROJECT = os.environ["MODRINTH_PROJECT"]
+          GVS = [x for x in os.environ["GAME_VERSIONS"].split(",") if x]
+          TAG = os.environ["GITHUB_REF_NAME"]
+          VERSION = TAG[1:] if TAG.startswith("v") else TAG
+          REPO = os.environ["GITHUB_REPOSITORY"]
+          DIST = "dist"
+
+          def http(url, method="GET", data=None, headers=None):
+              req = urllib.request.Request(url, data=data, method=method)
+              for k, v in (headers or {}).items():
+                  req.add_header(k, v)
+              try:
+                  with urllib.request.urlopen(req, timeout=180) as r:
+                      raw = r.read().decode("utf-8")
+                      return r.status, (json.loads(raw) if raw.strip() else {})
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read().decode("utf-8", "replace")[:400]
+
+          def mr(method, path, data=None, ctype="application/json"):
+              return http("https://api.modrinth.com/v2" + path, method, data,
+                          {"User-Agent": "JunXieX/Miku-ZSTD-ci (github.com/JunXieX)",
+                           "Authorization": TOKEN,
+                           **({"Content-Type": ctype} if data else {})})
+
+          def multipart(fields, files):
+              b = "----MikuMC" + uuid.uuid4().hex
+              buf = bytearray()
+              for k, v in fields.items():
+                  buf += ("--%s\r\nContent-Disposition: form-data; name=\"%s\"\r\n\r\n%s\r\n"
+                          % (b, k, v)).encode("utf-8")
+              for k, (fn, content) in files.items():
+                  buf += ("--%s\r\nContent-Disposition: form-data; name=\"%s\"; filename=\"%s\"\r\n"
+                          "Content-Type: application/java-archive\r\n\r\n" % (b, k, fn)).encode("utf-8")
+                  buf += content + b"\r\n"
+              buf += ("--%s--\r\n" % b).encode("utf-8")
+              return bytes(buf), "multipart/form-data; boundary=%s" % b
+
+          # changelog 复用 GitHub Release 正文（单一来源），取不到才用兜底文案
+          changelog = "Miku-ZSTD %s" % VERSION
+          st, rel = http("https://api.github.com/repos/%s/releases/tags/%s" % (REPO, TAG),
+                         headers={"Authorization": "Bearer " + os.environ["GITHUB_TOKEN"],
+                                  "Accept": "application/vnd.github+json"})
+          if st == 200 and rel.get("body", "").strip():
+              changelog = rel["body"]
+          else:
+              print("[warn] 取 GitHub Release 正文失败（HTTP %s），使用兜底 changelog" % st)
+
+          # 已有版本，用于幂等：重复跑同一次发布不应产生重复版本
+          st, existing = mr("GET", "/project/%s/version" % PROJECT)
+          have = set()
+          if st == 200 and isinstance(existing, list):
+              for v in existing:
+                  have.add((v.get("version_number"), tuple(sorted(v.get("loaders") or []))))
+          print("已有版本:", sorted(have))
+
+          # ⚠️ 必须按 loader 拆成独立版本：Modrinth 要求**同一版本内所有文件**都满足
+          # 该 loader 的元数据（paper 要 paper-plugin.yml、fabric 要 fabric.mod.json），
+          # 三种产物混在一个版本里会被 400 拒绝。
+          PLAN = [
+              ("-Velocity.jar", ["velocity"], "server_only"),
+              ("-Paper.jar",    ["paper"],    "server_only"),
+              ("-Fabric.jar",   ["fabric"],   "client_only"),
+          ]
+
+          rc = 0
+          for suffix, loaders, env in PLAN:
+              key = (VERSION, tuple(sorted(loaders)))
+              if key in have:
+                  print("[skip] %s %s 已存在" % (VERSION, "/".join(loaders)))
+                  continue
+              jar = os.path.join(DIST, "Miku-ZSTD-%s%s" % (VERSION, suffix))
+              if not os.path.isfile(jar):
+                  print("[skip] 找不到 %s" % jar)
+                  continue
+              with open(jar, "rb") as f:
+                  content = f.read()
+              data = {
+                  "project_id": PROJECT,
+                  "name": "Miku-ZSTD %s (%s)" % (VERSION, " + ".join(l.capitalize() for l in loaders)),
+                  "version_number": VERSION,
+                  "changelog": changelog,
+                  "version_type": "release",
+                  "game_versions": GVS,
+                  "loaders": loaders,
+                  "environment": env,
+                  "file_parts": ["file"],
+                  "primary_file": "file",
+                  "status": "listed",
+                  "featured": False,
+                  "dependencies": [],
+              }
+              body, ctype = multipart({"data": json.dumps(data, ensure_ascii=False)},
+                                      {"file": (os.path.basename(jar), content)})
+              st, resp = mr("POST", "/version", body, ctype)
+              print("POST /version [%s] -> HTTP %s" % ("/".join(loaders), st))
+              if st in (200, 201):
+                  print("  已发布 id=%s number=%s" % (resp.get("id"), resp.get("version_number")))
+              else:
+                  print("  错误: %s" % resp)
+                  rc = 1
+          raise SystemExit(rc)
+          PY
