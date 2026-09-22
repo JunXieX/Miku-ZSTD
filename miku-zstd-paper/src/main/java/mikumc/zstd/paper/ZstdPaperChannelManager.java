@@ -45,6 +45,7 @@ public class ZstdPaperChannelManager {
     private volatile boolean responseReceived;
     private volatile boolean refused;
     private volatile boolean confirmed;
+    private volatile boolean dictRequested;
     private volatile boolean replaced;
 
     public ZstdPaperChannelManager() {
@@ -132,11 +133,45 @@ public class ZstdPaperChannelManager {
     /**
      * 回填协商结论。语义与另两端完全一致：
      * {@code 0 = 客户端启用 zstd}、{@code 1 = 需要字典}、{@code 2 = 客户端保持原版}。
+     *
+     * <p>两点收紧（与 Velocity 端对齐）：</p>
+     * <ul>
+     *   <li>状态码经 {@link ZstdNegotiateStatus#sanitize} 归一化，越界值不再被当成
+     *       第三种状态放行；</li>
+     *   <li>{@code confirmed} 的含义<b>必须</b>是"两个方向都是 0（就绪）"。旧实现写成
+     *       {@code confirmed = !refused}，于是 {@code (1,1)}（客户端还在等字典）也会被
+     *       判为"已确认"，本端就会在客户端尚未激活时先行激活 → 单侧 zstd → 断连。</li>
+     * </ul>
+     *
+     * @param clientAnswered 客户端是否理解了这次查询（应答的 success 位）；
+     *                       false 表示它不认识该通道（多半没装模组），与"装了但版本不匹配"要分开看
      */
-    public void markResponse(int encStatus, int decStatus) {
+    public void markResponse(int encStatus, int decStatus, boolean clientAnswered) {
         this.responseReceived = true;
-        this.refused = encStatus == 2 || decStatus == 2;
-        this.confirmed = !this.refused;
+        int enc = mikumc.zstd.protocol.ZstdNegotiateStatus.sanitize(encStatus);
+        int dec = mikumc.zstd.protocol.ZstdNegotiateStatus.sanitize(decStatus);
+        this.refused = enc == mikumc.zstd.protocol.ZstdNegotiateStatus.VANILLA
+                || dec == mikumc.zstd.protocol.ZstdNegotiateStatus.VANILLA;
+        this.confirmed = !this.refused
+                && enc == mikumc.zstd.protocol.ZstdNegotiateStatus.READY
+                && dec == mikumc.zstd.protocol.ZstdNegotiateStatus.READY;
+        if (!clientAnswered) {
+            LOGGER.debug("[Zstd] 客户端未识别 zstd:negotiate（未安装 Miku-ZSTD 模组），保持原版 zlib");
+        } else if (this.refused) {
+            LOGGER.debug("[Zstd] 客户端拒绝 zstd（enc={} dec={}）——多为两端版本不匹配，保持原版 zlib", enc, dec);
+        } else {
+            LOGGER.debug("[Zstd] 协商应答：enc={} dec={} confirmed={}", enc, dec, this.confirmed);
+        }
+    }
+
+    /** 客户端报告过"缺字典"（协议 v4 需先推 {@code zstd:dict}）。 */
+    public void markDictRequested() {
+        this.dictRequested = true;
+    }
+
+    /** 客户端是否报告过缺字典——激活前必须等字典确认，见 {@code ZstdPaperNegotiator} 的硬门控。 */
+    public boolean isDictRequested() {
+        return dictRequested;
     }
 
     public boolean isResponseReceived() {

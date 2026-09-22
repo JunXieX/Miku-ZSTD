@@ -5,6 +5,7 @@ import io.netty.channel.Channel;
 import io.netty.channel.ChannelDuplexHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelPromise;
+import mikumc.zstd.protocol.ZstdNegotiateStatus;
 import mikumc.zstd.protocol.ZstdVarInts;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -35,18 +36,11 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
 
     private static final long RETRY_MS = 100;
     private static final int MAX_RETRIES = 20;
-    /**
-     * 诊断开关：打印管线名与入站包结构（定位应答包用）。
-     * 默认关闭——开启时会打印每个入站包，仅用于排障。
-     */
-    private static final boolean DIAG = false;
-    private static final int DIAG_MAX_PACKETS = 12;
 
     private boolean holding;
     private final List<Object> heldPackets = new ArrayList<>();
     private final List<ChannelPromise> heldPromises = new ArrayList<>();
 
-    private int diagCount;
     /**
      * 连接去向：{@code TRUE}=登录连接、{@code FALSE}=服务器列表 ping、{@code null}=尚未确定。
      *
@@ -60,15 +54,6 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
     @Override
     public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
         ZstdPaperChannelManager mgr = ctx.channel().attr(ZstdPaperChannelManager.KEY).get();
-
-        if (DIAG && diagCount < DIAG_MAX_PACKETS && msg != null) {
-            diagCount++;
-            if (diagCount == 1) {
-                LOGGER.info("[Zstd][DIAG] pipeline={}", ctx.channel().pipeline().names());
-            }
-            LOGGER.info("[Zstd][DIAG] inbound[{}] {} | {}", diagCount,
-                    msg.getClass().getName(), dumpFields(msg));
-        }
 
         // 1) 握手包：必须区分「服务器列表 ping」与「登录」。
         //    ⚠️ 两者都会发 ClientIntentionPacket，只看"有没有握手包"等于没有门控——
@@ -101,28 +86,31 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
             String cn = msg.getClass().getSimpleName();
             if (cn.contains("Query") || cn.contains("Plugin")) {
                 int tx = readInt(msg, "transactionId", "id", "transactionID");
-                if (DIAG) {
-                    LOGGER.info("[Zstd][DIAG] 候选应答包 {} tx={} (期望 tx={})", cn, tx, mgr.getNegotiateTxId());
-                }
                 boolean isNegotiate = tx != 0 && tx == mgr.getNegotiateTxId();
                 boolean isDict = tx != 0 && tx == mgr.getDictTxId();
                 if (isNegotiate || isDict) {
                     byte[] payload = readBytes(msg, "data", "payload", "contents");
-                    int enc = 2;
-                    int dec = 2;
+                    // 取不到字节 = 客户端没理解这次查询（success=false），与"理解了但拒绝"必须分开表述
+                    boolean success = payload != null;
+                    int enc = ZstdNegotiateStatus.VANILLA;
+                    int dec = ZstdNegotiateStatus.VANILLA;
                     if (payload != null && payload.length >= 2) {
                         int[] cursor = {0};
-                        enc = readVarInt(payload, cursor, 2);
-                        dec = readVarInt(payload, cursor, 2);
+                        enc = ZstdNegotiateStatus.sanitize(
+                                readVarInt(payload, cursor, ZstdNegotiateStatus.FALLBACK));
+                        dec = ZstdNegotiateStatus.sanitize(
+                                readVarInt(payload, cursor, ZstdNegotiateStatus.FALLBACK));
                     }
-                    LOGGER.info("[Zstd] 捕获{}应答: {} tx={} enc={} dec={}",
-                            isDict ? "字典" : "协商", cn, tx, enc, dec);
+                    LOGGER.debug("[Zstd] 捕获{}应答: {} tx={} enc={} dec={} success={}",
+                            isDict ? "字典" : "协商", cn, tx, enc, dec, success);
                     io.netty.util.ReferenceCountUtil.release(msg);
-                    if (isNegotiate && (enc == 1 || dec == 1)) {
+                    if (isNegotiate && ZstdPaperNegotiator.needsDictPush(enc, dec)) {
                         // 协议 v4：客户端缺字典 → 单独推送 zstd:dict，门控结论等其应答
-                        sendDictQuery(ctx, enc == 1, dec == 1);
+                        mgr.markDictRequested();
+                        sendDictQuery(ctx, ZstdNegotiateStatus.needsDict(enc),
+                                ZstdNegotiateStatus.needsDict(dec));
                     } else {
-                        mgr.markResponse(enc, dec);
+                        mgr.markResponse(enc, dec, success);
                         ctx.channel().eventLoop().execute(() -> tryActivate(ctx, 0));
                     }
                     return;
@@ -158,7 +146,7 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
             if (decId != 0) flags |= 2;
             buf.writeByte(flags); // v4 仅声明"有字典"，字节按需另发
             ctx.writeAndFlush(buf);
-            LOGGER.info("[Zstd] Sent zstd:negotiate txId={}", txId);
+            LOGGER.debug("[Zstd] Sent zstd:negotiate txId={}", txId);
         } catch (Throwable t) {
             if (buf.refCnt() > 0) buf.release();
             throw t;
@@ -187,7 +175,7 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
             if (enc != null && enc.length > 0) writeDictBytes(buf, enc);
             if (dec != null && dec.length > 0) writeDictBytes(buf, dec);
             ctx.writeAndFlush(buf);
-            LOGGER.info("[Zstd] 已推送 zstd:dict txId={} flags={} (enc={}B dec={}B)", txId, flags,
+            LOGGER.debug("[Zstd] 已推送 zstd:dict txId={} flags={} (enc={}B dec={}B)", txId, flags,
                     enc == null ? 0 : enc.length, dec == null ? 0 : dec.length);
         } catch (Throwable t) {
             if (buf.refCnt() > 0) buf.release();
@@ -214,11 +202,6 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
         if (!holding && isPacket(msg)
                 && msg.getClass().getSimpleName().contains("ClientboundLoginCompression")) {
             sendNegotiate(ctx); // 兜底
-            // 诊断：SetCompression 写出时管线里已装好原版压缩处理器，这里能看到它的真实名字
-            if (DIAG) {
-                LOGGER.info("[Zstd][DIAG] SetCompression 写出，此时 pipeline={}",
-                        ctx.channel().pipeline().names());
-            }
             holding = true;
             super.write(ctx, msg, promise);
             ctx.channel().eventLoop().execute(() -> tryActivate(ctx, 0));
@@ -272,16 +255,23 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
             releaseHeld(ctx);
             return;
         }
+
+        // ⚠️ 协议 v4 硬门控：客户端报告过"缺字典"，但最终没确认字典就绪
+        //（推送丢失 / 客户端加载失败 / 应答没被捕获到）。此时绝不能激活——
+        // 客户端会因为等字典停在 PLAIN 状态永不激活，单侧 zstd 必断连。
+        if (mgr.isDictRequested() && !mgr.isConfirmed()) {
+            LOGGER.warn("[Zstd] 客户端请求了字典但未确认就绪（zstd:dict 应答缺失）"
+                    + "— 放弃 zstd 并回落原版，避免单侧 zstd 断连");
+            releaseHeld(ctx);
+            return;
+        }
         // 客户端确认就绪 → 装载共享字典（仅此时装载，避免与客户端不一致）
         if (mgr.isConfirmed()) {
             mgr.loadTrainerDicts();
         }
 
 
-        if (DIAG) {
-            LOGGER.info("[Zstd][DIAG] 激活前 pipeline={}", channel.pipeline().names());
-        }
-        LOGGER.info("[Zstd] 正在安装 zstd 编解码器 (attempt={}, pipeline={})",
+        LOGGER.debug("[Zstd] 正在安装 zstd 编解码器 (attempt={}, pipeline={})",
                 attempt, channel.pipeline().names());
         if (!mgr.installEncoder(channel) || !mgr.installDecoder(channel)) {
             // ⚠️ 原版的 compress/decompress 是在 SetCompression 写出**之后**才安装的
@@ -310,7 +300,7 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
         List<ChannelPromise> promises = new ArrayList<>(heldPromises);
         heldPackets.clear();
         heldPromises.clear();
-        LOGGER.info("[Zstd] releasing {} packet(s) held during activation window", packets.size());
+        LOGGER.debug("[Zstd] releasing {} packet(s) held during activation window", packets.size());
         for (int i = 0; i < packets.size(); i++) {
             ctx.write(packets.get(i), promises.get(i));
         }
@@ -320,6 +310,12 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
     @Override
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
         holding = false;
+        // ⚠️ 先把包本身 release 掉：它们是 ReferenceCounted 的（内部持有 ByteBuf），
+        // 扣下时所有权已转到本处理器；既然永远不会被写出，就没有别人替我们释放。
+        // 少了这一步，每次"激活窗口内断线"都会泄漏一批（Netty leak detector 会报 LEAK）。
+        for (Object p : heldPackets) {
+            io.netty.util.ReferenceCountUtil.release(p);
+        }
         heldPackets.clear();
         for (ChannelPromise p : heldPromises) {
             p.tryFailure(new java.nio.channels.ClosedChannelException());
@@ -328,30 +324,16 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
         super.channelInactive(ctx);
     }
 
-    private static boolean isPacket(Object msg) {
-        return NMS_PACKET != null && NMS_PACKET.isInstance(msg);
+    /**
+     * 客户端是否在 negotiate 应答里报告了"缺字典"（协议 v4 需要先推一次 {@code zstd:dict}）。
+     * 与 Velocity 端保持同一份判断——两端漏分支的表现都是"单侧 zstd → 断连"。
+     */
+    private static boolean needsDictPush(int encStatus, int decStatus) {
+        return ZstdNegotiateStatus.needsDict(encStatus) || ZstdNegotiateStatus.needsDict(decStatus);
     }
 
-    /** 诊断：打印对象自身与父类的字段（名/类型/值）。 */
-    private static String dumpFields(Object o) {
-        StringBuilder sb = new StringBuilder();
-        Class<?> c = o.getClass();
-        while (c != null && c != Object.class) {
-            for (Field f : c.getDeclaredFields()) {
-                try {
-                    f.setAccessible(true);
-                    Object v = f.get(o);
-                    String s = String.valueOf(v);
-                    if (s.length() > 70) s = s.substring(0, 70) + "…";
-                    sb.append(f.getName()).append(':').append(f.getType().getSimpleName())
-                            .append('=').append(s).append("  ");
-                } catch (Throwable ignored) {
-                    // 忽略不可读字段
-                }
-            }
-            c = c.getSuperclass();
-        }
-        return sb.toString();
+    private static boolean isPacket(Object msg) {
+        return NMS_PACKET != null && NMS_PACKET.isInstance(msg);
     }
 
     /**
@@ -419,10 +401,7 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
                 return out;
             }
         }
-        if (DIAG) {
-            LOGGER.info("[Zstd][DIAG] 未能从 {} 取出字节，字段={}",
-                    v.getClass().getName(), dumpFields(v));
-        }
+        LOGGER.debug("[Zstd] 未能从 {} 取出应答字节（该包的负载结构可能又变了）", v.getClass().getName());
         return null;
     }
 

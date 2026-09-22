@@ -7,6 +7,7 @@ import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelPipeline;
 import io.netty.channel.ChannelPromise;
 import io.netty.util.ReferenceCountUtil;
+import mikumc.zstd.protocol.ZstdNegotiateStatus;
 import mikumc.zstd.protocol.ZstdVarInts;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -182,21 +183,23 @@ public class ZstdHijacker extends ChannelDuplexHandler {
             boolean isDict = mgr.getDictTxId() != 0 && txId == mgr.getDictTxId();
             if (isNegotiate || isDict) {
                 try {
-                    int encStatus = 2;
-                    int decStatus = 2;
                     Object contentValue = invokeOrNull(M_RESP_CONTENT, msg);
                     ByteBuf data = contentValue instanceof ByteBuf bb ? bb : null;
                     boolean success = Boolean.TRUE.equals(invokeOrNull(M_RESP_SUCCESS, msg));
+                    int encStatus = ZstdNegotiateStatus.VANILLA;
+                    int decStatus = ZstdNegotiateStatus.VANILLA;
                     if (success && data != null && data.readableBytes() >= 2) {
                         encStatus = readStatus(data);
                         decStatus = readStatus(data);
                     }
-                    if (isNegotiate && (encStatus == 1 || decStatus == 1)) {
+                    if (isNegotiate && needsDictPush(encStatus, decStatus)) {
                         // 协议 v4：客户端报告缺字典 —— 单独推送一次 zstd:dict，
                         // 门控结论等这次推送的应答到达后再定（见 markDictResponse 调用点）
-                        sendDictQuery(ctx.channel(), encStatus == 1, decStatus == 1);
+                        mgr.markDictRequested();
+                        sendDictQuery(ctx.channel(), ZstdNegotiateStatus.needsDict(encStatus),
+                                ZstdNegotiateStatus.needsDict(decStatus));
                     } else {
-                        mgr.markDictResponse(encStatus, decStatus);
+                        mgr.markDictResponse(encStatus, decStatus, success);
                         if (isDict) {
                             ZstdHijacker.notifyDictResponse(ctx.channel());
                         }
@@ -264,13 +267,19 @@ public class ZstdHijacker extends ChannelDuplexHandler {
     }
 
     /**
-     * 通道关闭时把扣住的 promise 补完。
+     * 通道关闭时把扣住的包与 promise 一起收尾。
      *
-     * <p>⚠️ 缺少这一步会造成 <b>promise 永不完成</b>：扣包时我们把调用方给的 promise
-     * 存进了 {@link #heldPromises}，只有 {@code releaseHeld} 才会让它们被 netty 完成。
-     * 若连接在激活窗口内断开（客户端掉线、超时），{@code tryActivate} 会因为
-     * {@code !channel.isActive()} 提前返回，那些 promise 就再也没人完成——
-     * 等待它们的一方会永久挂住。这类问题不会报错、不会泄漏堆，只会表现为"偶发卡死"。</p>
+     * <p>⚠️ <b>两件事都必须做，缺一件各有一个隐蔽后果：</b></p>
+     * <ul>
+     *   <li><b>不补 promise</b>：扣包时把调用方给的 promise 存进了 {@link #heldPromises}，
+     *       只有 {@code releaseHeld} 才会让它们被 netty 完成。若连接在激活窗口内断开
+     *       （客户端掉线、超时），{@code tryActivate} 会因为 {@code !channel.isActive()}
+     *       提前返回，那些 promise 就再也没人完成——等待它们的一方会永久挂住。
+     *       这类问题不报错、不泄漏堆，只表现为"偶发卡死"；</li>
+     *   <li><b>不 release 包</b>：这些包是 ReferenceCounted 的（内部持有 ByteBuf），
+     *       扣下时所有权已转到本处理器。它们永远不会被写出，因此不会有人替我们释放——
+     *       每次"激活窗口内断线"都会泄漏一批（Netty leak detector 会报 LEAK）。</li>
+     * </ul>
      */
     @Override
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
@@ -281,8 +290,11 @@ public class ZstdHijacker extends ChannelDuplexHandler {
     /** 用给定异常补完所有扣住的 promise（幂等：列表清空后重复调用无副作用）。 */
     private void failHeldPromises(Throwable cause) {
         holding = false;
+        // ⚠️ 顺序不能反：先把包本身释放掉，再补 promise。
+        // 这些包是 ReferenceCounted 的（内部持有 ByteBuf），扣下时所有权就转到我们手上；
+        // 既然永远不会被写出，就必须由我们 release，否则每次"激活窗口内断线"都泄漏一批。
+        releaseHeldPackets();
         if (heldPromises.isEmpty()) {
-            heldPackets.clear();
             return;
         }
         LOGGER.debug("[Zstd] channel closed with {} held packet(s) — failing their promises",
@@ -293,6 +305,21 @@ public class ZstdHijacker extends ChannelDuplexHandler {
             }
         }
         heldPromises.clear();
+    }
+
+    /**
+     * 释放扣住的包本身（{@link #heldPackets}），不碰 promise。
+     *
+     * <p>只用于"这些包永远不会被写出"的路径（连接关闭）。正常补发走 {@link #releaseHeld}，
+     * 那条路上包会被交给管线，由管线负责释放——两处不要混淆，否则会双重释放。</p>
+     */
+    private void releaseHeldPackets() {
+        if (heldPackets.isEmpty()) {
+            return;
+        }
+        for (Object p : heldPackets) {
+            ReferenceCountUtil.release(p);
+        }
         heldPackets.clear();
     }
 
@@ -316,8 +343,26 @@ public class ZstdHijacker extends ChannelDuplexHandler {
         ctx.flush();
     }
 
-    /** 门控激活：等待协商应答；版本不匹配/超时则放弃（原版 zlib 全程接管）。 */
+    /**
+     * 门控激活入口：包一层异常兜底后再进 {@link #tryActivate0}。
+     *
+     * <p>⚠️ 这层兜底不能省。本方法跑在 {@code eventLoop().execute/schedule} 里，
+     * 抛出的异常会被 event loop 吞掉，于是 {@link #releaseHeld} <b>永不执行</b>——
+     * 激活窗口内扣住的包与 promise 会永久挂起，客户端表现为<b>连接卡死</b>（而不是断连），
+     * 日志里只有一行堆栈甚至什么都没有。Paper 端一直有这层保护，本端曾有缺口。</p>
+     */
     private void tryActivate(ChannelHandlerContext ctx, int attempt) {
+        try {
+            tryActivate0(ctx, attempt);
+        } catch (Throwable t) {
+            LOGGER.error("[Zstd] activation flow failed (attempt={}) — releasing held packets, staying vanilla",
+                    attempt, t);
+            releaseHeld(ctx);
+        }
+    }
+
+    /** 门控激活：等待协商应答；版本不匹配/字典未确认/超时则放弃（原版 zlib 全程接管）。 */
+    private void tryActivate0(ChannelHandlerContext ctx, int attempt) {
         Channel channel = ctx.channel();
         if (!channel.isActive() || pipelineRemoved(channel)) return;
 
@@ -339,6 +384,18 @@ public class ZstdHijacker extends ChannelDuplexHandler {
         if (mgr.isProtocolMismatch()) {
             LOGGER.warn("[Zstd] Protocol mismatch reported by client — skipping zstd (vanilla fallback)");
             releaseHeld(ctx); // 回落原版：补发扣下的包
+            return;
+        }
+
+        // ⚠️ 协议 v4 硬门控（必需，不能只依赖"应答已到"）：
+        // 客户端报告过"缺字典"，但最终没有确认字典就绪 —— 推送丢失、客户端加载失败、
+        // 或该应答在帧层被别的捕获点消费掉了。此时**绝不能激活**：客户端会因为等字典
+        // 停在 PLAIN 状态永不激活，于是服务端 zstd / 客户端 vanilla → 必断连。
+        // 宁可回落原版（少一点压缩率），也不能让玩家进不去。
+        if (mgr.isDictRequested() && !mgr.isDictConfirmed()) {
+            LOGGER.warn("[Zstd] 客户端请求了字典但未确认就绪（zstd:dict 应答缺失）"
+                    + "— 放弃 zstd 并回落原版，避免单侧 zstd 断连");
+            releaseHeld(ctx);
             return;
         }
 
@@ -459,7 +516,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
                 // 协议 v4：字典不再内联——只声明 id，客户端缺哪个再单独推 zstd:dict
 
                 writeCtx.writeAndFlush(buf);
-                LOGGER.info("[Zstd] Sent zstd:negotiate txId={} encId={} decId={}", txId, encId, decId);
+                LOGGER.debug("[Zstd] Sent zstd:negotiate txId={} encId={} decId={}", txId, encId, decId);
             } catch (Throwable t) {
                 if (buf.refCnt() > 0) buf.release();
                 throw t;
@@ -474,8 +531,11 @@ public class ZstdHijacker extends ChannelDuplexHandler {
      *
      * <p>与 negotiate 分开的原因：直连场景（Paper 端）无法预筛客户端，
      * 若把几百 KB 的字典内联进 negotiate，不支持 zstd 的客户端也要白吃这份流量。</p>
+     *
+     * <p>包可见：帧层嗅探器（{@link ZstdNegotiateAnswerSniffer}）捕获到 negotiate 应答后
+     * 也要走这条路——它是主路径，且应答在帧层就被消费掉了，Hijacker 的包层分支看不到。</p>
      */
-    private static void sendDictQuery(Channel channel, boolean needEncoder, boolean needDecoder) {
+    static void sendDictQuery(Channel channel, boolean needEncoder, boolean needDecoder) {
         try {
             ZstdChannelManager mgr = channel.attr(ZstdChannelManager.KEY).get();
             if (mgr == null) return;
@@ -506,7 +566,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
                 if (enc != null && enc.length > 0) writeDictBytes(buf, enc);
                 if (dec != null && dec.length > 0) writeDictBytes(buf, dec);
                 writeCtx.writeAndFlush(buf);
-                LOGGER.info("[Zstd] Sent zstd:dict txId={} flags={}", txId, flags);
+                LOGGER.debug("[Zstd] Sent zstd:dict txId={} flags={}", txId, flags);
             } catch (Throwable t) {
                 if (buf.refCnt() > 0) buf.release();
                 throw t;
@@ -516,17 +576,35 @@ public class ZstdHijacker extends ChannelDuplexHandler {
         }
     }
 
+    /** 线上字典帧：{@code [int crc32][int len][bytes]}；crc 必须与字典 id 同源。 */
     private static void writeDictBytes(ByteBuf buf, byte[] dict) {
-        java.util.zip.CRC32 crc = new java.util.zip.CRC32();
-        crc.update(dict);
-        buf.writeInt((int) crc.getValue());
+        buf.writeInt(mikumc.zstd.protocol.ZstdDictId.wireChecksum(dict));
         buf.writeInt(dict.length);
         buf.writeBytes(dict);
     }
 
-    /** 解析应答状态；解析失败按"不可用"(2) 处理。 */
+    /**
+     * 客户端是否在 negotiate 应答里报告了"缺字典"（协议 v4 需要先推一次 {@code zstd:dict}）。
+     *
+     * <p><b>两条捕获点（包层 Hijacker / 帧层嗅探器）必须用同一份判断</b>——
+     * 以前帧层嗅探器少了这个分支，导致服务端跳过字典推送就直接激活，
+     * 而客户端因为"等字典"停在 PLAIN 状态永不激活 → 单侧 zstd → 断连。</p>
+     */
+    static boolean needsDictPush(int encStatus, int decStatus) {
+        return ZstdNegotiateStatus.needsDict(encStatus) || ZstdNegotiateStatus.needsDict(decStatus);
+    }
+
+    /**
+     * 解析应答状态；解析失败或越界一律按"不可用"({@link ZstdNegotiateStatus#VANILLA}) 处理。
+     *
+     * <p>必须走白名单归一化：畸形载荷里的越界值（如 7）如果被原样放行，
+     * 会变成两端理解不一致的"第三种状态"——见 {@link ZstdNegotiateStatus}。</p>
+     */
     private static int readStatus(ByteBuf buf) {
         int v = ZstdVarInts.tryRead(buf, Integer.MAX_VALUE);
-        return (v == ZstdVarInts.NEED_MORE || v == ZstdVarInts.INVALID) ? 2 : v;
+        if (v == ZstdVarInts.NEED_MORE || v == ZstdVarInts.INVALID) {
+            return ZstdNegotiateStatus.VANILLA;
+        }
+        return ZstdNegotiateStatus.sanitize(v);
     }
 }

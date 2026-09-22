@@ -65,8 +65,18 @@ public class ZstdChannelManager {
     private volatile boolean dictResponseReceived;
     /** 客户端确认双向字典就绪（encStatus==0 && decStatus==0） */
     private volatile boolean dictConfirmed;
+    /**
+     * 客户端曾报告"缺字典"（encStatus==1 / decStatus==1），即协议 v4 需要推一次
+     * {@code zstd:dict} 才能激活。激活前的硬门控要看它：见
+     * {@link #isDictConfirmed()} 与 ZstdHijacker 的 activateZstd。
+     */
+    private volatile boolean dictRequested;
     /** 客户端协议版本不匹配（status==2），须完全跳过 zstd */
     private volatile boolean protocolMismatch;
+
+    /** 「协议不匹配」告警的只报一次标志（该情形通常影响所有客户端，逐连接重复无价值） */
+    private static final java.util.concurrent.atomic.AtomicBoolean MISMATCH_WARNED =
+            new java.util.concurrent.atomic.AtomicBoolean();
 
     private volatile boolean replaced;
     private volatile boolean negotiationSent;
@@ -192,20 +202,51 @@ public class ZstdChannelManager {
      * 客户端 zstd"的必断连组合（3.1.0 实测"无法进入服务器"的根因即客户端在
      * 服务端尚无字典时返回 2 却仍激活了 zstd）。</p>
      *
-     * @param encStatus 客户端对 encoder 字典的应答（0=可用，2=不可用）
-     * @param decStatus 客户端对 decoder 字典的应答
+     * <p>状态码经 {@link mikumc.zstd.protocol.ZstdNegotiateStatus#sanitize} 归一化：
+     * 畸形载荷里的越界值不能被当成"第三种状态"放行。</p>
+     *
+     * @param encStatus      客户端对 encoder 字典的应答（0=可用，1=需要字典，2=不可用）
+     * @param decStatus      客户端对 decoder 字典的应答
+     * @param clientAnswered 客户端是否<b>理解</b>了这次查询（应答的 success 位）。
+     *                       {@code false} 表示它根本不认识 {@code zstd:negotiate}
+     *                       （多半是没装模组），与"装了模组但版本不匹配"要分开表述，
+     *                       否则公开服上每个原版玩家登录都会刷一条误导性的 WARN。
      */
-    public void markDictResponse(int encStatus, int decStatus) {
+    public void markDictResponse(int encStatus, int decStatus, boolean clientAnswered) {
         this.dictResponseReceived = true;
-        if (encStatus == 2 || decStatus == 2) {
+        int enc = mikumc.zstd.protocol.ZstdNegotiateStatus.sanitize(encStatus);
+        int dec = mikumc.zstd.protocol.ZstdNegotiateStatus.sanitize(decStatus);
+        if (enc == mikumc.zstd.protocol.ZstdNegotiateStatus.VANILLA
+                || dec == mikumc.zstd.protocol.ZstdNegotiateStatus.VANILLA) {
             this.protocolMismatch = true;
-            LOGGER.warn("[Zstd] Client reported unavailable (enc={}, dec={}) — staying vanilla zlib. "
-                    + "常见原因：客户端版本不匹配，或客户端无法加载服务端下发的字典。", encStatus, decStatus);
+            if (!clientAnswered) {
+                // 原版客户端 / 未安装模组：这是完全正常的预期行为，不是问题
+                LOGGER.debug("[Zstd] 客户端未识别 zstd:negotiate（未安装 Miku-ZSTD 模组），保持原版 zlib");
+            } else if (MISMATCH_WARNED.compareAndSet(false, true)) {
+                // 真正值得上报的信号：客户端认识这个查询但拒绝了（多为版本不匹配）。
+                // 只报一次——若真是版本不匹配，它会命中每一条连接，逐条告警只会淹没日志。
+                LOGGER.warn("[Zstd] 客户端明确拒绝 zstd（enc={}, dec={}）。若所有客户端都如此，"
+                        + "通常是两端版本不匹配；本端保持原版 zlib，不影响进服。"
+                        + "（本条只提示一次）", enc, dec);
+            }
         } else {
-            this.dictConfirmed = (encStatus == 0 && decStatus == 0);
-            LOGGER.info("[Zstd] Negotiate response received: enc={} dec={} dictConfirmed={}",
-                    encStatus, decStatus, dictConfirmed);
+            this.dictConfirmed = (enc == mikumc.zstd.protocol.ZstdNegotiateStatus.READY
+                    && dec == mikumc.zstd.protocol.ZstdNegotiateStatus.READY);
+            LOGGER.debug("[Zstd] Negotiate 应答：enc={} dec={} dictConfirmed={}", enc, dec, dictConfirmed);
         }
+    }
+
+    /**
+     * 记下"客户端请求了字典"。协议 v4 在推完 {@code zstd:dict} 并拿到它的应答之前，
+     * 都不能激活 zstd——见 ZstdHijacker 激活前的硬门控。
+     */
+    public void markDictRequested() {
+        this.dictRequested = true;
+    }
+
+    /** 客户端是否报告过缺字典（决定激活前是否必须等到字典确认）。 */
+    public boolean isDictRequested() {
+        return dictRequested;
     }
 
     public boolean isDictResponseReceived() {

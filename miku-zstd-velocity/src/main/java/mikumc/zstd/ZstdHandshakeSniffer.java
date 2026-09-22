@@ -65,25 +65,30 @@ public class ZstdHandshakeSniffer extends MessageToMessageDecoder<ByteBuf> {
         }
 
         Channel channel = ctx.channel();
-        LOGGER.info("[Zstd] Sniffer detected Zstd client on {}", channel.remoteAddress());
+        LOGGER.debug("[Zstd] Sniffer detected Zstd client on {}", channel.remoteAddress());
 
-        ZstdChannelManager mgr = new ZstdChannelManager();
-        channel.attr(ZstdChannelManager.KEY).set(mgr);
-        channel.closeFuture().addListener(f -> mgr.close());
-
-        // 当前处于 eventLoop 线程且早于 login start 处理，同步注入安全。
-        // 注意：此处不发送 negotiate——真实客户端在发出 login start 之前尚未挂载
-        // 登录监听器，过早发送会被丢弃。negotiate 由 spy.write 首次触发
-        // （velocity 发出 encryption request / SetCompression 之时，先于该包），
-        // 该时刻客户端监听器必然就绪，与 Velocity 3.x 的原始时序一致。
         ChannelPipeline p = channel.pipeline();
         try {
+            // ⚠️ 构造必须放在 try 内：ZstdChannelManager 的构造器会立刻把配置里的
+            // level / window_log 施加到 zstd 上下文上，配置越界（如 window_log=60）时
+            // zstd-jni 会抛异常。以前这段在 try 之外，于是一个写错的配置会让
+            // **每一条新连接**都在解码链上抛异常——从"zstd 不生效"恶化成"连不上"。
+            ZstdChannelManager mgr = new ZstdChannelManager();
+            channel.attr(ZstdChannelManager.KEY).set(mgr);
+            channel.closeFuture().addListener(f -> mgr.close());
+
+            // 当前处于 eventLoop 线程且早于 login start 处理，同步注入安全。
+            // 注意：此处不发送 negotiate——真实客户端在发出 login start 之前尚未挂载
+            // 登录监听器，过早发送会被丢弃。negotiate 由 spy.write 首次触发
+            // （velocity 发出 encryption request / SetCompression 之时，先于该包），
+            // 该时刻客户端监听器必然就绪，与 Velocity 3.x 的原始时序一致。
             if (p.get("zstd_outbound_spy") == null && p.get("handler") != null) {
                 p.addBefore("handler", "zstd_outbound_spy", new ZstdHijacker());
                 LOGGER.debug("[Zstd] Sniffer injected spy before login processing; pipeline={}", p.names());
             }
             // 帧层应答嗅探：必须位于压缩解码器之前，否则离线模式下应答会被原版压缩
-            // 解码器当作压缩帧丢弃（详见 ZstdNegotiateAnswerSniffer 的类注释）
+            // 解码器当作压缩帧丢弃。它同时负责 negotiate 与 zstd:dict 两种应答
+            //（详见 ZstdNegotiateAnswerSniffer 的类注释）。
             if (p.get("zstd-negotiate-answer") == null) {
                 p.addAfter(ctx.name(), "zstd-negotiate-answer", new ZstdNegotiateAnswerSniffer());
                 LOGGER.debug("[Zstd] Negotiate-answer sniffer installed at frame level");

@@ -49,31 +49,50 @@ public class ZstdPaperConfig {
     public final double trainerAdoptionThreshold;
     public final int trainerPruneMinPayload;
 
+    /**
+     * ⚠️ 与 Velocity 端同规则：<b>所有数值都夹取</b>，不接受越界值。
+     *
+     * <p>越界的 {@code window_log} 会在构造 {@code ZstdPaperChannelManager} 时让
+     * zstd-jni 抛异常，而那个构造发生在<b>通道初始化路径</b>上——
+     * 一个配置打错就会让每条新连接都失败。</p>
+     */
     private ZstdPaperConfig(Map<String, Object> map) {
         Map<String, Object> c = section(map, "compression");
-        this.level = getInt(c, "level", 3);
-        this.windowLog = getInt(c, "window_log", 20);
-        this.compressThreads = getInt(c, "threads", 0);
-        this.batchWindowMs = getInt(c, "batch_window_ms", 1);
-        this.batchMaxPackets = getInt(c, "batch_max_packets", 64);
-        this.skipCompressBelowBytes = getInt(c, "skip_compress_below_bytes", 48);
-        this.skipCompressBelowBytesWithDict = getInt(c, "skip_compress_below_bytes_with_dict", 24);
+        this.level = clamp(getInt(c, "level", 3), 1, 22);
+        this.windowLog = clamp(getInt(c, "window_log", 20), 10, 27);
+        this.compressThreads = clamp(getInt(c, "threads", 0), 0, 256);
+        this.batchWindowMs = clamp(getInt(c, "batch_window_ms", 1), 0, 1000);
+        this.batchMaxPackets = clamp(getInt(c, "batch_max_packets", 64), 1, 4096);
+        this.skipCompressBelowBytes = clamp(getInt(c, "skip_compress_below_bytes", 48), 0, 65536);
+        this.skipCompressBelowBytesWithDict =
+                clamp(getInt(c, "skip_compress_below_bytes_with_dict", 24), 0, 65536);
         Map<String, Object> t = section(map, "trainer");
-        this.trainerMaxSamples = getInt(t, "max_samples", 10000);
-        this.trainerMinSamples = getInt(t, "min_samples", 2000);
-        this.trainerCooldownMs = getLong(t, "cooldown_ms", 300000);
-        this.trainerFallbackTimeoutMs = getLong(t, "fallback_timeout_ms", 600000);
-        this.trainerDictMaxBytes = getInt(t, "dict_max_bytes", 131072);
-        this.trainerSampleTargetBytes = getInt(t, "sample_target_bytes", 1048576);
-        this.trainerMaxHistorySamples = getInt(t, "max_history_samples", 20000);
-        this.trainerAdoptionThreshold = getDouble(t, "adoption_threshold", 0.01);
-        this.trainerPruneMinPayload = getInt(t, "prune_min_payload", 16);
+        this.trainerMaxSamples = clamp(getInt(t, "max_samples", 10000), 16, 10_000_000);
+        this.trainerMinSamples = clamp(getInt(t, "min_samples", 2000), 1, this.trainerMaxSamples);
+        this.trainerCooldownMs = Math.max(0L, getLong(t, "cooldown_ms", 300000));
+        this.trainerFallbackTimeoutMs = Math.max(1000L, getLong(t, "fallback_timeout_ms", 600000));
+        // 上限 1MB：客户端 loadOne 会拒绝超过 0x100000 的字典并回"不可用"
+        this.trainerDictMaxBytes = clamp(getInt(t, "dict_max_bytes", 131072), 1024, 0x100000);
+        this.trainerSampleTargetBytes = clamp(getInt(t, "sample_target_bytes", 1048576), 1024, 1 << 30);
+        this.trainerMaxHistorySamples = clamp(getInt(t, "max_history_samples", 20000), 0, 10_000_000);
+        this.trainerAdoptionThreshold = clampD(getDouble(t, "adoption_threshold", 0.01), 0.0, 1.0);
+        this.trainerPruneMinPayload = clamp(getInt(t, "prune_min_payload", 16), 0, 4096);
 
         Map<String, Object> l = section(map, "logging");
         this.debug = getBool(l, "debug", false);
 
         Map<String, Object> bb = section(map, "bossbar");
         this.bossbarFormat = getString(bb, "format", DEFAULT_BOSSBAR_FORMAT);
+    }
+
+    private static int clamp(int value, int min, int max) {
+        if (value < min) return min;
+        return Math.min(value, max);
+    }
+
+    private static double clampD(double value, double min, double max) {
+        if (value < min) return min;
+        return Math.min(value, max);
     }
 
     public static void load(Path configPath) {

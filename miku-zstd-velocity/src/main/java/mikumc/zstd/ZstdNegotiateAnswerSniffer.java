@@ -3,13 +3,14 @@ package mikumc.zstd;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.MessageToMessageDecoder;
+import mikumc.zstd.protocol.ZstdNegotiateStatus;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.List;
 
 /**
- * negotiate 应答嗅探器（帧层，位于 frame-decoder 之后、压缩解码器之前）。
+ * 协商应答嗅探器（帧层，位于 frame-decoder 之后、压缩解码器之前）。
  *
  * <h2>为什么必须在这一层捕获</h2>
  * <p>Velocity 处理 login start 后会<b>立即</b>启用压缩（安装 compression-decoder 并写出
@@ -30,17 +31,32 @@ import java.util.List;
  *
  * <h2>方案</h2>
  * <p>把嗅探点放到 <b>frame-decoder 之后、压缩解码器之前</b>：这里拿到的是解密、拆帧后的
- * 原始负载，与压缩状态无关。以 negotiate 的随机 txId 作为唯一标识匹配，
+ * 原始负载，与压缩状态无关。以协商/字典查询的随机 txId 作为唯一标识匹配，
  * 命中即消费该帧（不下传），避免 Velocity 产生"未知 login plugin 应答"噪音。</p>
  *
- * <p>原 {@link ZstdHijacker#channelRead} 的拦截保留为兜底路径（例如应答恰好走正常通道到达）。</p>
+ * <h2>⚠️ 两种应答都必须在这里捕获（曾经只捕了一种，造成必断连）</h2>
+ * <p>协议 v4 的流程是<b>两段式</b>：negotiate → 客户端回"缺字典" → 服务端推
+ * {@code zstd:dict} → 客户端回"就绪"。第二段的应答与第一段走完全相同的通道，
+ * 因此同样会撞上"此时压缩解码器已就绪"的问题，<b>也必须在帧层捕获</b>。</p>
+ *
+ * <p>旧实现只匹配 {@code negotiateTxId}，且在命中协商应答后无条件
+ * {@code markDictResponse} 并自移除，于是：</p>
+ * <ol>
+ *   <li>客户端答"缺字典"(status=1) 被当成"最终结论"，服务端<b>从不推送字典</b>；</li>
+ *   <li>客户端在等字典，状态停在 PLAIN，<b>永不激活</b>；</li>
+ *   <li>服务端却按"应答已到、无协议不匹配"照常激活 zstd → 单侧 zstd → <b>断连</b>。</li>
+ * </ol>
+ * <p>现在：命中协商应答且需要字典时，走 {@link ZstdHijacker#sendDictQuery} 推字典，
+ * <b>不自移除、也不下结论</b>，继续等字典应答；结论只由最后那一次应答给出。
+ * 另外在 ZstdHijacker 的激活路径上还有一道硬门控兜底（见 activateZstd），
+ * 即使这里的应答真的丢了，也只会回落原版而不会断连。</p>
  */
 public class ZstdNegotiateAnswerSniffer extends MessageToMessageDecoder<ByteBuf> {
 
     private static final Logger LOGGER = LoggerFactory.getLogger("miku-zstd");
 
     /** 只在前若干帧内检测，避免长期驻留（应答通常出现在第 3 帧） */
-    private static final int MAX_FRAMES = 16;
+    private static final int MAX_FRAMES = 64;
 
     /** 应答包 id：login 阶段 C→S 的 custom query answer */
     private static final int PACKET_ID_ANSWER = 0x02;
@@ -49,12 +65,6 @@ public class ZstdNegotiateAnswerSniffer extends MessageToMessageDecoder<ByteBuf>
 
     @Override
     protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) {
-        if (framesChecked++ >= MAX_FRAMES) {
-            ctx.pipeline().remove(this);
-            out.add(in.retain());
-            return;
-        }
-
         ZstdChannelManager mgr = ctx.channel().attr(ZstdChannelManager.KEY).get();
         if (mgr == null || mgr.isReplaced() || mgr.isDictResponseReceived()) {
             ctx.pipeline().remove(this);
@@ -62,20 +72,41 @@ public class ZstdNegotiateAnswerSniffer extends MessageToMessageDecoder<ByteBuf>
             return;
         }
 
-        if (tryHandleAnswer(ctx, in, mgr)) {
+        framesChecked++;
+        // 帧上限只是"这件事彻底没戏了"的安全阀。**等待字典推送应答期间不启用**：
+        // 那一段要等客户端收完几十~几百 KB 并算完 CRC 才回包，很容易越过原本的 16 帧。
+        // 真正的收尾由"结论已回填"或通道关闭负责。
+        if (!awaitingDict(mgr) && framesChecked >= MAX_FRAMES) {
             ctx.pipeline().remove(this);
+            out.add(in.retain());
+            return;
+        }
+
+        if (tryHandleAnswer(ctx, in, mgr)) {
+            // 结论已定才自移除；若刚发完字典推送，则继续留在帧层等它的应答
+            if (mgr.isDictResponseReceived()) {
+                ctx.pipeline().remove(this);
+            }
             return; // 已消费，不下传
         }
         out.add(in.retain());
     }
 
+    /** 是否正在等待 {@code zstd:dict} 推送的应答。 */
+    private static boolean awaitingDict(ZstdChannelManager mgr) {
+        return mgr.isDictRequested() && !mgr.isDictResponseReceived();
+    }
+
     /**
-     * 匹配 {@code [id=0x02][varint txId][bool success][varint encStatus][varint decStatus]}。
-     * 命中则回填协商结果并返回 true。
+     * 匹配 {@code [id=0x02][varint txId][bool success][varint encStatus][varint decStatus]}，
+     * txId 与 negotiate 或 dict 查询任一相符即命中。
+     *
+     * @return 是否命中并已消费该帧
      */
     private boolean tryHandleAnswer(ChannelHandlerContext ctx, ByteBuf in, ZstdChannelManager mgr) {
-        int txId = mgr.getNegotiateTxId();
-        if (txId <= 0) return false;
+        int negotiateTxId = mgr.getNegotiateTxId();
+        int dictTxId = mgr.getDictTxId();
+        if (negotiateTxId <= 0 && dictTxId <= 0) return false;
 
         int start = in.readerIndex();
         int end = in.writerIndex();
@@ -93,24 +124,36 @@ public class ZstdNegotiateAnswerSniffer extends MessageToMessageDecoder<ByteBuf>
             if ((b & 0x80) == 0) break;
             shift += 7;
         }
-        if ((int) value != txId) return false;
+        int txId = (int) value;
+        boolean isNegotiate = negotiateTxId > 0 && txId == negotiateTxId;
+        boolean isDict = dictTxId > 0 && txId == dictTxId;
+        if (!isNegotiate && !isDict) return false;
 
-        int encStatus = 2;
-        int decStatus = 2;
-        if (pos < end && in.getByte(pos) != 0) {
-            // success=true：剩余字节是两个 varint 状态
+        boolean success = pos < end && in.getByte(pos) != 0;
+        int encStatus = ZstdNegotiateStatus.VANILLA;
+        int decStatus = ZstdNegotiateStatus.VANILLA;
+        if (success && pos + 1 < end) {
             byte[] tail = new byte[end - pos - 1];
-            if (tail.length > 0) {
-                in.getBytes(pos + 1, tail);
-                int[] cursor = {0};
-                encStatus = readVarInt(tail, cursor, 2);
-                decStatus = readVarInt(tail, cursor, 2);
-            }
+            in.getBytes(pos + 1, tail);
+            int[] cursor = {0};
+            encStatus = ZstdNegotiateStatus.sanitize(readVarInt(tail, cursor, ZstdNegotiateStatus.FALLBACK));
+            decStatus = ZstdNegotiateStatus.sanitize(readVarInt(tail, cursor, ZstdNegotiateStatus.FALLBACK));
         }
 
-        LOGGER.debug("[Zstd] negotiate answer captured at frame level (txId={}, enc={}, dec={})",
-                txId, encStatus, decStatus);
-        mgr.markDictResponse(encStatus, decStatus);
+        if (isNegotiate && ZstdHijacker.needsDictPush(encStatus, decStatus)) {
+            // 协议 v4：客户端缺字典。推一次 zstd:dict，**先不下结论**——
+            // 门控必须等这次推送的应答，否则服务端会先于客户端激活（单侧 zstd）。
+            mgr.markDictRequested();
+            ZstdHijacker.sendDictQuery(ctx.channel(),
+                    ZstdNegotiateStatus.needsDict(encStatus), ZstdNegotiateStatus.needsDict(decStatus));
+            LOGGER.debug("[Zstd] negotiate 应答要求字典（enc={} dec={}），已推送 zstd:dict，继续等待其应答",
+                    encStatus, decStatus);
+            return true;
+        }
+
+        LOGGER.debug("[Zstd] {} 应答已在帧层捕获（txId={}, enc={}, dec={}, success={}）",
+                isDict ? "zstd:dict" : "negotiate", txId, encStatus, decStatus, success);
+        mgr.markDictResponse(encStatus, decStatus, success);
         // 立即触发激活（若 SetCompression 已写出），省掉最长 100ms 的轮询等待
         ZstdHijacker.notifyDictResponse(ctx.channel());
         return true;

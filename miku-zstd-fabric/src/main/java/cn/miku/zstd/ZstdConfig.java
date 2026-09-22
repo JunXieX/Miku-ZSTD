@@ -50,21 +50,33 @@ public class ZstdConfig {
     /** 有字典时：阈值更低（实测 24B 起才有收益） */
     public final int skipCompressBelowBytesWithDict;
 
+    /**
+     * ⚠️ 与服务端同规则：<b>所有数值都夹取</b>。
+     *
+     * <p>越界的 {@code window_log} 会在构造 {@code ZstdChannelManager} 时让 zstd-jni 抛异常，
+     * 而那个构造发生在<b>登录协商的回调里</b>——一个配置打错就会让每次连接都失败。</p>
+     */
     private ZstdConfig(Map<String, Object> map) {
         Map<String, Object> c = section(map, "compression");
-        this.level = getInt(c, "level", 3);
-        this.windowLog = getInt(c, "window_log", 20);
-        this.compressThreads = getInt(c, "threads", 0);
-        this.batchWindowMs = getInt(c, "batch_window_ms", 1);
-        this.batchMaxPackets = getInt(c, "batch_max_packets", 64);
-        this.skipCompressBelowBytes = getInt(c, "skip_compress_below_bytes", 48);
-        this.skipCompressBelowBytesWithDict = getInt(c, "skip_compress_below_bytes_with_dict", 24);
+        this.level = clamp(getInt(c, "level", 3), 1, 22);
+        this.windowLog = clamp(getInt(c, "window_log", 20), 10, 27);
+        this.compressThreads = clamp(getInt(c, "threads", 0), 0, 256);
+        this.batchWindowMs = clamp(getInt(c, "batch_window_ms", 1), 0, 1000);
+        this.batchMaxPackets = clamp(getInt(c, "batch_max_packets", 64), 1, 4096);
+        this.skipCompressBelowBytes = clamp(getInt(c, "skip_compress_below_bytes", 48), 0, 65536);
+        this.skipCompressBelowBytesWithDict =
+                clamp(getInt(c, "skip_compress_below_bytes_with_dict", 24), 0, 65536);
 
         Map<String, Object> l = section(map, "logging");
         this.debug = getBool(l, "debug", false);
 
         Map<String, Object> d = section(map, "display");
         this.hudEnabled = getBool(d, "hud_enabled", false);
+    }
+
+    private static int clamp(int value, int min, int max) {
+        if (value < min) return min;
+        return Math.min(value, max);
     }
 
     private static boolean getBool(Map<String, Object> map, String key, boolean def) {

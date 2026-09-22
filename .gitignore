@@ -47,3 +47,5 @@ desktop.ini
 
 # ===== 本地整理的内部文档（不随仓库发布） =====
 MikuZSTD-源码解读.md
+QUIC方案评估.md
+MikuZSTD-代码审计报告.md
