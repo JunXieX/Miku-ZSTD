@@ -21,6 +21,7 @@ jobs:
       - name: Build
         working-directory: miku-zstd-velocity
         run: |
+          sed -i 's/\r$//' ./gradlew
           chmod +x ./gradlew
           ./gradlew shadowJar --no-daemon
       - uses: actions/upload-artifact@v4
@@ -42,6 +43,7 @@ jobs:
       - name: Build
         working-directory: miku-zstd-paper
         run: |
+          sed -i 's/\r$//' ./gradlew
           chmod +x ./gradlew
           ./gradlew shadowJar --no-daemon
       - uses: actions/upload-artifact@v4
@@ -63,6 +65,7 @@ jobs:
       - name: Build
         working-directory: miku-zstd-fabric
         run: |
+          sed -i 's/\r$//' ./gradlew
           chmod +x ./gradlew
           ./gradlew build --no-daemon
       - uses: actions/upload-artifact@v4

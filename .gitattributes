@@ -1,0 +1,6 @@
+# gradlew 是 shell 脚本，必须以 LF 进入仓库：
+# 若为 CRLF，shebang 会变成 "#!/bin/sh\r"，在 Linux 上执行时内核找不到该解释器，
+# 表现为 "./gradlew: cannot execute: required file not found"（exit 127），
+# 而这个报错完全看不出是行尾问题，排查成本很高。
+gradlew        text eol=lf
+gradlew.bat    text eol=crlf
