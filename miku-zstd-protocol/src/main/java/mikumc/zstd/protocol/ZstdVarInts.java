@@ -3,15 +3,28 @@ package mikumc.zstd.protocol;
 import io.netty.buffer.ByteBuf;
 
 /**
- * Minecraft VarInt 编解码（<b>两端共享的唯一实现</b>）。
+ * Minecraft VarInt 编解码，以及 varint 相关字节级读取（<b>三端共用的唯一实现</b>）。
  *
- * <p>本类位于共享协议模块 {@code miku-zstd-protocol}，由 Velocity 端与 Fabric 端
- * 各自通过 {@code sourceSets} 引用同一份源码编译（见模块 README）。
+ * <p>本类位于共享协议模块 {@code miku-zstd-protocol}，由三端各自通过 {@code sourceSets}
+ * 引用同一份源码编译（见模块 README）。
  * 3.0.0 之前项目里存在四份独立实现（两端的管理器、Hijacker 的通用循环版、
- * 嗅探器的 ByteBuffer 版），行为与性能均不一致；现已全部收敛到这里。</p>
+ * 嗅探器的 ByteBuffer 版），行为与性能均不一致；后来又有 6 处新写的循环。
+ * 现在 byte[] / ByteBuf 两种输入都有唯一的入口：{@link #tryRead}、{@link #readAt}、{@link #readOr}。</p>
  *
  * <p>写路径带 1~3 字节快路径（覆盖 99% 的 MC 包长），读路径支持"数据不足时
  * 不消费缓冲"的尽力语义。</p>
+ *
+ * <h2>术语：本项目里的 "v几" 有三个不同含义，不要混用</h2>
+ * <ul>
+ *   <li><b>协商版本</b>：三端 {@code PROTOCOL_VERSION = 4}，在登录期 negotiate 载荷里交换。
+ *       三端必须一致，不一致即回落原版 zlib。v4 的改动是"字典改为按需推送"
+ *      （v3 把字典内联在 negotiate 里，所有连接都要白吃这几百 KB）。</li>
+ *   <li><b>帧格式 v3</b>：{@code [bodyLen?][rawSize][zstd payload | payload]}，
+ *       {@code payload = [varint pktLen][pkt]...}。v3 做了帧头精简（magicless /
+ *       无 contentSize / 无 dictID）与"一帧多包"批处理。<b>v4 没有再改帧格式。</b></li>
+ *   <li><b>v1 / v2</b>：历史版本，只应出现在"我们为什么这么改"的说明里。</li>
+ * </ul>
+ * <p>所以"帧格式 v3"与"协商版本 v4"是两个维度的编号，同一份代码同时属于这两者。</p>
  */
 public final class ZstdVarInts {
 

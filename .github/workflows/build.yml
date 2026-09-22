@@ -18,12 +18,15 @@ jobs:
           java-version: '25'
           distribution: 'temurin'
           cache: gradle
-      - name: Build
+      - name: Build & test
         working-directory: miku-zstd-velocity
         run: |
           sed -i 's/\r$//' ./gradlew
           chmod +x ./gradlew
-          ./gradlew shadowJar --no-daemon
+          # test 必须在 shadowJar 之前跑：协议回归测试（FrameLayoutTest 等）挂在
+          # 本模块的 test 源集上，它保护的是跨端帧格式的字节对称性——
+          # 那类错误不会编译失败，只会让两端静默错位。测试不过就不该产出产物。
+          ./gradlew test shadowJar --no-daemon
       - uses: actions/upload-artifact@v4
         with:
           name: Miku-ZSTD-Velocity
@@ -96,9 +99,13 @@ jobs:
 
   # Modrinth 只在**正式版**（tag 不含 Beta）发布：测试版完全跳过，连 job 都不进。
   # 发布逻辑内联在这里，不往仓库里加脚本文件（仓库只允许源码与 README）。
+  #
+  # ⚠️ needs 必须是 release（而不是三个构建 job）：下面的 changelog 要读 GitHub Release
+  # 的正文当唯一来源。若与 release 并行启动，Release 往往还没建好，于是静默退回兜底文案——
+  # 4.3.0 就是这样发的（正文是事后用 API 补的）。
   modrinth:
     name: Modrinth
-    needs: [velocity, paper, fabric]
+    needs: [release]
     if: startsWith(github.ref, 'refs/tags/') && !contains(github.ref_name, 'Beta')
     runs-on: ubuntu-latest
     steps:

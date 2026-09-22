@@ -20,7 +20,7 @@ import java.util.List;
  * 因为它此时还没收到 SetCompression），但这个应答要经过一个 RTT 才到达服务端，
  * <b>那时服务端的原版压缩解码器已经装好</b>，会把裸帧应答当作压缩帧解析并丢弃。</p>
  *
- * <p>实测（本地 Velocity 4.2 + 协议 v2 模拟客户端）：</p>
+ * <p>实测（本地 Velocity 4.2 + 当时的 v2 模拟客户端）：</p>
  * <pre>
  *   应答按裸帧发送   -> 服务端 spy 完全看不到该包，markDictResponse 永不触发，zstd 静默不激活
  *   应答按压缩帧发送 -> "Negotiate response received: enc=0 dec=0 dictConfirmed=true"

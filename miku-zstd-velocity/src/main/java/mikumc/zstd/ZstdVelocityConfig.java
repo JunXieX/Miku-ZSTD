@@ -13,8 +13,10 @@ import java.util.Map;
 /**
  * Miku-ZSTD Velocity 配置。
  *
- * <p>默认值面向<b>低带宽占用</b>：zstd 压缩等级 15（显著高于旧默认 9），
- * 配合 8MB 滑动窗口与 LDM 长距离匹配，最大限度降低网络流量。</p>
+ * <p>默认值以<b>实测结论</b>为准，而不是"看起来更狠"：压缩等级 <b>3</b>、窗口 <b>2^20（1MB）</b>。
+ * 实测高等级在小包上反而更差（单包 64B：L3 压到 45.3%，L9 只有 57.8%），而耗时是 8~12 倍；
+ * 窗口 17/20/23 的压缩率完全相同，但哈希表按 {@code 2^(windowLog-1) × 4B} 指数增长、
+ * 且每连接一份。完整依据见下方生成的配置模板注释。</p>
  *
  * <h2>3.1.0 修复</h2>
  * <p>旧实现每次 {@code load()} 都无条件调用 {@code writeConfig()}，把配置文件
@@ -34,7 +36,7 @@ public class ZstdVelocityConfig {
     public final int compressThreads;
     public final boolean debug;
 
-    /** 协议 v3 批处理窗口（毫秒）：窗口内发往同一玩家的多个包合成一帧 */
+    /** 帧格式 v3 的批处理窗口（毫秒）：窗口内发往同一玩家的多个包合成一帧 */
     public final int batchWindowMs;
     /** 单帧最多合并多少个包（防止延迟与内存失控） */
     public final int batchMaxPackets;
@@ -194,7 +196,7 @@ public class ZstdVelocityConfig {
 
                     compression:
                       # ── 压缩等级 (1-22) ──
-                      # 默认 3。依据是 tools/levelprobe 的实测（带 128KB 字典、按批处理形态）：
+                      # 默认 3。依据是开发期探针的实测（带 128KB 字典、按批处理形态）：
                       #   · 小包是字典收益的主战场，而高等级在这里【反而更差】——
                       #     单包 64B：L3 压到 45.3%，L9 只能压到 57.8%，L3 好 12.5 个百分点；
                       #   · 数据越长高等级才越有优势：8KB 批次上 L9 好约 4 个百分点；
@@ -207,7 +209,7 @@ public class ZstdVelocityConfig {
 
                       # 滑动窗口大小，单位为 2 的幂（20 = 1MB）。
                       # 窗口决定"能记住多少历史数据用于跨包匹配"，听起来对大包有帮助，但实测
-                      # （tools/levelprobe/WindowProbe，逐值独立 JVM 测量）恰恰相反：
+                      # （开发期探针 WindowProbe，逐值独立 JVM 测量）恰恰相反：
                       #   window_log 17 / 20 / 23 的压缩率【完全相同】——批次 29.5%、大包重复 12.5%。
                       # 原因：小包的重复内容已被【字典】吃掉；大包（区块）多为新内容，本就匹配不到历史。
                       # 而 zstd 上下文的哈希表规模是 2^(windowLog-1) × 4B ——【指数增长】：
@@ -226,7 +228,7 @@ public class ZstdVelocityConfig {
                       # 才需要考虑加线程或降低 level；盲目调到核心数会让服务端掉 TPS。
                       threads: 0
 
-                      # ── 批处理（协议 v4）──
+                      # ── 批处理（帧格式 v3 引入）──
                       # 把时间窗内发往同一玩家的多个包合成一帧再压缩。
                       # 实测收益很大：每包单独成帧时，帧头与熵表的重复发送几乎吃掉小包的全部收益
                       #（小包甚至会膨胀到 105%，只能直存）；合批后可再省约 34% 线路字节。

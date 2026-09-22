@@ -5,7 +5,7 @@ import io.netty.channel.ChannelHandlerContext;
 import mikumc.zstd.protocol.ZstdBatchEncoderBase;
 
 /**
- * Miku-ZSTD 编码器（Paper → 客户端）协议 v4。
+ * Miku-ZSTD 编码器（Paper → 客户端）帧格式 v3（协商版本 v4）。
  *
  * <p>⚠️ 与 Velocity 端唯一的协议差异：服务端管线<b>有 prepender</b>，外层长度由它负责，
  * 因此本编码器<b>不写</b> bodyLen（与 Fabric 客户端一致；Velocity 端才需要写）。</p>
@@ -56,10 +56,12 @@ public class ZstdPaperEncoder extends ZstdBatchEncoderBase {
         }
     }
 
-    /** 采样：把批次按包拆开逐个提交（见方法内说明——整批提交会让样本数永远不达标）。 */
+    /**
+     * 采样：把整批原始字节交给训练器，由它在锁外按包拆开、过滤、只为入库样本拷贝
+     * （见 {@code ZstdPaperTrainer#addBatch}）。
+     */
     @Override
     protected void onRawBatch(byte[] raw, int length) {
-        // 采样提交已批量化：一次加锁入环，不再逐包提交（见 ZstdPaperTrainer#addBatch）
         ZstdPaperTrainer.submitEncoderBatch(raw, length);
     }
 

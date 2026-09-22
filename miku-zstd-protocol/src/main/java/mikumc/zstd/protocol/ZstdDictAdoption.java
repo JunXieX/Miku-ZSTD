@@ -49,7 +49,7 @@ public final class ZstdDictAdoption {
      * 字典采纳判定。
      *
      * <h2>为什么首部字典不能套用替换阈值</h2>
-     * <p>实测（{@code tools/memprobe/MemProbe9/10}）：</p>
+     * <p>实测（{@code 开发期探针 MemProbe9/10}）：</p>
      * <ul>
      *   <li>无字典时小包压缩后<b>膨胀</b>（&lt;48B 为 102~113%），只能全部直存 ——
      *       字典是让小包压缩变得可行的<b>前提</b>，不是锦上添花；</li>

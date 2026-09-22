@@ -5,7 +5,7 @@ import io.netty.channel.ChannelHandlerContext;
 import mikumc.zstd.protocol.ZstdBatchDecoderBase;
 
 /**
- * Miku-ZSTD 解码器（客户端 → Paper）协议 v4。
+ * Miku-ZSTD 解码器（客户端 → Paper）帧格式 v3（协商版本 v4）。
  *
  * <p>帧解析、切包、压缩比上限、fail-fast 全部由共享基类提供，本类只声明解压上下文来源。</p>
  */
@@ -23,12 +23,12 @@ public class ZstdPaperDecoder extends ZstdBatchDecoderBase {
 
     @Override
     protected void onStoredFrame(int frameBodyBytes) {
-        // 预留：入站统计出口
+        // 服务端无入站统计（有意）——与 Velocity 端一致：带宽口径只统计出站
     }
 
     @Override
     protected void onCompressedFrame(int inBytes, int outBytes) {
-        // 预留：入站统计出口
+        // 服务端无入站统计（有意）
     }
 
     /** 直存帧也是字典收益的主战场（它们都是"小到不值得压缩"的包），必须采样。 */

@@ -43,9 +43,8 @@ java {
 tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8'
     options.release.set(targetJavaVersion)
-    // 开启全部静态检查。其中 -processing 被显式关掉：
-    // Velocity 的注解处理器只消费 @Plugin，而 @DataDirectory/@Subscribe/@Inject
-    // 本来就不该被它消费，javac 会为此报"注解未被处理"——属噪声，非问题。
+    // 开启全部静态检查（-processing 关掉的是"注解处理器未被消费"这类告警）。
+    // 本模块没有注解处理器，保留该开关只是为了与另两个模块的编译参数保持一致。
     options.compilerArgs << '-Xlint:all' << '-Xlint:-processing'
 }
 

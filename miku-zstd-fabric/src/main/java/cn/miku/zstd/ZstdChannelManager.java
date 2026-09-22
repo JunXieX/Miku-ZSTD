@@ -8,22 +8,26 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * 每连接上下文：zstd 压缩/解压上下文、字典加载、传输状态（协议 v2）。
+ * 每连接上下文：zstd 压缩/解压上下文、字典加载、传输状态。
  *
- * <p>帧格式 v2：客户端→服务端 {@code [rawSize][zstd(packet)|packet]}（prepender
- * 负责外层长度）；服务端→客户端 {@code [bodyLen][rawSize][zstd(packet)|packet]}
+ * <p><b>协商版本 v4</b>（{@link #PROTOCOL_VERSION}），<b>帧格式 v3</b>：
+ * 客户端→服务端 {@code [rawSize][zstd(packet)|packet]}（prepender 负责外层长度）；
+ * 服务端→客户端 {@code [bodyLen][rawSize][zstd(packet)|packet]}
  * （bodyLen 由服务端编码器自带，已被 frame-decoder 剥离）。</p>
  *
  * <p>⚠️ 注意与 Velocity 端的语义差异——客户端的 "encoder" 字典用于<b>解压</b>
- * 服务端发来的数据，"decoder" 字典用于<b>压缩</b>发往服务端的数据。</p>
+ * 服务端发来的数据，"decoder" 字典用于<b>压缩</b>发往服务端的数据。
+ * 命名是从"对端那个方向"来的：服务端用它的 encoder 字典压缩，本端就用同一份去解压。</p>
  *
  * <h2>3.1.0 变更</h2>
  * <ul>
  *   <li>字典对象改由 {@link ZstdDictRegistry} 全进程共享并按引用计数释放
  *       （旧实现每次登录都重建 3.2MB 的 {@code ZstdDictCompress} 且从不释放）；</li>
  *   <li>VarInt 收敛到 {@link ZstdVarInts}；</li>
- *   <li>删除从未被赋值的 {@code expectedDictId} 与 {@code finishConfigPending}
- *       ——它们支撑的 zstd:dict 推送链路服务端从未实现（整条链路已移除）。</li>
+ *   <li>删除从未被赋值的 {@code expectedDictId} 与 {@code finishConfigPending}——
+ *       它们是 v3 内联字典时代的残留；v4 改成"按需推送"后，这条链路由
+ *       {@code ZstdLoginNetworking.handleDict} 承担（服务端确会主动推 {@code zstd:dict}，
+ *       客户端收到后加载并回状态）。</li>
  * </ul>
  */
 public class ZstdChannelManager {
@@ -52,7 +56,7 @@ public class ZstdChannelManager {
     }
 
     /**
-     * 协议 v3 帧头精简：去掉双方都已知道的冗余字段。
+     * 帧格式 v3 的帧头精简：去掉双方都已知道的冗余字段。
      *
      * <ul>
      *   <li>{@code magicless}：省 4 字节 magic（对几十字节的小包占比可观）；</li>

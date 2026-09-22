@@ -14,7 +14,7 @@ import java.util.concurrent.atomic.LongAdder;
  *
  * <h2>为什么需要它</h2>
  * <p>"怎么继续降低带宽"这个问题<b>必须用真实流量分布来回答</b>，因为不同包长区间的
- * 优化手段完全不同。实测（合成流量，见 <code>tools/memprobe/MemProbe7~9</code>）：</p>
+ * 优化手段完全不同。实测（合成流量，见 <code>开发期探针 MemProbe7~9</code>）：</p>
  * <ul>
  *   <li>小包（&lt;48B）：无字典时压缩后<b>膨胀到 105%</b>（全部直存、纯浪费 CPU），
  *       有字典后降到 80%——<b>字典的价值全在这里</b>；</li>

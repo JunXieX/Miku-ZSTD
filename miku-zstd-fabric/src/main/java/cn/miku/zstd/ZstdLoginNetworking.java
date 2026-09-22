@@ -21,7 +21,7 @@ import mikumc.zstd.protocol.ZstdNegotiateStatus;
 /**
  * 登录协商：{@code zstd:negotiate}（轻量握手）+ {@code zstd:dict}（按需推送字典）。
  *
- * <h2>协议 v4：两段式（相对 v3 的变化）</h2>
+ * <h2>协商版本 v4：两段式（相对 v3 的变化，帧格式未变）</h2>
  * <p>v3 把字典字节直接内联进 negotiate——所有连接都要吃这几百 KB，无论客户端支不支持
  * zstd、也不管本地是否已缓存。v4 拆成两段：</p>
  * <ol>

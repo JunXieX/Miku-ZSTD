@@ -16,7 +16,7 @@ import java.util.concurrent.TimeUnit;
 import java.nio.channels.ClosedChannelException;
 
 /**
- * Miku-ZSTD 出站编码器基类（协议 <b>v3</b>）——两端共享实现。
+ * Miku-ZSTD 出站编码器基类（帧格式 <b>v3</b>，协商版本 v4）——三端共享实现。
  *
  * <h2>帧格式（v3）</h2>
  * <pre>

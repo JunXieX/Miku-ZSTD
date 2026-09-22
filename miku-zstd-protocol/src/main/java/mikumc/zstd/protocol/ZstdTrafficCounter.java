@@ -22,7 +22,8 @@ import java.util.concurrent.atomic.LongAdder;
  *
  * <h2>⚠️ 本类绝不能引用任何平台类型</h2>
  * <p>（Adventure / Velocity / Bukkit 都不行。）编码器热路径会直接调用 {@link #record}，
- * 而协议回归测试的 classpath 里只有 netty 与 zstd——曾把统计与 BossBar 显示写在同一个类里，
+ * 而协议回归测试（{@code miku-zstd-protocol/src/test/java} 下的 {@code FrameLayoutTest} 等）
+ * 的 classpath 里只有 netty 与 zstd——曾把统计与 BossBar 显示写在同一个类里，
  * 结果 {@code onFrame} 一被调用就 {@code NoClassDefFoundError}，整个帧布局测试组全红。</p>
  */
 public final class ZstdTrafficCounter {

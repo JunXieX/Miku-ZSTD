@@ -21,8 +21,8 @@ import java.time.Duration;
  * 子服侧若有插件，统计的是"子服 ↔ 代理"那一段，口径不同。</p>
  *
  * <p>数据来自共享的 {@link ZstdTrafficCounter}（统计与显示刻意分开：那个类零平台依赖，
- * 因为编码器热路径会调用它，而协议回归测试的 classpath 里没有 Adventure；
- * 它的实现同样被 Paper 端复用，两端口径必然一致）。
+ * 因为编码器热路径会调用它，而协议回归测试（{@code FrameLayoutTest}）的 classpath 里
+ * 没有 Adventure；它的实现同样被 Paper 端复用，两端口径必然一致）。
  * 统计口径只覆盖<b>走 zstd 的连接</b>。</p>
  */
 public final class ZstdBossBarMonitor {

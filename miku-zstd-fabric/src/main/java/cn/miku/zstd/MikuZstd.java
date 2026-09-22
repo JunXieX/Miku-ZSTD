@@ -13,13 +13,13 @@ import java.nio.file.Paths;
 /**
  * 模组入口常量与初始化。
  *
- * <h2>4.1.6 变更</h2>
- * <ul>
- *   <li>配置文件从 {@code config/miku_zstd.yml} 迁到自建目录
- *       <b>{@code miku-zstd/config.yml}</b> —— 埋在 config/ 里不容易找到，
- *       而且与服务端插件的目录命名保持一致；
- *       首次启动时若检测到旧文件会自动搬过来，不会丢设置。</li>
- * </ul>
+ * <h2>配置文件位置</h2>
+ * <p>当前为 {@code <游戏目录>/Miku-ZSTD/config.yml}（与服务端插件的目录命名一致）。
+ * 历史上有过两代位置，首次启动时若<b>只</b>找到旧文件会自动<b>搬</b>过来，不会丢设置：</p>
+ * <ol>
+ *   <li>{@code miku-zstd/config.yml}（4.1.6 起的自建目录）</li>
+ *   <li>{@code config/miku_zstd.yml}（最早的位置，埋在 config/ 里不容易找到）</li>
+ * </ol>
  *
  * <h2>3.1.0 变更</h2>
  * <ul>

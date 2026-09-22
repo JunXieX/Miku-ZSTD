@@ -15,21 +15,27 @@ import org.slf4j.LoggerFactory;
  * <p>持有 zstd 压缩/解压上下文与协商状态机。生命周期：嗅探器检测到
  * {@code \0ZSTD\0} 握手标记时创建，连接关闭时释放本地资源。</p>
  *
- * <h2>协议 v2</h2>
+ * <h2>帧格式（v3；协商版本见 {@link #PROTOCOL_VERSION}）</h2>
  * <ul>
- *   <li>服务端 → 客户端帧：{@code [varint bodyLen][varint rawSize][zstd(packet) | packet]}
+ *   <li>服务端 → 客户端帧：{@code [varint bodyLen][varint rawSize][zstd(payload) | payload]}
  *       —— Velocity 4.x 管线无独立 frame-encoder，编码器<b>自带</b> bodyLen 外层长度。</li>
- *   <li>客户端 → 服务端帧：{@code [varint rawSize][zstd(packet) | packet]}
+ *   <li>客户端 → 服务端帧：{@code [varint rawSize][zstd(payload) | payload]}
  *       —— 外层长度由客户端管线的 prepender 负责，服务端 frame-decoder 剥离后
  *       本解码器收到的即完整帧负载。</li>
- *   <li>rawSize==0 表示未压缩直存，此时整个数据就是单个 Minecraft 包。</li>
- *   <li>v1 的内层 {@code [pktSize]} 前缀已移除：单包模式下包长可从数据长度推出。</li>
+ *   <li>{@code rawSize == 0} 表示未压缩直存；{@code payload = [varint pktLen][pkt]...}，
+ *       一帧可含多个包（批处理）。</li>
+ *   <li>「v几」有三种含义（协商版本 / 帧格式 / 历史版本），见
+ *       {@link ZstdVarInts} 类注释里的术语表——不要混用。</li>
  * </ul>
  *
  * <h2>字典门控</h2>
- * <p>negotiate 应答由 Hijacker 拦截（{@link #markDictResponse}）。仅当客户端确认
- * 双向字典就绪（status==0）时才把字典加载进压缩/解压上下文；否则以无字典模式
- * 激活（压缩仍有效，仅失去字典增益）。协议版本不匹配时完全跳过 zstd，回落原版 zlib。</p>
+ * <p>negotiate 应答由 {@code ZstdNegotiateAnswerSniffer}（帧层）与 Hijacker（包层，兜底）
+ * 捕获并回填 {@link #markDictResponse}。仅当客户端确认双向字典就绪（status==0）时才把字典
+ * 加载进压缩/解压上下文。</p>
+ *
+ * <p>⚠️ 客户端报告过"缺字典"（status==1）时，本端<b>必须先推 {@code zstd:dict} 并等到
+ * 它的应答</b>才能激活——否则客户端会停在"等字典"状态永不激活，而本端已开始用 zstd 发帧，
+ * 形成单侧 zstd 的必断连组合。激活路径上有一道硬门控兜底（见 ZstdHijacker 的 activateZstd）。</p>
  *
  * <h2>3.1.0 变更</h2>
  * <ul>
@@ -97,7 +103,7 @@ public class ZstdChannelManager {
     }
 
     /**
-     * 协议 v3 帧头精简：去掉双方都已知道的冗余字段。
+     * 帧格式 v3 的帧头精简：去掉双方都已知道的冗余字段。
      *
      * <ul>
      *   <li>{@code magicless}：省 4 字节 magic（对几十字节的小包占比可观）；</li>

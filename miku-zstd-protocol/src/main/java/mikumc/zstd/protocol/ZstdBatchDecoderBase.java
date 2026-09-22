@@ -11,7 +11,7 @@ import org.slf4j.LoggerFactory;
 import java.util.List;
 
 /**
- * Miku-ZSTD 入站解码器基类（协议 <b>v3</b>）——两端共享实现。
+ * Miku-ZSTD 入站解码器基类（帧格式 <b>v3</b>，协商版本 v4）——三端共享实现。
  *
  * <h2>帧格式（v3）</h2>
  * <pre>

@@ -5,7 +5,7 @@ import io.netty.channel.ChannelHandlerContext;
 import mikumc.zstd.protocol.ZstdBatchDecoderBase;
 
 /**
- * Miku-ZSTD 解码器（Velocity → 客户端）协议 <b>v3</b>。
+ * Miku-ZSTD 解码器（Velocity → 客户端）帧格式 <b>v3</b>（协商版本 v4）。
  *
  * <p>帧解析、内层切包、两道防护（压缩比上限 / scratch 上限）、fail-fast 协议
  * 全部在共享基类 {@link ZstdBatchDecoderBase} 中（两端同一份源码）；

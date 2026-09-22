@@ -6,7 +6,7 @@ import mikumc.zstd.protocol.ZstdBatchEncoderBase;
 import mikumc.zstd.protocol.ZstdTrafficCounter;
 
 /**
- * Miku-ZSTD 编码器（服务端 → 客户端）协议 <b>v3</b>。
+ * Miku-ZSTD 编码器（服务端 → 客户端）帧格式 <b>v3</b>（协商版本 v4）。
  *
  * <p>批处理、建帧、promise 编排等全部逻辑在共享基类
  * {@link ZstdBatchEncoderBase} 中（两端同一份源码）；本类只声明服务端的
@@ -66,10 +66,15 @@ public class ZstdBatchEncoder extends ZstdBatchEncoderBase {
         }
     }
 
-    /** 采样：按包拆开逐个提交——整批提交会让样本数永远达不到 min_samples 门槛。 */
+    /**
+     * 采样：把整批原始字节交给训练器，由它在锁外按包拆开、过滤、只为入库样本拷贝
+     * （见 {@code ZstdSampleTrainer#addBatch}）。
+     *
+     * <p>不能把整批当成"一个样本"：那样 1MB 数据只有 26 个样本，永远够不到 min_samples；
+     * 也不该在这里逐包拆分——那会把解析与过滤搬到 event loop 上。</p>
+     */
     @Override
     protected void onRawBatch(byte[] raw, int length) {
-        // 采样提交已批量化：一次加锁入环，不再逐包提交（见 ZstdSampleTrainer#addBatch）
         ZstdSampleTrainer.submitEncoderBatch(raw, length);
     }
 
