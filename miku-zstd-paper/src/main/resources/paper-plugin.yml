@@ -1,6 +1,6 @@
 # Miku-ZSTD — Paper 端（纯 Paper，无 Bukkit/Spigot 兼容层）
 name: Miku-ZSTD
-version: 4.2.4-Beta
+version: 4.3.0
 main: mikumc.zstd.paper.MikuZstdPaper
 api-version: 1.26
 authors: [JunXieX]
