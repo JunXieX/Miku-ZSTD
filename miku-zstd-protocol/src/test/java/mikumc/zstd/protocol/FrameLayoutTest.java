@@ -88,9 +88,11 @@ class FrameLayoutTest {
         assertNotNull(frame, "编码器应当产出一帧");
 
         int bodyLen = ZstdVarInts.tryRead(frame, Integer.MAX_VALUE);
+        // bodyLen 的含义是"其后剩余字节数"，必须在读掉 rawSize 之前取这个值
+        int afterBodyLen = frame.readableBytes();
         int rawSize = ZstdVarInts.tryRead(frame, Integer.MAX_VALUE);
         assertEquals(0, rawSize, "直存帧的 rawSize 必须是 0");
-        assertEquals(frame.readableBytes(), bodyLen, "bodyLen 必须等于其后剩余字节数");
+        assertEquals(afterBodyLen, bodyLen, "bodyLen 必须等于其后剩余字节数");
         assertFalse(encoder.lastCompressed, "低于阈值不应走压缩");
     }
 
@@ -104,10 +106,11 @@ class FrameLayoutTest {
         ByteBuf frame = readFrame(ch);
         assertNotNull(frame);
 
+        int total = frame.readableBytes();
         int rawSize = ZstdVarInts.tryRead(frame, Integer.MAX_VALUE);
         assertEquals(0, rawSize);
         // 帧 = [varint 0][varint pktLen][pkt]，其中 pkt = 1 字节包 id + 2 字节负载
-        assertEquals(1 + ZstdVarInts.length(3) + 3, frame.readableBytes(),
+        assertEquals(1 + ZstdVarInts.length(3) + 3, total,
                 "帧应只含 [0][varint pktLen][pkt]，不含任何外层长度");
     }
 
@@ -131,9 +134,10 @@ class FrameLayoutTest {
         ByteBuf frame = readFrame(ch);
         assertNotNull(frame);
         int bodyLen = ZstdVarInts.tryRead(frame, Integer.MAX_VALUE);
+        int afterBodyLen = frame.readableBytes();
         int rawSize = ZstdVarInts.tryRead(frame, Integer.MAX_VALUE);
         assertEquals(0, rawSize);
-        assertEquals(frame.readableBytes(), bodyLen);
+        assertEquals(afterBodyLen, bodyLen);
 
         assertArrayEquals(new byte[][]{p1, p2, p3}, drainPackets(frame),
                 "三个包应按顺序出现在同一帧里");
@@ -167,11 +171,12 @@ class FrameLayoutTest {
         assertNotNull(frame, "压缩走线程池，需要等待回到 event loop");
 
         int bodyLen = ZstdVarInts.tryRead(frame, Integer.MAX_VALUE);
+        int afterBodyLen = frame.readableBytes();
         int rawSize = ZstdVarInts.tryRead(frame, Integer.MAX_VALUE);
         assertTrue(rawSize > 0, "压缩帧的 rawSize 应为原始长度（>0）");
         assertEquals(1 + ZstdVarInts.length(payload.length) + payload.length, rawSize,
                 "rawSize 应等于 [varint pktLen][pkt] 的总长");
-        assertEquals(frame.readableBytes(), bodyLen, "bodyLen 必须等于其后剩余字节数");
+        assertEquals(afterBodyLen, bodyLen, "bodyLen 必须等于其后剩余字节数");
         assertTrue(encoder.lastCompressed, "应当走压缩路径");
         assertTrue(encoder.lastWire < encoder.lastRaw, "重复数据的压缩帧应当更小");
 

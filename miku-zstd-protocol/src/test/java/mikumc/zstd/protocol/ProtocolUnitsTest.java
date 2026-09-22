@@ -30,8 +30,9 @@ class ProtocolUnitsTest {
     @Test
     @DisplayName("VarInt：length 与 write 必须一致，且覆盖 1~5 字节各档边界")
     void varIntLengthMatchesWrite() {
-        int[] values = {0, 1, 127, 128, 16383, 16384, 2097151, 2097152,
-                Integer.MAX_VALUE, Integer.MIN_VALUE, -1};
+        // 只测非负值：协议里所有 varint 都是长度/状态码，而 tryRead 会主动拒绝负结果
+        //（负结果只可能来自畸形输入，见下面的 varIntRejectsNegative）
+        int[] values = {0, 1, 127, 128, 16383, 16384, 2097151, 2097152, Integer.MAX_VALUE};
         for (int v : values) {
             ByteBuf buf = Unpooled.buffer();
             ZstdVarInts.write(buf, v);
@@ -41,6 +42,21 @@ class ProtocolUnitsTest {
                     "写完再读必须得到原值：" + v);
             buf.release();
         }
+    }
+
+    @Test
+    @DisplayName("VarInt：负数一律读作 INVALID（协议只承载非负长度与状态码）")
+    void varIntRejectsNegative() {
+        for (int v : new int[]{-1, -127, Integer.MIN_VALUE}) {
+            ByteBuf buf = Unpooled.buffer();
+            ZstdVarInts.write(buf, v);
+            assertEquals(ZstdVarInts.INVALID, ZstdVarInts.tryRead(buf, Integer.MAX_VALUE),
+                    "负数 " + v + " 必须被拒绝（它是畸形输入的信号，不是合法值）");
+            buf.release();
+        }
+        // length 仍应给出真实的编码长度（写路径用它分配缓冲）
+        assertEquals(5, ZstdVarInts.length(-1));
+        assertEquals(5, ZstdVarInts.length(Integer.MIN_VALUE));
     }
 
     @Test
@@ -197,8 +213,9 @@ class ProtocolUnitsTest {
     void bossBarColorize() {
         assertEquals("\u00a7aOK", ZstdBossBarFormat.colorize("&aOK"));
         assertEquals("\u00a7lB\u00a7r", ZstdBossBarFormat.colorize("&lB&r"));
-        // '&' 后不是颜色码时保持原样（例如 URL 查询串里的 &）
-        assertEquals("a&b", ZstdBossBarFormat.colorize("a&b"));
+        assertEquals("\u00a7b", ZstdBossBarFormat.colorize("&b"), "&b 是合法颜色码");
+        // '&' 后不是颜色码时保持原样（例如 URL 查询串、或 &z 这类占位）
+        assertEquals("x&zy", ZstdBossBarFormat.colorize("x&zy"));
         assertEquals("&", ZstdBossBarFormat.colorize("&"), "结尾单 & 不应越界");
     }
 

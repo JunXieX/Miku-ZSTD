@@ -39,9 +39,14 @@ dependencies {
     implementation("org.yaml:snakeyaml:2.2")
 
     // ── 测试 ──────────────────────────────────────────────────────────────
-    // 协议回归测试需要 netty 与 zstd 在运行期可见：zstd-jni 由 implementation 传递，
-    // netty 是 compileOnly，所以要在 test 作用域再声明一次。
+    // 协议回归测试需要 netty、zstd 与 slf4j 在运行期可见：zstd-jni 由 implementation
+    // 传递；netty 与 slf4j 平时都是 compileOnly（由代理运行时提供），所以要在
+    // test 作用域再声明一次——共享基类在 <clinit> 里就取 Logger，
+    // 缺 slf4j 会让每个用例以 NoClassDefFoundError 失败（TestEncoder/TestDecoder
+    // "Could not initialize class" 的根因就是它）。
     testImplementation("io.netty:netty-all:4.2.16.Final")
+    testImplementation("org.slf4j:slf4j-api:2.0.17")
+    testRuntimeOnly("org.slf4j:slf4j-nop:2.0.17") // 测试里不需要真实日志输出
     testImplementation(platform("org.junit:junit-bom:6.1.3"))
     testImplementation("org.junit.jupiter:junit-jupiter")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
