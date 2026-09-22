@@ -171,9 +171,12 @@ class FrameLayoutTest {
         ByteBuf frame = readFrame(ch, 5000);
         assertNotNull(frame, "压缩走线程池，需要等待回到 event loop");
 
-        int bodyLen = ZstdVarInts.tryRead(frame, Integer.MAX_VALUE);
-        int afterBodyLen = frame.readableBytes();
-        int rawSize = ZstdVarInts.tryRead(frame, Integer.MAX_VALUE);
+        // ⚠️ 解析必须用 duplicate()：读断言会推进 readerIndex，而这一帧下面还要原样喂给解码器。
+        // （曾经直接用 frame 解析，于是喂过去的是"已被消费掉帧头"的残帧，解码必然失败。）
+        ByteBuf probe = frame.duplicate();
+        int bodyLen = ZstdVarInts.tryRead(probe, Integer.MAX_VALUE);
+        int afterBodyLen = probe.readableBytes();
+        int rawSize = ZstdVarInts.tryRead(probe, Integer.MAX_VALUE);
         assertTrue(rawSize > 0, "压缩帧的 rawSize 应为原始长度（>0）");
         assertEquals(1 + ZstdVarInts.length(payload.length) + payload.length, rawSize,
                 "rawSize 应等于 [varint pktLen][pkt] 的总长");
@@ -302,6 +305,12 @@ class FrameLayoutTest {
      * 只把负载交给解码器——这正是三端"外层长度归属不同"的差异所在，测试必须如实模拟。</p>
      */
     private static void feed(EmbeddedChannel in, ByteBuf frame) {
+        // 防呆：被断言读过的帧不该再喂给解码器（否则喂进去的是残帧，
+        // 症状是"解压不出任何包"，而根因在调用方——所以在这里直接报出来）。
+        if (frame.readerIndex() != 0) {
+            fail("传入的帧已被消费过（readerIndex=" + frame.readerIndex()
+                    + "）：解析断言请改用 frame.duplicate()");
+        }
         int start = frame.readerIndex();
         int first = ZstdVarInts.tryRead(frame, Integer.MAX_VALUE);
         if (first == frame.readableBytes()) {
