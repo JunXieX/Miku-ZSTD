@@ -11,13 +11,14 @@ import org.slf4j.LoggerFactory;
  *
  * <p>触发点有两个，互为保险：</p>
  * <ol>
- *   <li>{@code Connection.setupCompression} 的 TAIL（无冲突环境，原始时机）</li>
- *   <li>{@code ClientHandshakePacketListenerImpl.handleCompression} 的 TAIL（Krypton 兼容路径）</li>
+ *   <li>{@code Connection.setupCompression} 的 TAIL（原始时机）</li>
+ *   <li>{@code ClientHandshakePacketListenerImpl.handleCompression} 的 TAIL</li>
  * </ol>
  *
- * <p>Krypton 会通过后置注入在 setupCompression 内部/之后安装它的 zlib 压缩实现，
- * 覆盖路径 1 的结果；路径 2 在 handleCompression 整体返回后（所有注入完成）再通过
- * eventLoop 排队执行，确保晚于 Krypton 的动作，重新接管管道。</p>
+ * <p>路径 2 存在的意义是<b>接管必须晚于所有压缩处理器的安装</b>：服务端下发
+ * SetCompression 后，压缩处理器可能在 setupCompression 内部或之后才被装上，
+ * 从而覆盖路径 1 的结果。路径 2 在 handleCompression 整体返回后（本轮所有注入
+ * 都已完成）再通过 eventLoop 排队执行，因此总是最后生效。</p>
  *
  * <h2>3.1.0 修复</h2>
  * <ul>
@@ -43,7 +44,7 @@ public final class ZstdClientActivation {
     }
 
     /**
-     * 用 zstd 编解码器替换原版/Krypton 的压缩处理器。幂等，可从任意线程调用
+     * 用 zstd 编解码器替换管线中的压缩处理器。幂等，可从任意线程调用
      * （内部会切到 eventLoop 执行）。
      */
     public static void activate(Channel channel) {
@@ -74,10 +75,10 @@ public final class ZstdClientActivation {
         final ZstdChannelManager mgr = existing;
         ChannelPipeline p = channel.pipeline();
 
-        // 清理 Krypton/原版残留：zstd_encoder 已在位时，移除它装回来的 compress
+        // 清理后装上的压缩处理器：zstd_encoder 已在位时，移除它装回来的 compress
         if (p.get("zstd_encoder") != null && p.get("compress") != null) {
             p.remove("compress");
-            LOGGER.debug("[Zstd] Removed stale vanilla/Krypton compress handler");
+            LOGGER.debug("[Zstd] Removed stale compress handler installed after zstd_encoder");
         }
 
         boolean encOk = installEncoder(p);
