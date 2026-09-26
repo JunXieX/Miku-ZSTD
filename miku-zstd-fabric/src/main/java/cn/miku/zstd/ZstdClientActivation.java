@@ -9,10 +9,13 @@ import org.slf4j.LoggerFactory;
 /**
  * 客户端 zstd 管道激活（幂等）。
  *
- * <p>触发点有两个，互为保险：</p>
+ * <p>触发点有三个，互为保险：</p>
  * <ol>
  *   <li>{@code Connection.setupCompression} 的 TAIL（原始时机）</li>
  *   <li>{@code ClientHandshakePacketListenerImpl.handleCompression} 的 TAIL</li>
+ *   <li>{@link #activateAfterQueryResponseSent}：{@code zstd:dict} 应答写出之后。
+ *       前两条都跑在 SetCompression 处理期间，而"等字典"的客户端那一刻还停在 PLAIN 被跳过，
+ *       没有这一条就再也没人激活（详见该方法的注释）</li>
  * </ol>
  *
  * <p>路径 2 存在的意义是<b>接管必须晚于所有压缩处理器的安装</b>：服务端下发
@@ -54,10 +57,37 @@ public final class ZstdClientActivation {
      */
     public static void activate(Channel channel) {
         if (channel == null) return;
-        channel.eventLoop().execute(() -> activateInEventLoop(channel));
+        channel.eventLoop().execute(() -> activateInEventLoop(channel, false));
     }
 
-    private static void activateInEventLoop(Channel channel) {
+    /**
+     * 登录查询应答<b>写出之后</b>调用（当前唯一调用点是 {@code zstd:dict}）：
+     * 字典装载成功、状态刚变为 {@link ZstdChannelManager.TransportState#NEGOTIATING} 时补一次激活尝试。
+     *
+     * <h2>为什么必须有这个入口</h2>
+     * <p>原有的两个触发点（{@code setupCompression} 与 {@code handleCompression} 的 TAIL）都在
+     * <b>SetCompression 处理期间</b>执行。而"需要字典"的客户端在那一时刻还停在 PLAIN
+     * （见 {@code ZstdLoginNetworking.handleNegotiate}），于是两条路径都只记一句 debug 就跳过；
+     * 等 {@code zstd:dict} 到达、状态改成 NEGOTIATING 时，已经没有任何触发点了——
+     * 客户端停在 NEGOTIATING 永不替换管线，而服务端收到本端应答后已切换到 zstd 发帧，
+     * 形成"服务端 zstd / 客户端 vanilla"的必断连组合。</p>
+     *
+     * <h2>⚠️ 为什么必须"应答写出之后"才能调</h2>
+     * <p>本方法会真的替换出站管道。若在应答写出<b>之前</b>替换，这条应答就会以 zstd 帧
+     * （{@code [rawSize][varint pktLen][pkt]}）发出，而服务端此刻既没有 zstd 解码器，
+     * 帧层应答嗅探器也只认裸帧 {@code [0x02][txId]...}——应答会被丢弃或按未知包 id 解析，
+     * 协商直接失败。调用点因此挂在"应答包写出"的回调上（Fabric 的 {@code callbacksConsumer}）。</p>
+     *
+     * <h2>与 {@link #activate} 的唯一区别</h2>
+     * <p>管道里还没有压缩处理器时（字典比 SetCompression 先到）只记 debug、不报 ERROR：
+     * 那是正常时序，真正需要报警的尝试由上面那两个 TAIL 触发点负责（它们必然在 SetCompression 时执行）。</p>
+     */
+    public static void activateAfterQueryResponseSent(Channel channel) {
+        if (channel == null) return;
+        channel.eventLoop().execute(() -> activateInEventLoop(channel, true));
+    }
+
+    private static void activateInEventLoop(Channel channel, boolean quiet) {
         if (!channel.isActive()) return;
         if (Boolean.TRUE.equals(channel.attr(ACTIVATED).get())) return;
 
@@ -89,8 +119,15 @@ public final class ZstdClientActivation {
         boolean encOk = installEncoder(p);
         boolean decOk = installDecoder(p);
         if (!encOk || !decOk) {
-            LOGGER.error("[Zstd] activation aborted — pipeline anchors missing "
-                    + "(encoder={}, decoder={}); pipeline={}", encOk, decOk, p.names());
+            if (quiet) {
+                // 字典比 SetCompression 先到：压缩处理器还没装上，属正常时序。
+                // 真正决定成败的那次尝试在 setupCompression / handleCompression 的 TAIL 上，那里会报错。
+                LOGGER.debug("[Zstd] activation deferred — compression handlers not installed yet "
+                        + "(encoder={}, decoder={})", encOk, decOk);
+            } else {
+                LOGGER.error("[Zstd] activation aborted — pipeline anchors missing "
+                        + "(encoder={}, decoder={}); pipeline={}", encOk, decOk, p.names());
+            }
             return;
         }
 

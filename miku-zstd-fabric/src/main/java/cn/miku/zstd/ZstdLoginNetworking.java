@@ -132,6 +132,14 @@ public final class ZstdLoginNetworking {
             if (ok) {
                 channel.attr(ZstdChannelManager.ZSTD_STATE)
                         .set(ZstdChannelManager.TransportState.NEGOTIATING);
+                // ⚠️ 状态刚变成 NEGOTIATING，但客户端原有的两个激活触发点
+                //（setupCompression / handleCompression 的 TAIL）是 SetCompression 处理时跑的，
+                // 那时本端还停在 PLAIN 而跳过了 —— 必须在这里补一次，否则客户端永不替换管线，
+                // 而服务端收到本条应答后已开始发 zstd 帧 → 单侧 zstd → 必断连。
+                // 回调挂在"本条应答写出"之后：提前替换出站管道会让这条应答以 zstd 帧发出去，
+                // 而服务端此时还没有 zstd 解码器、帧层嗅探器也只认裸帧 → 协商直接失败。
+                listenerConsumer.accept(operation ->
+                        ZstdClientActivation.activateAfterQueryResponseSent(channel));
             }
             LOGGER.debug("[Zstd] dict delivered: encStatus={} decStatus={} -> {}",
                     encoderStatus, decoderStatus, ok ? "will activate zstd" : "staying vanilla");
