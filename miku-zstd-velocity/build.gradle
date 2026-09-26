@@ -4,7 +4,7 @@ plugins {
 }
 
 group = 'mikumc.zstd'
-version = '4.5.1-Beta'
+version = '4.5.2-Beta'
 
 repositories {
     mavenCentral()

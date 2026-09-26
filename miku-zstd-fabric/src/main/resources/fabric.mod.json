@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "id": "miku_zstd",
-  "version": "4.5.1-Beta",
+  "version": "4.5.2-Beta",
   "name": "Miku-ZSTD",
   "description": "面向 Minecraft 26.2+ / Velocity 4.x 的高性能 zstd 压缩管道：替代原版 zlib，带宽占用大幅降低。需搭配服务端 Miku-ZSTD 插件使用。",
   "authors": [
