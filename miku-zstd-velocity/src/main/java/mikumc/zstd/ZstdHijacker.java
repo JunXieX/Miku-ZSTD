@@ -371,8 +371,13 @@ public class ZstdHijacker extends ChannelDuplexHandler {
 
         if (!mgr.isDictResponseReceived()) {
             if (attempt >= RESPONSE_MAX_RETRIES) {
-                LOGGER.warn("[Zstd] Negotiate response not received after {}ms — skipping zstd (vanilla fallback)",
-                        RESPONSE_RETRY_MS * RESPONSE_MAX_RETRIES);
+                // ⚠️ 这句日志必须能自证"卡在哪一步"：只写"超时"无法区分
+                //「协商应答就没收到」与「协商应答收到了、字典也推了，但字典应答没回来」，
+                // 而两者的排查方向完全相反（前者看客户端有没有收到查询，后者看推送有没有被接受）。
+                LOGGER.warn("[Zstd] Negotiate response not received after {}ms — skipping zstd (vanilla fallback)"
+                                + "（字典已请求={} 字典已确认={}；字典已请求=false 表示连协商应答都没收到）",
+                        RESPONSE_RETRY_MS * RESPONSE_MAX_RETRIES,
+                        mgr.isDictRequested(), mgr.isDictConfirmed());
                 releaseHeld(ctx); // 回落原版：补发扣下的包（原版压缩编码器仍在位）
                 return;
             }
@@ -566,7 +571,8 @@ public class ZstdHijacker extends ChannelDuplexHandler {
                 if (enc != null && enc.length > 0) writeDictBytes(buf, enc);
                 if (dec != null && dec.length > 0) writeDictBytes(buf, dec);
                 writeLoginQuery(channel, writeCtx, buf);
-                LOGGER.debug("[Zstd] Sent zstd:dict txId={} flags={}", txId, flags);
+                LOGGER.info("[Zstd] 已推送 zstd:dict txId={} flags={} (enc={}B dec={}B)，等待其应答",
+                        txId, flags, enc == null ? 0 : enc.length, dec == null ? 0 : dec.length);
             } catch (Throwable t) {
                 if (buf.refCnt() > 0) buf.release();
                 throw t;

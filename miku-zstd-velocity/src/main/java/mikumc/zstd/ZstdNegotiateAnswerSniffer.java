@@ -188,10 +188,15 @@ public class ZstdNegotiateAnswerSniffer extends MessageToMessageDecoder<ByteBuf>
             return out;
         }
         if (first == 0x00) { // 直存帧：跳过"未压缩"标记
-            if (len < 4 || (in.getByte(start + 1) & 0xFF) != PACKET_ID_ANSWER) return null;
-            byte[] out = new byte[len - 1];
-            in.getBytes(start + 1, out, 0, out.length);
-            return out;
+            if (len >= 4 && (in.getByte(start + 1) & 0xFF) == PACKET_ID_ANSWER) {
+                byte[] out = new byte[len - 1];
+                in.getBytes(start + 1, out, 0, out.length);
+                return out;
+            }
+            // 也可能是 zstd 直存帧 [0x00][varint pktLen][packetId 0x02]…：
+            // 客户端若在本条应答写出之前就已经切到 zstd（旧模组 / 极端时序），应答就是这个形态。
+            // 漏认它 → 应答丢失 → 代理回落原版而客户端已切 zstd → 单侧 zstd → 断连。
+            return asZstdStoredPacket(in, start + 1);
         }
 
         // 其余情况按压缩帧处理：先读声明长度，再解压。
@@ -227,5 +232,27 @@ public class ZstdNegotiateAnswerSniffer extends MessageToMessageDecoder<ByteBuf>
             LOGGER.debug("[Zstd] 应答帧解压失败（忽略该帧）: {}", t.toString());
             return null;
         }
+    }
+
+    /** 取出 zstd 直存帧内层的第一个包：{@code [varint pktLen][pkt]…}。 */
+    private static byte[] asZstdStoredPacket(ByteBuf in, int idx) {
+        int pktLen = -1;
+        int value = 0;
+        int shift = 0;
+        while (idx < in.writerIndex() && shift <= 28) {
+            byte b = in.getByte(idx++);
+            value |= (b & 0x7F) << shift;
+            if ((b & 0x80) == 0) {
+                pktLen = value;
+                break;
+            }
+            shift += 7;
+        }
+        int avail = in.writerIndex() - idx;
+        if (pktLen < 3 || avail < 3) return null;
+        if ((in.getByte(idx) & 0xFF) != PACKET_ID_ANSWER) return null;
+        byte[] out = new byte[Math.min(pktLen, avail)];
+        in.getBytes(idx, out, 0, out.length);
+        return out;
     }
 }
