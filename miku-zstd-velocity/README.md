@@ -17,7 +17,7 @@
 
 | 优化 | 实测收益 | 说明 |
 |---|---|---|
-| **一帧多包**（批处理） | **-33.7%** | 3ms 窗口内的多个包合成一帧再压缩，开销被摊薄，直存帧降到 0 |
+| **一帧多包**（批处理） | **-33.7%** | 1ms 窗口内的多个包合成一帧再压缩，开销被摊薄，直存帧降到 0 |
 | **帧头精简** | **-10.7%** | 去掉 zstd 的 4 字节 magic 与帧头里的 contentSize/dictID（尺寸由协议自带） |
 | **字典训练** | 小包 **-23.6%** | 从真实流量采样自动训练，收益集中在小包（这正是原版最吃亏的地方） |
 | **合计** | **-38.3%** | 相对"每包一帧 + 完整帧头"的基线 |
@@ -193,14 +193,15 @@ logging:
 | `/mikuzstd` | 等同 `/mikuzstd status` | 无 |
 | `/mikuzstd status` | 压缩参数、在线人数、训练器状态、压缩线程池、解压缓冲 | 无 |
 | `/mikuzstd top` | 各连接的压缩统计排行（按原始字节降序，定位"谁在拖后腿"） | 无 |
-| `/mikuzstd bar` | 开关 BossBar 实时监控（每秒刷新） | 无 |
+| `/mikuzstd bar` | 开关 BossBar 实时监控（每秒刷新） | `mikuzstd.command` / `zstd.command` |
 | `/mikuzstd reload` | 热重载 `config.yml` | `mikuzstd.command` / `zstd.command` |
-| `/mikuzstd train` | 立即触发一轮训练（绕过采样门槛与冷却） | `mikuzstd.command` / `zstd.command` |
-| `/mikuzstd train force` | 同 `train`（`forceTrain` 本就绕过门槛与冷却） | 同 `train` |
+| `/mikuzstd train` | 样本达标时触发一轮训练（绕过冷却与「环满 / 兜底超时」两个门槛） | `mikuzstd.command` / `zstd.command` |
+| `/mikuzstd train force` | 忽略样本门槛，强制触发一轮训练 | 同 `train` |
 
 > **权限说明**：Velocity 自身没有内置权限系统，未装权限插件时玩家的 `hasPermission` 恒为 false；
 > 而 Brigadier 会把 `requires=false` 的节点**连同子树整个从命令树里剔除**（不只是禁用）。
-> 因此只读/无副作用的前三个子命令对所有人开放，只有 `reload` / `train` 保留权限门槛。
+> 因此只读的 `status` / `top` 对所有人开放；`bar` 虽然看起来只是个显示开关，实际会**启停全局流量统计**
+> （且监控是单人持有的），所以与 `reload` / `train` 一样保留权限门槛。
 
 > ⚠️ `reload` 只会替换配置单例：**`level` / `window_log` 等参数只对之后新建立的连接生效**，
 > 已有连接仍在用旧值（这些参数在连接建立时才应用到该连接的上下文），需要重启代理才会全部更新。
@@ -223,7 +224,7 @@ logging:
 ```
 [Zstd] Sniffer detected Zstd client on <ip>          ← 识别到 mod 客户端
 [Zstd] Sent zstd:negotiate txId=... encId=... decId=...
-[Zstd] Negotiate response received: enc=0 dec=0      ← 客户端应答
+[Zstd] Negotiate 应答：enc=0 dec=0 dictConfirmed=true  ← 客户端应答
 [Zstd] SetCompression detected — deferring ...       ← 进入激活窗口
 [Zstd] Zstd transport activated (dict=true)          ← 激活成功
 ```

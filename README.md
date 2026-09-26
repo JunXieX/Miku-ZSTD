@@ -374,7 +374,7 @@ With `logging.debug: true`, a normal sequence looks like this:
 ```text
 [Zstd] Sniffer detected Zstd client on <ip>          <- modded client detected
 [Zstd] Sent zstd:negotiate txId=... encId=... decId=...
-[Zstd] Negotiate response received: enc=0 dec=0      <- client answered
+[Zstd] Negotiate 应答：enc=0 dec=0 dictConfirmed=true  <- client answered
 [Zstd] SetCompression detected - deferring ...       <- entering the activation window
 [Zstd] Zstd transport activated (dict=true)          <- activation succeeded
 ```
