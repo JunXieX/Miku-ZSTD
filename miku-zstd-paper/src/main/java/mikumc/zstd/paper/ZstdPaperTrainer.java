@@ -198,20 +198,6 @@ public final class ZstdPaperTrainer {
         return sampleBytes;
     }
 
-    /** 手动触发训练（命令入口），绕过门槛与冷却。 */
-    public void forceTrain() {
-        if (!training.compareAndSet(false, true)) return;
-        synchronized (this) {
-            lastTrainTime = System.currentTimeMillis();
-        }
-        ExecutorService te = trainExecutor;
-        if (te == null) {
-            training.set(false);
-            return;
-        }
-        te.execute(this::trainAndAdopt);
-    }
-
     /**
      * 拆分整帧并批量入环：帧格式为 {@code [varint pktLen][pkt]...}。
      *

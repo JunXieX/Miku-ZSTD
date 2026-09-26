@@ -124,7 +124,7 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
 
 
 
-    /** 发轻量 negotiate：只带协议版本与 dictId（本端无字典训练，恒为 0）。 */
+    /** 发轻量 negotiate：只带协议版本与两个 dictId（字典字节按需另发，见 {@link #sendDictQuery}）。 */
     private void sendNegotiate(ChannelHandlerContext ctx) {
         ZstdPaperChannelManager mgr = ctx.channel().attr(ZstdPaperChannelManager.KEY).get();
         if (mgr == null || mgr.getNegotiateTxId() != -1) return;

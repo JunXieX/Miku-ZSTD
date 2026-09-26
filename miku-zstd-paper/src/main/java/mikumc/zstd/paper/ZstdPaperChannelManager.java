@@ -19,7 +19,9 @@ import org.slf4j.LoggerFactory;
  *   <li>入站：{@code splitter} → {@code decompress} → {@code decoder}。</li>
  * </ul>
  *
- * <p>本版本不做字典训练，故 {@code dictId} 恒为 0——客户端照常参与 zstd（无字典压缩仍有效）。</p>
+ * <p>字典链路与 Velocity 端同构：{@link ZstdPaperTrainer} 从真实流量采样训练，
+ * {@link ZstdPaperDictRegistry} 进程级共享并按引用计数换代释放；协商时按客户端所缺方向
+ * 通过 {@code zstd:dict} 按需下发。</p>
  */
 public class ZstdPaperChannelManager {
 

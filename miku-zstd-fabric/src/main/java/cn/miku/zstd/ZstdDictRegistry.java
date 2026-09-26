@@ -162,13 +162,4 @@ public final class ZstdDictRegistry {
         return null;
     }
 
-    /** 清空全部缓存（客户端退出时调用）。 */
-    public static void shutdown() {
-        synchronized (LOCK) {
-            for (Entry e : COMPRESS.values()) e.retire();
-            for (Entry e : DECOMPRESS.values()) e.retire();
-            COMPRESS.clear();
-            DECOMPRESS.clear();
-        }
-    }
 }

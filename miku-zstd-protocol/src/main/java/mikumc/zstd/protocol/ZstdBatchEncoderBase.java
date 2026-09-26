@@ -405,13 +405,19 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
             windowTask.cancel(false);
             windowTask = null;
         }
-        if (!pending.isEmpty() && ctx.channel().isActive()) {
+        // 只有「通道还在、且没有在途压缩任务占用每连接的缓冲」时才有可能补发；
+        // 有在途任务时 emitBatch 会直接返回（见那里的说明），于是下面必须自己收尾。
+        if (!pending.isEmpty() && !compressing && ctx.channel().isActive()) {
             emitBatch(ctx); // 处理器被移除前把残留数据送出去，避免丢包
-        } else {
+        }
+        // ⚠️ 没能补发的残留必须在这里处理干净：本处理器已被移除，emitBatch 的
+        //「等压缩回来再发」那条路径不会再走回来，留下的是永不完成的 promise 与永不释放的缓冲
+        //（后者是 ReferenceCounted，扣在 pending 里没人替我们 release）。
+        if (!pending.isEmpty()) {
             releasePending();
             failPending(new ClosedChannelException());
-            pendingPromises.clear();
         }
+        pendingPromises.clear();
         failInflight(new ClosedChannelException());
     }
 

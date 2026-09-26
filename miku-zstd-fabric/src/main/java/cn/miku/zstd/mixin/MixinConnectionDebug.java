@@ -25,8 +25,9 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
  *       入站包做 {@code getSimpleName()} 加 4 次 {@code String.contains()} 的
  *       字符串匹配且永不停止——netty 线程上的长期逐包开销。</li>
  * </ul>
- * <p>现在：逐包记录与断连详情只在 debug 开启时输出；{@code exceptionCaught}
- * 保持 ERROR（真正的异常不会在正常断连时触发，属于值得上报的信号）。</p>
+ * <p>现在：逐包记录与断连详情只在 debug 开启时输出；{@code exceptionCaught} 在<b>通道仍活跃</b>时
+ * 保持 ERROR（真正的异常必须留痕），通道已关闭时的收尾噪音降为 debug——与服务端
+ * {@code ZstdBatchDecoderBase#exceptionCaught} 的约定一致，否则每次退出服务器都会刷一条 ERROR + 堆栈。</p>
  */
 @Mixin(Connection.class)
 public class MixinConnectionDebug {
@@ -36,7 +37,15 @@ public class MixinConnectionDebug {
     @Inject(method = "exceptionCaught(Lio/netty/channel/ChannelHandlerContext;Ljava/lang/Throwable;)V",
             at = @At("HEAD"))
     private void zstd$logException(ChannelHandlerContext ctx, Throwable t, CallbackInfo ci) {
-        LOGGER.error("[Zstd] connection exception (normally swallowed at debug level):", t);
+        // ⚠️ 与服务端同一约定：通道已关闭时的异常是收尾噪音 —— 本模组在断线时会失败化挂起的写
+        // promise，它们挂着的 FIRE_EXCEPTION_ON_FAILURE 会把异常从 pipeline 头部广播回来，
+        // 正好撞在这里。那种情况降为 debug，否则每次退出服务器都要刷一条 ERROR + 堆栈。
+        // 通道仍活跃时保持 ERROR：真异常必须留痕。
+        if (!ctx.channel().isActive()) {
+            LOGGER.debug("[Zstd] connection exception after channel closed: {}", t.toString());
+        } else {
+            LOGGER.error("[Zstd] connection exception (normally swallowed at debug level):", t);
+        }
     }
 
     @Inject(method = "channelInactive", at = @At("HEAD"))
