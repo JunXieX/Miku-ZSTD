@@ -515,7 +515,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
 
                 // 协议 v4：字典不再内联——只声明 id，客户端缺哪个再单独推 zstd:dict
 
-                writeCtx.writeAndFlush(buf);
+                writeLoginQuery(channel, writeCtx, buf);
                 LOGGER.debug("[Zstd] Sent zstd:negotiate txId={} encId={} decId={}", txId, encId, decId);
             } catch (Throwable t) {
                 if (buf.refCnt() > 0) buf.release();
@@ -565,7 +565,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
                 buf.writeByte(flags);
                 if (enc != null && enc.length > 0) writeDictBytes(buf, enc);
                 if (dec != null && dec.length > 0) writeDictBytes(buf, dec);
-                writeCtx.writeAndFlush(buf);
+                writeLoginQuery(channel, writeCtx, buf);
                 LOGGER.debug("[Zstd] Sent zstd:dict txId={} flags={}", txId, flags);
             } catch (Throwable t) {
                 if (buf.refCnt() > 0) buf.release();
@@ -581,6 +581,67 @@ public class ZstdHijacker extends ChannelDuplexHandler {
         buf.writeInt(mikumc.zstd.protocol.ZstdDictId.wireChecksum(dict));
         buf.writeInt(dict.length);
         buf.writeBytes(dict);
+    }
+
+    /**
+     * 写出一个手工拼的登录期查询包，并按"客户端此刻期望的形态"决定是否包一层压缩帧头。
+     *
+     * <p>negotiate 与 zstd:dict 都是手工拼的裸 MC 包（{@code [packetId][txId][channel][payload]}），
+     * 写在 {@code compression-encoder} 的 context 上会<b>绕过压缩</b>。压缩还没启用时这正确
+     * （客户端此刻也还没装 zlib 解码器，裸帧就是它期望的形态）。</p>
+     *
+     * <p>⚠️ 但压缩一旦启用（原版已经写出 SetCompression），客户端的 {@code CompressionDecoder}
+     * 会先读一个 varint：{@code 0} = 未压缩直存、{@code >0} = zlib 压缩体长度。我们的包 id
+     * {@code 0x04} 会被它当成"声明了 4 字节压缩体"，直接抛
+     * {@code DecoderException: Badly compressed packet - size of 4 is below server threshold of 256}
+     * 把玩家踢下线 —— 这正是「离线模式代理 + 已训练出字典 + 客户端无缓存」进不去服务器的原因：
+     * 离线模式没有加密那一个额外 RTT，字典推送必然落在 SetCompression 之后。在线模式因为
+     * 字典推送恰好赶在 SetCompression 之前，所以一直没暴露。</p>
+     *
+     * <p>因此压缩已启用时，这里按 MC 的压缩帧格式自己包一层再发（写在不经过
+     * compression-encoder 的位置上，所以不会被压第二次）。</p>
+     */
+    private static void writeLoginQuery(Channel channel, ChannelHandlerContext writeCtx, ByteBuf payload) {
+        if (channel.pipeline().get(COMPRESSION_ENCODER) == null) {
+            writeCtx.writeAndFlush(payload); // 裸帧：压缩未启用，所有权交给管线
+            return;
+        }
+        try {
+            byte[] raw = new byte[payload.readableBytes()];
+            payload.getBytes(payload.readerIndex(), raw);
+            writeCtx.writeAndFlush(compressFrame(writeCtx.alloc(), raw));
+        } finally {
+            payload.release(); // 压缩路径用的是拷贝，原缓冲由本方法回收（raw 路径不释放，见上）
+        }
+    }
+
+    /**
+     * MC 的压缩帧：{@code [varint 原始长度][deflate 数据]}，与 {@code CompressionEncoder} 同格式。
+     *
+     * <p>解压端（客户端）会校验解压结果的长度与声明一致，所以这里必须整帧压完再发。</p>
+     */
+    private static ByteBuf compressFrame(io.netty.buffer.ByteBufAllocator alloc, byte[] payload) {
+        java.util.zip.Deflater deflater = new java.util.zip.Deflater();
+        byte[] chunk = new byte[8192];
+        ByteBuf out = alloc.buffer();
+        try {
+            deflater.setInput(payload);
+            deflater.finish();
+            ZstdVarInts.write(out, payload.length);
+            while (!deflater.finished()) {
+                int n = deflater.deflate(chunk);
+                if (n <= 0) {
+                    throw new IllegalStateException("deflate made no progress");
+                }
+                out.writeBytes(chunk, 0, n);
+            }
+            return out;
+        } catch (Throwable t) {
+            out.release();
+            throw t;
+        } finally {
+            deflater.end();
+        }
     }
 
     /**

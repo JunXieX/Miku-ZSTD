@@ -99,8 +99,12 @@ public class ZstdNegotiateAnswerSniffer extends MessageToMessageDecoder<ByteBuf>
     }
 
     /**
-     * 匹配 {@code [id=0x02][varint txId][bool success][varint encStatus][varint decStatus]}，
+     * 匹配登录查询应答：{@code [0x02][varint txId][bool success][varint encStatus][varint decStatus]}，
      * txId 与 negotiate 或 dict 查询任一相符即命中。
+     *
+     * <p>⚠️ 帧的<b>外层形态有三种</b>（见 {@link #asRawPacket}），全部都要认得：漏掉任何一种，
+     * 应答就永远回填不上 —— 服务端 2 秒后回落原版，而客户端此刻已经装载字典并切到 zstd，
+     * 于是形成单侧 zstd → 必断连。</p>
      *
      * @return 是否命中并已消费该帧
      */
@@ -109,37 +113,28 @@ public class ZstdNegotiateAnswerSniffer extends MessageToMessageDecoder<ByteBuf>
         int dictTxId = mgr.getDictTxId();
         if (negotiateTxId <= 0 && dictTxId <= 0) return false;
 
-        int start = in.readerIndex();
-        int end = in.writerIndex();
-        if (end - start < 3) return false;
-        if ((in.getByte(start) & 0xFF) != PACKET_ID_ANSWER) return false;
+        byte[] packet = asRawPacket(in);
+        if (packet == null || packet.length < 3) return false;
+        if ((packet[0] & 0xFF) != PACKET_ID_ANSWER) return false;
 
-        // 无副作用读取 txId：借共享的 ByteBuf 版读取器，读完把读位置还原。
-        // （不能依赖 tryRead 内部的 mark/reset——它会把标记覆盖成 varint 的起点。）
-        // 成功后 tryRead 会把读位置推到 varint 之后，正好就是 success 位的下标，
-        // 这比用 length(txId) 重算更可靠（对非最小编码也成立）。
-        in.readerIndex(start + 1);
-        int txId = ZstdVarInts.tryRead(in, Integer.MAX_VALUE);
-        int successPos = in.readerIndex();
-        in.readerIndex(start);
+        // 包结构： [packetId 0x02][varint txId][bool success][varint encStatus][varint decStatus]
+        int[] cursor = {1};
+        int txId = ZstdVarInts.readOr(packet, cursor, ZstdVarInts.INVALID);
         if (txId < 0) return false;
 
         boolean isNegotiate = negotiateTxId > 0 && txId == negotiateTxId;
         boolean isDict = dictTxId > 0 && txId == dictTxId;
         if (!isNegotiate && !isDict) return false;
 
-        // 包结构： [varint txId][bool success][varint encStatus][varint decStatus]
-        boolean success = successPos < end && in.getByte(successPos) != 0;
+        boolean success = cursor[0] < packet.length && packet[cursor[0]] != 0;
+        cursor[0]++;
         int encStatus = ZstdNegotiateStatus.VANILLA;
         int decStatus = ZstdNegotiateStatus.VANILLA;
-        if (success && successPos + 1 < end) {
-            byte[] tail = new byte[end - successPos - 1];
-            in.getBytes(successPos + 1, tail);
-            int[] cursor = {0};
+        if (success && cursor[0] < packet.length) {
             encStatus = ZstdNegotiateStatus.sanitize(
-                    ZstdVarInts.readOr(tail, cursor, ZstdNegotiateStatus.FALLBACK));
+                    ZstdVarInts.readOr(packet, cursor, ZstdNegotiateStatus.FALLBACK));
             decStatus = ZstdNegotiateStatus.sanitize(
-                    ZstdVarInts.readOr(tail, cursor, ZstdNegotiateStatus.FALLBACK));
+                    ZstdVarInts.readOr(packet, cursor, ZstdNegotiateStatus.FALLBACK));
         }
 
         if (isNegotiate && ZstdHijacker.needsDictPush(encStatus, decStatus)) {
@@ -159,5 +154,78 @@ public class ZstdNegotiateAnswerSniffer extends MessageToMessageDecoder<ByteBuf>
         // 立即触发激活（若 SetCompression 已写出），省掉最长 100ms 的轮询等待
         ZstdHijacker.notifyDictResponse(ctx.channel());
         return true;
+    }
+
+    /**
+     * 把一帧还原成"裸包字节"（以包 id 开头），兼容客户端在三种状态下发出的应答。
+     *
+     * <ul>
+     *   <li><b>裸帧</b> {@code [0x02][txId]...} —— 客户端还没装 zlib 编码器（SetCompression 之前，
+     *       离线模式下 negotiate 的应答就是这种）；</li>
+     *   <li><b>直存帧</b> {@code [0x00][0x02][txId]...} —— 客户端已装 zlib 编码器、且应答小于阈值。
+     *       登录查询应答只有几字节，所以这是<b>SetCompression 之后的常态</b>；</li>
+     *   <li><b>压缩帧</b> {@code [varint 原始长度>0][deflate]} —— 客户端已装 zlib 编码器、但阈值很小
+     *       （例如 {@code network-compression-threshold=1}），此时应答会被真正压缩。</li>
+     * </ul>
+     *
+     * <p>为什么要三种都认：代理这一侧的压缩解码器会把这些帧当作 zlib 帧处理（直存帧恰好被
+     * "长度 0 = 未压缩"规则放行，压缩帧被正常解开），所以<b>帧层是唯一能拦到应答的地方</b>；
+     * 少认一种，应答就丢了（详见 {@link #tryHandleAnswer} 的警告）。</p>
+     *
+     * <p>本方法<b>不改变</b>传入缓冲的读位置：识别失败时原帧必须原样交给下游。</p>
+     *
+     * @return 裸包字节；无法识别返回 {@code null}
+     */
+    private static byte[] asRawPacket(ByteBuf in) {
+        int start = in.readerIndex();
+        int len = in.writerIndex() - start;
+        if (len < 3) return null;
+
+        int first = in.getByte(start) & 0xFF;
+        if (first == PACKET_ID_ANSWER) { // 裸帧
+            byte[] out = new byte[len];
+            in.getBytes(start, out, 0, len);
+            return out;
+        }
+        if (first == 0x00) { // 直存帧：跳过"未压缩"标记
+            if (len < 4 || (in.getByte(start + 1) & 0xFF) != PACKET_ID_ANSWER) return null;
+            byte[] out = new byte[len - 1];
+            in.getBytes(start + 1, out, 0, out.length);
+            return out;
+        }
+
+        // 其余情况按压缩帧处理：先读声明长度，再解压。
+        // 长度上限刻意收紧到 64KB —— 登录查询应答不可能这么大，避免畸形帧逼出大分配。
+        try {
+            int declared = -1;
+            int idx = start;
+            int value = 0;
+            int shift = 0;
+            while (idx < in.writerIndex() && shift <= 28) {
+                byte b = in.getByte(idx++);
+                value |= (b & 0x7F) << shift;
+                if ((b & 0x80) == 0) {
+                    declared = value;
+                    break;
+                }
+                shift += 7;
+            }
+            if (declared <= 0 || declared > 65536 || idx >= in.writerIndex()) return null;
+
+            byte[] src = new byte[in.writerIndex() - idx];
+            in.getBytes(idx, src, 0, src.length);
+            java.util.zip.Inflater inflater = new java.util.zip.Inflater();
+            try {
+                inflater.setInput(src);
+                byte[] out = new byte[declared];
+                if (inflater.inflate(out) != declared) return null;
+                return out;
+            } finally {
+                inflater.end();
+            }
+        } catch (Throwable t) {
+            LOGGER.debug("[Zstd] 应答帧解压失败（忽略该帧）: {}", t.toString());
+            return null;
+        }
     }
 }
