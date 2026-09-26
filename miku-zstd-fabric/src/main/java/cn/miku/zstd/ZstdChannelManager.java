@@ -3,6 +3,7 @@ package cn.miku.zstd;
 import com.github.luben.zstd.ZstdCompressCtx;
 import com.github.luben.zstd.ZstdDecompressCtx;
 import io.netty.util.AttributeKey;
+import mikumc.zstd.protocol.ZstdNegotiateStatus;
 import mikumc.zstd.protocol.ZstdVarInts;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -44,6 +45,19 @@ public class ZstdChannelManager {
     /** 已取用的共享字典条目，连接关闭时归还引用 */
     private ZstdDictRegistry.Entry encoderDictEntry;
     private ZstdDictRegistry.Entry decoderDictEntry;
+
+    /**
+     * 协商阶段算出的两个方向的状态（取值见 {@link ZstdNegotiateStatus}）。
+     *
+     * <p>⚠️ 必须留着：服务端只会推送<b>客户端所缺</b>的方向（它的 flags 完全来自本端应答里的
+     * NEED_DICT），所以 {@code zstd:dict} 里<b>没被 flags 点名</b>的方向要沿用这里的状态 ——
+     * 不能当作"不可用"，那会让服务端判定客户端拒绝并让整条链路回落原版
+     * （详见 {@code ZstdLoginNetworking.handleDict}）。</p>
+     *
+     * <p>默认 {@code VANILLA}：万一没有协商过就收到字典推送，两端都会安全地保持原版。</p>
+     */
+    private volatile int encoderDirStatus = ZstdNegotiateStatus.VANILLA;
+    private volatile int decoderDirStatus = ZstdNegotiateStatus.VANILLA;
 
     public ZstdChannelManager() {
         ZstdConfig cfg = ZstdConfig.INSTANCE;
@@ -146,6 +160,25 @@ public class ZstdChannelManager {
 
     private static void releaseQuietly(ZstdDictRegistry.Entry e) {
         if (e != null) e.release();
+    }
+
+    /** 记录某一方向在协商阶段算出的状态（{@code READY} / {@code NEED_DICT}）。 */
+    public void setDirStatus(boolean isEncoder, int status) {
+        if (isEncoder) {
+            encoderDirStatus = status;
+        } else {
+            decoderDirStatus = status;
+        }
+    }
+
+    /**
+     * 读取某一方向在协商阶段的状态。
+     *
+     * <p>{@code zstd:dict} 阶段对"未被 flags 点名的方向"必须沿用本方法的值，而不是当作
+     * {@code VANILLA} —— 原因见 {@link #encoderDirStatus} 的注释。</p>
+     */
+    public int dirStatus(boolean isEncoder) {
+        return isEncoder ? encoderDirStatus : decoderDirStatus;
     }
 
     public void close() {

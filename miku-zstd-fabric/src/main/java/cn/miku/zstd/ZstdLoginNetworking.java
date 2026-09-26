@@ -81,6 +81,9 @@ public final class ZstdLoginNetworking {
             // 每个方向：READY = 已就绪（无需字典或本地已缓存），NEED_DICT = 需要服务端推送
             byte encoderStatus = resolve(mgr, encoderDictId, true);
             byte decoderStatus = resolve(mgr, decoderDictId, false);
+            // 记下两个方向的状态：zstd:dict 阶段要用它回答"未被 flags 点名的方向"
+            mgr.setDirStatus(true, encoderStatus);
+            mgr.setDirStatus(false, decoderStatus);
 
             boolean refuse = encoderStatus == ZstdNegotiateStatus.VANILLA
                     || decoderStatus == ZstdNegotiateStatus.VANILLA;
@@ -117,9 +120,14 @@ public final class ZstdLoginNetworking {
             }
 
             byte flags = data.readByte();
-            // 未被 flags 点名的方向按"不可用"处理：服务端会据此回落，而不是单侧激活
-            byte encoderStatus = ZstdNegotiateStatus.VANILLA;
-            byte decoderStatus = ZstdNegotiateStatus.VANILLA;
+            // ⚠️ 未被 flags 点名的方向**不能按"不可用"报**，要沿用协商阶段算出的状态：
+            // 服务端的 flags 完全来自本端应答里的 NEED_DICT，所以没被点名的那个方向在本端
+            // 必定已经 READY（服务端该方向 dictId=0，或本地缓存命中且已装载）。
+            // 按 VANILLA 报的后果：服务端把它判成"客户端拒绝"→ 双方一起回落原版 ——
+            // 只要字典有一个方向还没训练出来（/mikuzstd status 里某个 dictId=0），
+            // 或本地只缓存了一个方向，zstd 就永远不会生效。
+            byte encoderStatus = (byte) mgr.dirStatus(true);
+            byte decoderStatus = (byte) mgr.dirStatus(false);
             if ((flags & 1) != 0) {
                 encoderStatus = loadOne(mgr, data, true);
             }
