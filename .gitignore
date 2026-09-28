@@ -1,0 +1,47 @@
+# ===== 构建产物 =====
+build/
+target/
+out/
+bin/
+*.jar
+*.war
+*.zip
+*.tar.gz
+
+# ===== Gradle =====
+# 构建一律在 CI 上执行（见 .github/workflows/build.yml），仓库不保存 wrapper：
+# gradle-wrapper.jar 是二进制产物、gradlew 自带许可头，都不入库。
+gradle/wrapper/
+gradlew
+gradlew.bat
+
+# ===== 构建缓存 =====
+.gradle/
+gradle-app.setting
+.gradlew*
+.mvn/wrapper/maven-wrapper.jar
+
+# ===== 本地构建依赖目录（velocity-proxy.jar 等第三方 jar，不入库） =====
+libs/
+
+# ===== IDE =====
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+*.swp
+*.swo
+
+# ===== 运行环境 / 日志 =====
+run/
+runs/
+logs/
+plugins/
+*.log
+crash-reports/
+
+# ===== 系统 =====
+.DS_Store
+Thumbs.db
+desktop.ini

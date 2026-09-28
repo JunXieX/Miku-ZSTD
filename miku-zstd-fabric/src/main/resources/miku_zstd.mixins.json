@@ -1,0 +1,19 @@
+{
+  "required": true,
+  "package": "cn.miku.zstd.mixin",
+  "compatibilityLevel": "JAVA_25",
+  "minVersion": "0.8",
+  "client": [
+    "ConnectionAccessor",
+    "ClientHandshakePacketListenerAccessor",
+    "MixinClientIntentionPacket",
+    "MixinConnectionDebug",
+    "MixinConnectionSetup",
+    "MixinHandshakeListener",
+    "MixinHud"
+  ],
+  "mixins": [],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

@@ -1,0 +1,76 @@
+plugins {
+    id 'java'
+    id 'com.gradleup.shadow' version '8.3.9'
+}
+
+group = 'mikumc.zstd'
+version = '4.9.0'
+
+base {
+    archivesName = 'Miku-ZSTD'
+}
+
+repositories {
+    mavenCentral()
+    maven { url = 'https://repo.papermc.io/repository/maven-public/' }
+}
+
+dependencies {
+    // 纯 Paper：只依赖 paper-api（不引入 spigot-api / bukkit 兼容层）
+    compileOnly("io.papermc.paper:paper-api:26.2.build.124-stable")
+    // Netty 由服务端提供（MC 26.x 未混淆，反射即可访问管线），仅用于编译。
+    // ⚠️ 对齐运行期主版本：MC 26.2 内置 Netty **4.2.15.Final**。
+    // 以前写 4.1.107.Final 会造成"编译期 4.1 / 运行期 4.2"，跨大版本的风险在于
+    // 签名变更时本地编译不报错、运行期才炸。
+    compileOnly("io.netty:netty-all:4.2.15.Final")
+    // zstd：Paper 服务端自带 zstd-jni 1.5.7-15（在 META-INF/libraries 中），
+    // 但插件类加载器访问不到，因此随插件打包 1.5.7-17，避免版本/可见性歧义。
+    implementation("com.github.luben:zstd-jni:1.5.7-17")
+    implementation("org.yaml:snakeyaml:2.2")
+}
+
+// 共享协议模块（与 Velocity / Fabric 端同一份源码）
+sourceSets {
+    main {
+        java {
+            srcDir(new File(rootDir.parentFile, 'miku-zstd-protocol/src/main/java'))
+        }
+    }
+}
+
+def targetJavaVersion = 25
+java {
+    toolchain.languageVersion = JavaLanguageVersion.of(targetJavaVersion)
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release.set(targetJavaVersion)
+    options.compilerArgs << '-Xlint:all' << '-Xlint:-processing'
+}
+
+
+// ── native 库瘦身 ────────────────────────────────────────────────────────────
+// 真正的裁剪规则是下面 shadowJar 里那一组 exclude；要改保留平台就直接改那里。
+// （这里曾有一个 def slimNativeExcludes 列表，定义了却从未被引用——
+//  它和 exclude 两组内容重复，只会在改配置时让人以为改它就生效了。）
+
+shadowJar {
+    archiveClassifier.set('Paper')
+
+    // 裁掉不会部署本插件的平台（18 个原生库约占 jar 体积的 93%，而运行时只会
+    // 加载匹配当前平台的那一个——其余既不占内存也不参与加载，纯粹是磁盘与分发开销）。
+    // 保留：Windows(x64/arm64)、Linux(x64/arm64)、macOS(x64/arm64)。
+    // 要跑在别的架构上时，从下面删掉对应那一行即可。
+    exclude 'aix/**'
+    exclude 'freebsd/**'
+    exclude 'linux/riscv64/**'
+    exclude 'linux/ppc64/**'
+    exclude 'linux/ppc64le/**'
+    exclude 'linux/mips64/**'
+    exclude 'linux/loongarch64/**'
+    exclude 'linux/s390x/**'
+    exclude 'linux/i386/**'
+    exclude 'linux/arm/**'
+    exclude 'win/x86/**'
+}
