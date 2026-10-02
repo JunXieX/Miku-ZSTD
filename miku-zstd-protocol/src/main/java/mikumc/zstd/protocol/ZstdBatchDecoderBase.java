@@ -284,7 +284,9 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
                 return;
             }
             off = varintEnd;
-            if (off + pktLen > data.length) {
+            // ⚠️ pktLen 来自对端（最大 2^31-1），必须用 long 相加：int 溢出会让越界判定
+            // 失效而放行 2GB 级别的内层长度（回归用例见 FrameLayoutTest）。
+            if (off + (long) pktLen > data.length) {
                 protocolError(ctx, "inner packet length " + pktLen + " overruns payload ("
                         + off + "+" + pktLen + " > " + data.length + ")");
                 return;

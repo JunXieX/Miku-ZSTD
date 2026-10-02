@@ -89,6 +89,14 @@ public final class ZstdClientActivation {
 
     private static void activateInEventLoop(Channel channel, boolean quiet) {
         if (!channel.isActive()) return;
+        ChannelPipeline p = channel.pipeline();
+
+        // 幂等清理：zstd 已在位时，原版 SetCompression 可能再次被处理而装回
+        // compress/decompress（ViaFabricPlus 协议切换会重放登录流程），与 zstd 处理器
+        // 并存会导致双重压缩、断连。必须放在 ACTIVATED 早退之前——否则"已激活"这条
+        // 路径根本不会执行清理。
+        removeStaleVanillaHandlers(p);
+
         if (Boolean.TRUE.equals(channel.attr(ACTIVATED).get())) return;
 
         ZstdChannelManager.TransportState state = channel.attr(ZstdChannelManager.ZSTD_STATE).get();
@@ -108,13 +116,6 @@ public final class ZstdClientActivation {
             channel.closeFuture().addListener(f -> toClose.close());
         }
         final ZstdChannelManager mgr = existing;
-        ChannelPipeline p = channel.pipeline();
-
-        // 清理后装上的压缩处理器：zstd_encoder 已在位时，移除它装回来的 compress
-        if (p.get("zstd_encoder") != null && p.get("compress") != null) {
-            p.remove("compress");
-            LOGGER.debug("[Zstd] Removed stale compress handler installed after zstd_encoder");
-        }
 
         boolean encOk = installEncoder(p);
         boolean decOk = installDecoder(p);
@@ -135,6 +136,31 @@ public final class ZstdClientActivation {
         channel.attr(ACTIVATED).set(Boolean.TRUE);
 
         LOGGER.info("[Zstd] Client zstd transport activated; pipeline={}", p.names());
+    }
+
+    /**
+     * 移除与已装 zstd 处理器并存的原版压缩处理器（幂等）。
+     *
+     * <p>只在对应方向的 zstd 处理器已在位时才动手：这样第一次安装期间不会误删
+     * 待替换的原版 handler。二次进入（重放 SetCompression）时 zstd 已在位，
+     * 原版 handler 便是残留，必须清掉。</p>
+     */
+    private static void removeStaleVanillaHandlers(ChannelPipeline p) {
+        if (p.get("zstd_encoder") != null) {
+            removeIfPresent(p, "compress", "zstd_encoder");
+            removeIfPresent(p, "compression-encoder", "zstd_encoder");
+        }
+        if (p.get("zstd_decoder") != null) {
+            removeIfPresent(p, "decompress", "zstd_decoder");
+            removeIfPresent(p, "compression-decoder", "zstd_decoder");
+        }
+    }
+
+    private static void removeIfPresent(ChannelPipeline p, String name, String zstdName) {
+        if (p.get(name) != null) {
+            p.remove(name);
+            LOGGER.debug("[Zstd] Removed stale {} handler installed after {}", name, zstdName);
+        }
     }
 
     private static boolean installEncoder(ChannelPipeline p) {

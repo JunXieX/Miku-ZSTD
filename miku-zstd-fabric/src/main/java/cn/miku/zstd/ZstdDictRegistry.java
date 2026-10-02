@@ -140,24 +140,41 @@ public final class ZstdDictRegistry {
                                  long id) {
         for (int attempt = 0; attempt < 8; attempt++) {
             Entry existing;
-            Entry evicted = null;
             synchronized (LOCK) {
                 existing = cache.get(key);
-                if (existing == null) {
-                    Entry fresh = factory.get();
-                    cache.put(key, fresh);
-                    // 超出容量时淘汰最旧的一代（在用的条目靠引用计数延迟释放）
-                    while (cache.size() > MAX_ENTRIES) {
-                        String oldest = cache.keySet().iterator().next();
-                        if (oldest.equals(key)) break;
-                        evicted = cache.remove(oldest);
-                        if (evicted != null) evicted.retire();
-                    }
-                    LOGGER.info("[Zstd] Dict entry created: id={} cached={}", id, cache.size());
-                    return fresh;
-                }
             }
-            if (existing.acquire()) return existing;
+            if (existing != null) {
+                if (existing.acquire()) return existing;
+                continue; // 已被淘汰：重试
+            }
+
+            // 缺条目：在锁外构造。ZstdDictCompress 有约 3MB 预计算，放进 LOCK 会让
+            // 字典换代瞬间多个连接排队（对齐 Velocity 端 updateEncoder 的写法）。
+            Entry fresh = factory.get();
+
+            Entry evicted = null;
+            synchronized (LOCK) {
+                // 双重检查：构造期间可能有别的线程先放入
+                Entry raced = cache.get(key);
+                if (raced != null) {
+                    // 抢输的那份必须立即释放（refs 从 1 归零 → close），否则原生字典资源泄漏
+                    if (raced.acquire()) {
+                        fresh.retire();
+                        return raced;
+                    }
+                    continue; // raced 也已被淘汰：重试
+                }
+                cache.put(key, fresh);
+                // 超出容量时淘汰最旧的一代（在用的条目靠引用计数延迟释放）
+                while (cache.size() > MAX_ENTRIES) {
+                    String oldest = cache.keySet().iterator().next();
+                    if (oldest.equals(key)) break;
+                    evicted = cache.remove(oldest);
+                    if (evicted != null) evicted.retire();
+                }
+                LOGGER.info("[Zstd] Dict entry created: id={} cached={}", id, cache.size());
+                return fresh;
+            }
         }
         return null;
     }

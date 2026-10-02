@@ -194,6 +194,40 @@ class FrameLayoutTest {
         assertArrayEquals(fullPacket(payload), got.get(0), "解压后应与原始包一致（含包 id）");
     }
 
+    @Test
+    @DisplayName("压缩帧多包批：3 个包合成一帧压缩，解码按序还原")
+    void compressedFrameMultiPacketRoundTrip() {
+        // 现有一帧多包用例只覆盖直存路径；压缩路径的内层切包（splitAndEmit(byte[])）
+        // 与直存路径是两份不同实现，必须单独验证。
+        TestEncoder encoder = new TestEncoder(true, 0 /* 一律压缩 */, 3);
+        EmbeddedChannel ch = new EmbeddedChannel(encoder);
+        EmbeddedChannel in = new EmbeddedChannel(new TestDecoder(decompressCtx));
+
+        byte[] p1 = repetitive(300);
+        byte[] p2 = repetitive(500);
+        byte[] p3 = repetitive(700);
+        ch.writeOutbound(packet(p1));
+        ch.writeOutbound(packet(p2));
+        ch.writeOutbound(packet(p3));
+
+        ByteBuf frame = readFrame(ch, 5000);
+        assertNotNull(frame, "压缩走线程池，需要等待回到 event loop");
+        assertTrue(encoder.lastCompressed, "应当走压缩路径");
+        assertEquals(1, encoder.frames.size(), "三包应只产生一帧");
+
+        ByteBuf probe = frame.duplicate();
+        ZstdVarInts.tryRead(probe, Integer.MAX_VALUE); // bodyLen
+        int rawSize = ZstdVarInts.tryRead(probe, Integer.MAX_VALUE);
+        assertTrue(rawSize > 0, "压缩帧的 rawSize 应为原始长度（>0）");
+
+        feed(in, frame);
+        List<byte[]> got = drainInbound(in);
+        assertEquals(3, got.size(), "解压后应还原成 3 个包（压缩帧多包批路径）");
+        assertArrayEquals(fullPacket(p1), got.get(0), "第 1 个包");
+        assertArrayEquals(fullPacket(p2), got.get(1), "第 2 个包");
+        assertArrayEquals(fullPacket(p3), got.get(2), "第 3 个包");
+    }
+
     // ────────────────────────────────────────────────────────────────
     // 畸形输入：一律 fail-fast（关连接），绝不放行
     // ────────────────────────────────────────────────────────────────
@@ -220,6 +254,30 @@ class FrameLayoutTest {
         ZstdVarInts.write(buf, 32 * 1024 * 1024 + 1);
         buf.writeByte(0x00);
         assertRejected(buf);
+    }
+
+    @Test
+    @DisplayName("边界：帧头 rawSize 上界为 32MB（含）——32MB-1 与 32MB 合法，32MB+1 非法")
+    void rawSizeUpperBoundIsInclusive() {
+        // 显式钉死边界语义：tryRead 的判定是 result > maxValue，故上界值本身合法（含）。
+        // 不写死它，极易在别处按"32MB-1 才是上界"写出 off-by-one。
+        ByteBuf below = Unpooled.buffer();
+        ZstdVarInts.write(below, ZstdVarInts.DEFAULT_MAX_VALUE - 1);
+        assertEquals(ZstdVarInts.DEFAULT_MAX_VALUE - 1,
+                ZstdVarInts.tryRead(below, ZstdVarInts.DEFAULT_MAX_VALUE), "32MB-1 合法");
+        below.release();
+
+        ByteBuf atLimit = Unpooled.buffer();
+        ZstdVarInts.write(atLimit, ZstdVarInts.DEFAULT_MAX_VALUE);
+        assertEquals(ZstdVarInts.DEFAULT_MAX_VALUE,
+                ZstdVarInts.tryRead(atLimit, ZstdVarInts.DEFAULT_MAX_VALUE), "32MB 本身合法（含上界）");
+        atLimit.release();
+
+        ByteBuf over = Unpooled.buffer();
+        ZstdVarInts.write(over, ZstdVarInts.DEFAULT_MAX_VALUE + 1);
+        assertEquals(ZstdVarInts.INVALID,
+                ZstdVarInts.tryRead(over, ZstdVarInts.DEFAULT_MAX_VALUE), "32MB+1 非法");
+        over.release();
     }
 
     @Test
@@ -280,6 +338,38 @@ class FrameLayoutTest {
         ZstdVarInts.write(buf, 999); // 内层声明 999 字节
         buf.writeBytes(ascii("short"));
         assertRejected(buf);
+    }
+
+    @Test
+    @DisplayName("拒绝：压缩帧解压后内层 pktLen 巨大（0x7FFFFFFF，整数溢出回归用例）")
+    void rejectCompressedInnerLengthOverflow() {
+        // 回归用例（S1 同型缺陷）：解压后的负载内层声明约 2GB。若越界判定用 int 相加，
+        // off + pktLen 会溢出成负数而被放行，进而按 2GB 去切片。
+        byte[] payload = new byte[1029];
+        payload[0] = (byte) 0xFF;
+        payload[1] = (byte) 0xFF;
+        payload[2] = (byte) 0xFF;
+        payload[3] = (byte) 0xFF;
+        payload[4] = 0x07; // varint(0x7FFFFFFF)：内层 pktLen
+        byte[] compressed = compressCtx.compress(payload);
+        assertTrue(compressed.length < payload.length,
+                "用例前提：压缩后更小，才不会被「压缩体大于 rawSize」的前置检查拦下");
+
+        ByteBuf frame = Unpooled.buffer();
+        ZstdVarInts.write(frame, payload.length); // 声明解压后长度
+        frame.writeBytes(compressed);
+
+        TestDecoder decoder = new TestDecoder(decompressCtx);
+        EmbeddedChannel in = new EmbeddedChannel(decoder);
+        in.writeInbound(frame);
+        in.runPendingTasks();
+
+        assertNull(in.readInbound(), "内层 pktLen 越界的压缩帧不得产出任何包");
+        assertFalse(in.isOpen(), "必须 fail-fast 关闭连接");
+        assertNull(decoder.lastError,
+                "越界必须走 protocolError 干净拒绝；非 null 说明 int 溢出让判定失效、"
+                        + "改由 IndexOutOfBoundsException 兜住");
+        in.finishAndReleaseAll();
     }
 
     @Test
@@ -517,8 +607,20 @@ class FrameLayoutTest {
 
         private final ZstdDecompressCtx ctx;
 
+        /**
+         * 记录「经由异常路径关闭」的原因。正常拒绝走 {@code protocolError}（WARN + close），
+         * 不会置位；只有越界判定被绕过、抛出 IndexOutOfBoundsException 之类时才非 null。
+         */
+        Throwable lastError;
+
         TestDecoder(ZstdDecompressCtx ctx) {
             this.ctx = ctx;
+        }
+
+        @Override
+        public void exceptionCaught(ChannelHandlerContext c, Throwable cause) {
+            lastError = cause;
+            super.exceptionCaught(c, cause);
         }
 
         @Override

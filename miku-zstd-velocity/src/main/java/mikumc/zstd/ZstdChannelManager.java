@@ -353,8 +353,13 @@ public class ZstdChannelManager {
         stats.remove();
         // 走 setReplaced 归还计数（幂等），而不是直接判断 replaced —— 重复 close 不会多减
         setReplaced(false);
-        compressCtx.close();
-        decompressCtx.close();
+        // ⚠️ 必须与池线程拿的是**同一把锁**：压缩在 ZstdCompressPool 的线程上执行，
+        // 若在途压缩还没回来就 close 掉 native 上下文，池线程会继续写已释放的内存 → SIGSEGV。
+        // （本类 compressLock 字段的注释里"任何改写 compressCtx 的操作必须与池线程互斥"指的就是这里。）
+        synchronized (compressLock()) {
+            compressCtx.close();
+            decompressCtx.close();
+        }
         ZstdDictRegistry.Entry enc = encoderDictEntry;
         if (enc != null) {
             encoderDictEntry = null;

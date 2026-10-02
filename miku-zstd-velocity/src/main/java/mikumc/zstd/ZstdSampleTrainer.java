@@ -74,6 +74,8 @@ public class ZstdSampleTrainer {
     /** 环中前 savedCount 个样本已写入历史文件（去重游标） */
     private int savedCount;
     private int sampleBytes;
+    /** 环已满且样本数已达 minSamples：让 addBatch 跳过"复制 + 入环"（训练清空环时复位） */
+    private volatile boolean ringFull;
     private long lastTrainTime;
     private volatile byte[] currentDict;
     private volatile long currentDictId;
@@ -280,12 +282,22 @@ public class ZstdSampleTrainer {
         if (raw == null || length <= 0) {
             return;
         }
+        if (ringFull) {
+            // 环满且样本数已够：跳过下面的"复制 + 入环"。下轮训练最长要等 5~10 分钟，
+            // 这期间每个包都白拷一次、而且全在网络线程上。
+            // ⚠️ 训练判定**不能省**：否则满环后再也走不到 maybeTrain，环永远清不掉
+            // —— 3.1.0 修过同类的"样本环永久冻结"，这里不能倒退回去。
+            maybeTrain();
+            return;
+        }
         List<byte[]> batch = null;
         int[] cursor = {0};
         while (cursor[0] < length) {
             // 共享的 varint 读取器：以前这里手写了一遍，与其它 5 处各自实现等价但可能漂移
             int pktLen = ZstdVarInts.readOr(raw, cursor, ZstdVarInts.INVALID);
-            if (pktLen <= 0 || cursor[0] + pktLen > length) {
+            // ⚠️ pktLen 来自对端（最大 2^31-1），必须用 long 相加：int 溢出会让越界判断失效，
+            // 紧接着的 new byte[pktLen] 就是一次 2GB 分配（远程 OOM），在 event loop 上直接打崩。
+            if (pktLen <= 0 || cursor[0] + (long) pktLen > length) {
                 break;
             }
             byte[] sample = new byte[pktLen];
@@ -307,6 +319,9 @@ public class ZstdSampleTrainer {
         synchronized (this) {
             for (byte[] s : batch) {
                 if (sampleBytes >= sampleSize) {
+                    if (sampleRing.size() >= minSamples) {
+                        ringFull = true; // 满环且样本数够 → 后续 addBatch 走早退路径
+                    }
                     break;
                 }
                 sampleRing.add(s);
@@ -402,6 +417,7 @@ public class ZstdSampleTrainer {
             synchronized (this) {
                 sampleRing.clear();
                 sampleBytes = 0;
+                ringFull = false;
                 savedCount = 0;
             }
             LOGGER.info("[Zstd] {} training round finished (adopted={}), sample ring refreshed", name, adopted);

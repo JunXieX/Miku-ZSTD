@@ -62,6 +62,8 @@ public final class ZstdPaperTrainer {
     private final List<byte[]> ring = new ArrayList<>(1024);
     private int savedCount;
     private int sampleBytes;
+    /** 环已满且样本数已达 minSamples：让 addBatch 跳过"复制 + 入环"（训练清空环时复位） */
+    private volatile boolean ringFull;
     private long lastTrainTime;
     private volatile byte[] currentDict;
     private volatile long currentDictId;
@@ -212,13 +214,22 @@ public final class ZstdPaperTrainer {
         if (raw == null || length <= 0) {
             return;
         }
+        if (ringFull) {
+            // 环满且样本数已够：跳过下面的"复制 + 入环"，这期间的每包拷贝都是白费，
+            // 而且全在 Netty 网络线程上。
+            // ⚠️ 训练判定**不能省**：否则满环后再也走不到 maybeTrain，环永远清不掉。
+            maybeTrain();
+            return;
+        }
         List<byte[]> batch = null;
         int[] cursor = {0};
         while (cursor[0] < length) {
             // 共享的 varint 读取器（与 Velocity 端、解码器基类同一份实现）
             int pktLen = mikumc.zstd.protocol.ZstdVarInts.readOr(
                     raw, cursor, mikumc.zstd.protocol.ZstdVarInts.INVALID);
-            if (pktLen <= 0 || cursor[0] + pktLen > length) {
+            // ⚠️ pktLen 来自对端（最大 2^31-1），必须用 long 相加：int 溢出会让越界判断失效，
+            // 紧接着的 new byte[pktLen] 就是一次 2GB 分配（远程 OOM），在 Netty 线程上直接打崩。
+            if (pktLen <= 0 || cursor[0] + (long) pktLen > length) {
                 break;
             }
             byte[] sample = new byte[pktLen];
@@ -240,6 +251,9 @@ public final class ZstdPaperTrainer {
         synchronized (this) {
             for (byte[] s : batch) {
                 if (sampleBytes >= sampleSize) {
+                    if (ring.size() >= minSamples) {
+                        ringFull = true; // 满环且样本数够 → 后续 addBatch 走早退路径
+                    }
                     break;
                 }
                 ring.add(s);
@@ -317,6 +331,7 @@ public final class ZstdPaperTrainer {
             synchronized (this) {
                 ring.clear();
                 sampleBytes = 0;
+                ringFull = false;
                 savedCount = 0;
             }
             LOGGER.info("[Zstd] {} 本轮结束(adopted={})，样本环已刷新", name, adopted);

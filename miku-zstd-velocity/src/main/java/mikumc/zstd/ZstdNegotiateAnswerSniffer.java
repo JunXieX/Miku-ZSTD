@@ -223,7 +223,19 @@ public class ZstdNegotiateAnswerSniffer extends MessageToMessageDecoder<ByteBuf>
             try {
                 inflater.setInput(src);
                 byte[] out = new byte[declared];
-                if (inflater.inflate(out) != declared) return null;
+                // ⚠️ zlib 在 flush 边界可能一次产不完：必须循环 inflate 到 finished()，
+                // 否则"单次返回长度不足"会被当成解压失败，把好端端的应答丢掉 ——
+                // 表现为偶发"zstd 没生效"（回落原版，不断连），极难复现。
+                int total = 0;
+                while (total < declared && !inflater.finished()) {
+                    int n = inflater.inflate(out, total, declared - total);
+                    if (n == 0) {
+                        // 没有进展：要么输入不够，要么需要预设字典，都无法继续
+                        if (inflater.needsInput() || inflater.needsDictionary()) break;
+                    }
+                    total += n;
+                }
+                if (total != declared) return null;
                 return out;
             } finally {
                 inflater.end();

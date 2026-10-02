@@ -182,8 +182,12 @@ public class ZstdChannelManager {
     }
 
     public void close() {
-        this.compressCtx.close();
-        this.decompressCtx.close();
+        // ⚠️ 必须与池线程拿的是**同一把锁**：压缩在 ZstdCompressPool 的线程上执行，
+        // 若在途压缩还没回来就 close 掉 native 上下文，池线程会继续写已释放的内存 → SIGSEGV。
+        synchronized (compressLock()) {
+            this.compressCtx.close();
+            this.decompressCtx.close();
+        }
         ZstdDictRegistry.Entry enc = encoderDictEntry;
         if (enc != null) {
             encoderDictEntry = null;

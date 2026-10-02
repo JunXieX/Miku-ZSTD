@@ -291,6 +291,11 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
         mgr.setReplaced(true); // 计数已内聚在 setReplaced 内（幂等，避免重复 +1）
         LOGGER.info("[Zstd] zstd transport activated on Paper");
         releaseHeld(ctx);
+        // 激活后本处理器已无用：留在管线里会让**每个**出站包多一次 attr 查询、
+        // 每个入站包多一次 getSimpleName().contains(...) 判定，是永久税。
+        // 对齐 Velocity 端（激活即自移除）。顺序上必须先 releaseHeld 再移除 ——
+        // 移除后经该 ctx 写出的语义不再有保证，扣住的包就会发不出去。
+        ctx.pipeline().remove(this);
     }
 
     private void releaseHeld(ChannelHandlerContext ctx) {
