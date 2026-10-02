@@ -4,7 +4,7 @@ plugins {
 }
 
 group = 'mikumc.zstd'
-version = '4.9.2-Beta'
+version = '4.10.0'
 
 base {
     archivesName = 'Miku-ZSTD'
