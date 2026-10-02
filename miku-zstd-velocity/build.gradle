@@ -4,7 +4,7 @@ plugins {
 }
 
 group = 'mikumc.zstd'
-version = '4.9.1-Beta'
+version = '4.9.2-Beta'
 
 repositories {
     mavenCentral()
@@ -67,12 +67,15 @@ dependencies {
 shadowJar {
     archiveClassifier.set('Velocity')
 
-    // zstd-jni / snakeyaml 若以原包名分发，会与同机其它插件的同名类冲突
-    //（类加载顺序决定谁生效 → 莫名的 NoSuchMethodError / native 加载失败）。
-    // relocate 到本插件私有包：zstd-jni 的 native 库按 libzstd-jni-<版本> 加载，
-    // 与 Java 包名无关，因此 relocate 不影响原生库加载。
-    relocate 'com.github.luben.zstd', 'mikumc.zstd.libs.zstd'
+    // snakeyaml 是纯 Java，relocate 安全：避免与同机其它插件的同名类冲突
+    //（类加载顺序决定谁生效 → 莫名的 NoSuchMethodError）。
     relocate 'org.yaml.snakeyaml', 'mikumc.zstd.libs.snakeyaml'
+
+    // ⚠️ zstd-jni **绝不能** relocate：它的 native 方法按 **Java 类名**绑定
+    //（JNI 符号形如 Java_com_github_luben_zstd_ZstdCompressCtx_init），换包名后
+    // 原生库里找不到对应符号，直接 UnsatisfiedLinkError —— 4.9.1-Beta 真机实测踩过。
+    // 「库文件名 libzstd-jni-<版本> 与包名无关」不等于「JNI 符号与包名无关」。
+    // 与同机插件 zstd-jni 版本冲突的风险只能接受（目前几乎没有插件会打包它）。
 
     // 裁掉不会部署本插件的平台（18 个原生库约占 jar 体积的 93%，而运行时只会
     // 加载匹配当前平台的那一个——其余既不占内存也不参与加载，纯粹是磁盘与分发开销）。
