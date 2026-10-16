@@ -45,10 +45,6 @@ public final class ZstdTrafficCounter {
         enabled = value;
     }
 
-    public static boolean isEnabled() {
-        return enabled;
-    }
-
     /** 编码器每帧回调（{@code raw} 未压缩字节、{@code wire} 压缩后实际写出的字节）。 */
     public static void record(int rawBytes, int wireBytes) {
         if (!enabled) {

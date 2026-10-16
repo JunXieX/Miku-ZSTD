@@ -28,7 +28,7 @@ import java.nio.channels.ClosedChannelException;
  * 子类通过 {@link #writeBodyLen()} 声明。</p>
  *
  * <h2>批处理</h2>
- * <p>把时间窗（默认 3ms）内发出的多个包合成一帧。实测每包单独成帧时，帧头与
+ * <p>把时间窗（各端配置项决定，默认 1ms）内发出的多个包合成一帧。实测每包单独成帧时，帧头与
  * 熵表重复发送几乎吃掉小包的全部收益（小包甚至膨胀到 105%，只能直存）。</p>
  * <p>为不破坏批处理，窗口等待期间的 {@code flush()} 被<b>吞掉</b>（数据由窗口
  * 到期后的统一 flush 送出）；无待发包时 flush 照常透传。</p>
@@ -102,7 +102,13 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
     // 命令层可直接取摘要——"要不要降 level / 加线程"只能靠这些数字判断。
     //（这里原本挂了一段 javadoc，但其后紧跟的是别的字段，等于一段没有归属的注释。）
 
-    private int batchWindowMs = 3;
+    /**
+     * 批处理窗口与单帧包数上限。这里的初值只是"{@code handlerAdded} 之前万一被读到"的兜底
+     * ——真正生效的值在任何写操作都可能发生之前就已由 {@code handlerAdded} 从各端配置写入
+     *（见该处的 {@code Math.max(...)}）。因此不要把配置默认值写在这里：两处一旦不一致，
+     * 读代码的人无法判断哪个才是生效值。
+     */
+    private int batchWindowMs = 1;
     private int batchMaxPackets = 64;
 
     // ────────────────────────────────────────────────────────────────

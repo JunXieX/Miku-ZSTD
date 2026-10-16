@@ -47,10 +47,6 @@ public final class ZstdPaperMonitor {
         ZstdTrafficCounter.setEnabled(value);
     }
 
-    public static boolean isEnabled() {
-        return ZstdTrafficCounter.isEnabled();
-    }
-
     /** 编码器每次成帧后调用（热路径，仅两次加法）。 */
     public static void record(int rawBytes, int wireBytes) {
         ZstdTrafficCounter.record(rawBytes, wireBytes);

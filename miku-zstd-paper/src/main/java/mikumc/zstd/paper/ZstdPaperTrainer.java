@@ -469,7 +469,11 @@ public final class ZstdPaperTrainer {
         try {
             List<byte[]> history = loadHistory();
             history.addAll(unsaved);
-            while (history.size() > maxHistorySamples) history.remove(0);
+            // ⚠️ 必须用 subList().clear() 而不是循环 remove(0)：后者每次把整个列表前移一位，
+            // 上限 20000 时最坏情况是 O(n²)。与 Velocity 端同一处修正。
+            if (history.size() > maxHistorySamples) {
+                history.subList(0, history.size() - maxHistorySamples).clear();
+            }
             writeSamples(history);
             synchronized (this) {
                 savedCount = Math.max(savedCount, upto);

@@ -226,10 +226,6 @@ public class ZstdSampleTrainer {
         return sampleBytes;
     }
 
-    public long getLastTrainTime() {
-        return lastTrainTime;
-    }
-
     /**
      * 手动请求一次训练（{@code /mikuzstd train} 入口）。
      *
@@ -576,7 +572,13 @@ public class ZstdSampleTrainer {
         try {
             List<byte[]> history = loadHistory();
             history.addAll(unsaved);
-            while (history.size() > maxHistorySamples) history.remove(0);
+            // 裁剪到上限。⚠️ 必须用 subList().clear() 而不是循环 remove(0)：
+            // 后者每次都把整个列表前移一位，history 上限 20000、单轮新增样本可达数千，
+            // 于是这一步在最坏情况下是 O(n²)（上亿次元素搬移）。它跑在训练线程上、
+            // 会拖长归档耗时，也让"训练期间磁盘/CPU 占用"看起来莫名偏高。
+            if (history.size() > maxHistorySamples) {
+                history.subList(0, history.size() - maxHistorySamples).clear();
+            }
             writeSamples(history);
             synchronized (this) {
                 savedCount = Math.max(savedCount, upto);
