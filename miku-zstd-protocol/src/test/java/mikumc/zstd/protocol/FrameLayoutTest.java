@@ -229,6 +229,36 @@ class FrameLayoutTest {
     }
 
     // ────────────────────────────────────────────────────────────────
+    // 原生上下文生命周期：关闭后池线程绝不能再碰 compressCtx
+    // ────────────────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("压缩上下文已关闭时：在途压缩任务必须干净放弃（不得触碰 native ctx，也不得丢 promise）")
+    void compressionAbortsSafelyWhenContextClosed() {
+        // 回归用例：压缩任务可能"在连接断开前提交、在 ChannelManager#close() 释放 native
+        // 上下文之后才轮到执行"。若那时仍调用 compressCtx，就是 use-after-free → SIGSEGV
+        // （整进程崩，不止这条连接），而在纯 JVM 测试里它会表现为 JVM 崩溃或 native 报错。
+        TestEncoder encoder = new TestEncoder(true, 0 /* 一律压缩 */, 1);
+        EmbeddedChannel ch = new EmbeddedChannel(encoder);
+        // 模拟"连接已断、上下文已关"：必须在写入之前置位，让池线程拿到锁后立刻放弃。
+        encoder.lock.markClosed();
+
+        io.netty.channel.ChannelFuture f = ch.writeOutbound(packet(repetitive(4096)));
+        // 放弃结论由池线程经 eventLoop 回投，嵌入式 channel 需要手动推进任务队列。
+        long deadline = System.currentTimeMillis() + 3000;
+        while (!f.isDone() && System.currentTimeMillis() < deadline) {
+            ch.runPendingTasks();
+            Thread.sleep(2);
+        }
+
+        assertTrue(f.isDone(), "写 promise 必须被完成（否则上游永久挂起）");
+        assertFalse(f.isSuccess(), "上下文已关闭时该批必须以 ClosedChannelException 失败化");
+        assertTrue(encoder.frames.isEmpty(), "放弃的批次不得产出任何帧");
+        assertNull(readFrame(ch), "不得有帧写出");
+        ch.finishAndReleaseAll();
+    }
+
+    // ────────────────────────────────────────────────────────────────
     // 畸形输入：一律 fail-fast（关连接），绝不放行
     // ────────────────────────────────────────────────────────────────
 
@@ -556,6 +586,9 @@ class FrameLayoutTest {
         boolean lastCompressed;
         int lastRaw;
         int lastWire;
+
+        /** 本测试专用编码器的锁（与默认 {@code compressLock()} 同一实例），供生命周期用例置位。 */
+        final ZstdCompressLock lock = compressLock();
 
         TestEncoder(boolean bodyLen, int skip, int maxPackets) {
             this.bodyLen = bodyLen;

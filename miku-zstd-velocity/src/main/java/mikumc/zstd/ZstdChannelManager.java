@@ -4,6 +4,7 @@ import com.github.luben.zstd.ZstdCompressCtx;
 import com.github.luben.zstd.ZstdDecompressCtx;
 import io.netty.channel.Channel;
 import io.netty.util.AttributeKey;
+import mikumc.zstd.protocol.ZstdCompressLock;
 import mikumc.zstd.protocol.ZstdTrafficCounter;
 import mikumc.zstd.protocol.ZstdVarInts;
 import org.slf4j.Logger;
@@ -132,6 +133,9 @@ public class ZstdChannelManager {
      */
     public void loadTrainerDicts() {
         synchronized (compressLock) {
+        // 通道已关闭（上下文已释放）：装载字典等于写已释放的原生内存，直接放弃
+        //（正常时序下不会走到这里，此判仅作为兜底，见 ZstdCompressLock 的类注释）。
+        if (compressLock.isClosed()) return;
         ZstdDictRegistry.Entry enc = ZstdDictRegistry.acquireEncoder();
         if (enc != null && enc.compressDict() != null) {
             compressCtx.loadDict(enc.compressDict());
@@ -154,13 +158,16 @@ public class ZstdChannelManager {
      * 压缩上下文的互斥锁。
      *
      * <p>压缩已卸载到线程池执行，因此任何改写 {@link #compressCtx} 的操作
-     * （换字典、重申帧头参数）都必须与池线程互斥——{@code ZstdCompressCtx} 不是线程安全的。
+     * （换字典、重申帧头参数、close）都必须与池线程互斥——{@code ZstdCompressCtx} 不是线程安全的。
      * 编码器通过 {@code ZstdBatchEncoderBase#compressLock()} 取得同一把锁。</p>
+     *
+     * <p>⚠️ 类型是 {@link ZstdCompressLock} 而不是 {@code Object}：它同时承载"上下文已关闭"
+     * 标志，池线程在锁内读它来避免 use-after-free（详见该类注释）。</p>
      */
-    private final Object compressLock = new Object();
+    private final ZstdCompressLock compressLock = new ZstdCompressLock();
 
     /** 供编码器使用：所有对 compressCtx 的访问都收敛到这一把锁上。 */
-    public Object compressLock() {
+    public ZstdCompressLock compressLock() {
         return compressLock;
     }
 
@@ -355,8 +362,10 @@ public class ZstdChannelManager {
         setReplaced(false);
         // ⚠️ 必须与池线程拿的是**同一把锁**：压缩在 ZstdCompressPool 的线程上执行，
         // 若在途压缩还没回来就 close 掉 native 上下文，池线程会继续写已释放的内存 → SIGSEGV。
-        // （本类 compressLock 字段的注释里"任何改写 compressCtx 的操作必须与池线程互斥"指的就是这里。）
-        synchronized (compressLock()) {
+        // ⚠️ 且必须**先立标志再关上下文**：标志与 close 在同一段持锁区内，池线程在锁内读到
+        // 标志即可安全放弃；顺序反了（先 close 后立标志）等于没防（详见 ZstdCompressLock 注释）。
+        synchronized (compressLock) {
+            compressLock.markClosed();
             compressCtx.close();
             decompressCtx.close();
         }

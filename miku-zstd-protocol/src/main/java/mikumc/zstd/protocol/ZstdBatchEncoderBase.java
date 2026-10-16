@@ -81,6 +81,16 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
     /** 在途压缩任务持有的 promise（仅 event loop 线程读写）；通道关闭时需一并失败化 */
     private List<ChannelPromise> inflightPromises;
 
+    /**
+     * 独享锁（子类钩子为默认值 {@link #compressLock()} 时使用）。
+     *
+     * <p>真正需要在池线程与 {@code close()} 之间做互斥的端，必须让
+     * {@link #compressLock()} 返回<b>与 ChannelManager 同一个</b> {@link ZstdCompressLock}
+     * —— 那里带着"上下文已关闭"标志（见该类的类注释，它防的是一次会让进程 SIGSEGV 的
+     * use-after-free）。</p>
+     */
+    private final ZstdCompressLock ownLock = new ZstdCompressLock();
+
     // ── 压缩线程池 ───────────────────────────────────────────────────────────
     // 共享实现在 ZstdCompressPool，本类只调用它的静态入口。
     //
@@ -143,12 +153,15 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
      * 压缩上下文的互斥锁。
      *
      * <p>压缩已卸载到线程池，因此<b>必须与任何改写 {@code compressCtx} 的操作互斥</b>
-     * （典型场景：字典训练完成后 {@code loadDict()} 换字典）。默认返回本 handler 实例，
-     * 但字典通常由 ChannelManager 持有并改写——那种情况下子类必须覆写为
-     * <b>与 ChannelManager 相同的那把锁</b>，否则会与池线程并发使用同一个 ctx。</p>
+     * （典型场景：字典训练完成后 {@code loadDict()} 换字典）。默认返回本 handler 独占的
+     * {@link ZstdCompressLock}，但字典通常由 ChannelManager 持有并改写——那种情况下子类
+     * <b>必须</b>覆写为与 ChannelManager 相同的那把锁，否则会与池线程并发使用同一个 ctx。</p>
+     *
+     * <p>⚠️ 返回类型刻意是 {@link ZstdCompressLock} 而非 {@code Object}：池线程需要它来
+     * 判断"上下文是否已被 close"（见该类注释——少这一判就是一次 use-after-free 崩溃）。</p>
      */
-    protected Object compressLock() {
-        return this;
+    protected ZstdCompressLock compressLock() {
+        return ownLock;
     }
 
     // ────────────────────────────────────────────────────────────────
@@ -239,6 +252,11 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
             // 注册表帧，几十 MB）会被字段一直留到下一批 —— 刚进服就挂机的连接会白占一份。
             batchRaw = null;
         } catch (Throwable t) {
+            // ⚠️ concatPending 可能在**释放 pending 之前**就抛出来（采样回调抛异常、超大批次
+            // 分配失败等）。此时 pending 里仍压着已 retain 的 ByteBuf：不在这里释放并清空，
+            // 它们永远没人释放（引用计数泄漏），而且下一批会把这批残缺数据一并发出去，
+            // 同时让 pendingPromises 与 pending 彻底失去对应关系。
+            releasePending();
             failAll(promises, t);
             LOGGER.error("[Zstd] encoder batch concat failed", t);
             return;
@@ -262,14 +280,23 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
         // ── 压缩路径：交给线程池 ──
         compressing = true;
         inflightPromises = promises;
-        final Object lock = compressLock();
+        final ZstdCompressLock lock = compressLock();
 
         ZstdCompressPool.execute(() -> {
             final int produced;
             final byte[] dst;
             try {
-                // 与「换字典」互斥：ctx 不是线程安全的
+                // 与「换字典 / close」互斥：ctx 不是线程安全的，且可能已被释放
                 synchronized (lock) {
+                    // ⚠️ 拿到锁之后再判一次：本任务可能在连接断开**之前**提交、
+                    // 在 close() 释放 native 上下文**之后**才轮到执行。此时必须直接放弃，
+                    // 绝不能碰 compressCtx（那是已释放的内存 → SIGSEGV，整进程崩）。
+                    // 判据必须在锁内读——见 ZstdCompressLock 的类注释。
+                    if (lock.isClosed()) {
+                        backToEventLoop(ctx, promises, new ClosedChannelException(),
+                                0, null, raw, rawTotal, withBodyLen);
+                        return;
+                    }
                     // raw 是本批捕获的实例（大帧是临时数组）；dst 也按需临时分配
                     dst = ensureCompressDstCapacity(rawTotal);
                     // 第 3 个参数是"目标缓冲区可用空间"，必须传数组实际长度

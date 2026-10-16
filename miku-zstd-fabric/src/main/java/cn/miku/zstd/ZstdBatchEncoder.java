@@ -3,6 +3,7 @@ package cn.miku.zstd;
 import com.github.luben.zstd.ZstdCompressCtx;
 import io.netty.channel.ChannelHandlerContext;
 import mikumc.zstd.protocol.ZstdBatchEncoderBase;
+import mikumc.zstd.protocol.ZstdCompressLock;
 
 /**
  * Miku-ZSTD 编码器（客户端 → Velocity）帧格式 <b>v3</b>（协商版本 v4）。
@@ -27,11 +28,12 @@ public class ZstdBatchEncoder extends ZstdBatchEncoderBase {
     }
 
     /**
-     * 压缩已卸载到线程池；字典由 ChannelManager 改写 {@code compressCtx}，
-     * 所以这里必须返回<b>与它相同的那把锁</b>，否则池线程压缩与换字典会并发写同一个 ctx。
+     * 压缩已卸载到线程池；字典由 ChannelManager 改写 {@code compressCtx}、且它负责在
+     * 关连接时 close 该上下文，所以这里必须返回<b>与它相同的那把锁</b>——否则池线程压缩
+     * 会与「换字典 / close」并发，后者是 use-after-free（SIGSEGV）。
      */
     @Override
-    protected Object compressLock() {
+    protected ZstdCompressLock compressLock() {
         ZstdChannelManager m = manager;
         return m == null ? super.compressLock() : m.compressLock();
     }
