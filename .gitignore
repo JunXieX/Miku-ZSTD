@@ -45,3 +45,6 @@ crash-reports/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# ===== 额外的本地文档（仓库只入库源码 / 构建文件 / README）=====
+TROUBLESHOOTING.md

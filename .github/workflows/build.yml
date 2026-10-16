@@ -86,8 +86,8 @@ jobs:
     permissions:
       contents: write
     steps:
-      # 取回带 tag 的完整历史：下面要读 **打 tag 时写的说明** 作为 Release 正文。
-      # 只 checkout 默认深度拿不到 tag 对象，'%(contents)' 会是空串。
+      # 取回完整历史：下面要用 git log 读 tag 指向提交的完整正文，
+      # 浅克隆下 tag 的提交对象可能不完整。
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -98,24 +98,19 @@ jobs:
       - name: List artifacts
         run: ls -R dist
       # ── 结构化更新日志 ────────────────────────────────────────────────────
-      # 正文来源的优先级：① 附注 tag 的说明（发版时写的更新日志）；② 该 tag 指向
-      # 提交的完整提交信息；③ 兜底一行。
-      # ⚠️ 为什么不能只靠 generate_release_notes：它只会生成
+      # 正文来源：**发版提交的完整提交信息**（发版时把更新日志写进提交正文）。
+      # 取不到再兜底一行。
+      # ⚠️ 为什么不用 generate_release_notes：它只会生成
       # "**Full Changelog**: compare/... 链接"，正文里没有任何"改了什么"——
       # 4.10.0 就是这样发的（Release 与 Modrinth 都只有那条链接，等于没说明）。
-      # 本项目要求正式版必须附带结构化更新日志，因此这里显式取 tag/提交正文。
+      # ⚠️ 为什么不用附注 tag 的说明：CI 里 checkout 出来的 tag 实体在部分情况下
+      # 是"指向提交的轻量引用"，'%(contents)' 会取到提交信息而非 tag 说明，
+      # 行为不确定。以**发版提交正文**为唯一来源，语义最稳且只依赖提交本身。
       - name: Compose release body
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
-          # ① 附注 tag 的说明（git tag -a -m "..."）
-          git tag -l --format='%(contents)' "$TAG" > /tmp/body.md || true
-          # 去掉 git 自动附加的 "Tagger/Date/Message" 之类无关行，并按需裁剪空白
-          if ! grep -q '[^[:space:]]' /tmp/body.md; then
-            # ② 轻量 tag：取该提交的提交信息
-            git log -1 --format='%B' "$TAG" > /tmp/body.md
-          fi
-          # ③ 仍然为空则兜底
+          git log -1 --format='%B' "$TAG" > /tmp/body.md
           if ! grep -q '[^[:space:]]' /tmp/body.md; then
             echo "Miku-ZSTD ${TAG#v}" > /tmp/body.md
           fi
