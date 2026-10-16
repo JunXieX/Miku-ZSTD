@@ -243,7 +243,7 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
             if (attempt >= MAX_RETRIES) {
                 LOGGER.warn("[Zstd] no negotiate response within {}ms — staying vanilla",
                         RETRY_MS * MAX_RETRIES);
-                releaseHeld(ctx);
+                finishVanilla(ctx); // 明确回落：补发扣包并自移除
                 return;
             }
             channel.eventLoop().schedule(() -> tryActivate(ctx, attempt + 1), RETRY_MS, TimeUnit.MILLISECONDS);
@@ -252,7 +252,7 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
 
         if (mgr.isRefused()) {
             LOGGER.warn("[Zstd] 客户端保持原版 zlib，本端不激活");
-            releaseHeld(ctx);
+            finishVanilla(ctx); // 明确回落：补发扣包并自移除
             return;
         }
 
@@ -262,7 +262,7 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
         if (mgr.isDictRequested() && !mgr.isConfirmed()) {
             LOGGER.warn("[Zstd] 客户端请求了字典但未确认就绪（zstd:dict 应答缺失）"
                     + "— 放弃 zstd 并回落原版，避免单侧 zstd 断连");
-            releaseHeld(ctx);
+            finishVanilla(ctx);
             return;
         }
         // 客户端确认就绪 → 装载共享字典（仅此时装载，避免与客户端不一致）
@@ -285,7 +285,7 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
             }
             LOGGER.warn("[Zstd] anchors 始终未出现（compress/decompress 缺失）— 回落原版; pipeline={}",
                     channel.pipeline().names());
-            releaseHeld(ctx);
+            finishVanilla(ctx);
             return;
         }
         mgr.setReplaced(true); // 计数已内聚在 setReplaced 内（幂等，避免重复 +1）
@@ -295,7 +295,31 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
         // 每个入站包多一次 getSimpleName().contains(...) 判定，是永久税。
         // 对齐 Velocity 端（激活即自移除）。顺序上必须先 releaseHeld 再移除 ——
         // 移除后经该 ctx 写出的语义不再有保证，扣住的包就会发不出去。
-        ctx.pipeline().remove(this);
+        removeSelf(ctx);
+    }
+
+    /**
+     * 明确回落原版：补发扣住的包，并<b>自移除</b>协商器。
+     *
+     * <p>⚠️ 自移除这一步以前只在"激活成功"分支里有，所有回落分支（超时、客户端拒绝、
+     * 字典未确认、锚点始终缺失）都只 releaseHeld 就返回——协商器于是常驻这条连接的
+     * 入站/出站热路径，对<b>每一个</b>包继续做 {@code getSimpleName().contains(...)}
+     * 字符串判定，并且一直持有本插件的类加载器。这些回落路径并不罕见（原版客户端、
+     * 版本不匹配的客户端都会命中），属"每条非 zstd 连接都白付一份永久税"。</p>
+     */
+    private void finishVanilla(ChannelHandlerContext ctx) {
+        releaseHeld(ctx);
+        removeSelf(ctx);
+    }
+
+    /** 从管线摘掉自身（幂等；已移除或通道已关时静默）。 */
+    private void removeSelf(ChannelHandlerContext ctx) {
+        try {
+            ctx.pipeline().remove(this);
+        } catch (Throwable t) {
+            // 幂等：可能已移除、或通道正在关闭 → 无需处理
+            LOGGER.debug("[Zstd] negotiator self-removal skipped: {}", t.toString());
+        }
     }
 
     private void releaseHeld(ChannelHandlerContext ctx) {

@@ -106,8 +106,12 @@ public class MikuZstdPaper extends JavaPlugin {
             }
         }
         hookedFields.clear();
+        // ⚠️ 必须遍历**已建立的玩家连接**，而不是监听通道：协商器是注入到每条客户端连接的
+        // 子通道上的（见 injectHandlers），监听通道的管线里从来没有它。旧实现只遍历监听通道，
+        // 于是这段"摘掉在线连接的协商器"的承诺根本没兑现——插件重载后，老协商器仍挂在
+        // 每一条在线连接的出/入站热路径上，对每个包跑字符串判定，并继续持有旧类加载器。
         try {
-            forEachServerChannel(channel -> {
+            forEachLiveConnectionChannel(channel -> {
                 if (channel.pipeline().get("miku-zstd-negotiator") != null) {
                     channel.pipeline().remove("miku-zstd-negotiator");
                 }
@@ -182,6 +186,57 @@ public class MikuZstdPaper extends JavaPlugin {
                 }
             }
         }
+    }
+
+    /**
+     * 遍历<b>已建立的玩家连接</b>的 netty 通道（{@code ServerConnectionListener} 里
+     * 那个装 {@code Connection} 的集合字段，每个 {@code Connection} 内含 {@code channel}）。
+     *
+     * <p>与 {@link #forEachServerChannel} 的区别：后者遍历的是<b>监听</b>通道（accept
+     * 用的 server channel），本条遍历的是每个玩家各自那条子通道。协商器只存在于后者。</p>
+     *
+     * <p>字段名在不同版本可能变（{@code connections} / {@code connectionList}），因此按
+     * "值是集合、元素能取出 channel"来识别，而不是写死名字；取不到就安静跳过——
+     * 这段只服务于插件重载时的清理，失败不应影响停用流程。</p>
+     */
+    private void forEachLiveConnectionChannel(java.util.function.Consumer<Channel> action) throws Exception {
+        Object craftServer = getServer();
+        Object mcServer = craftServer.getClass().getMethod("getServer").invoke(craftServer);
+        Object serverConnection = mcServer.getClass().getMethod("getConnection").invoke(mcServer);
+        for (Field f : serverConnection.getClass().getDeclaredFields()) {
+            Object v = readQuietly(f, serverConnection);
+            if (!(v instanceof Iterable<?> connections)) continue;
+            for (Object conn : connections) {
+                // 跳过监听通道那一组（元素本身就是 ChannelFuture 的情形由 channelOf 统一处理，
+                // 但真正的玩家连接元素是 Connection，需从它的 channel 字段取）
+                Channel ch = channelOf(conn);
+                if (ch == null) {
+                    ch = readChannelField(conn);
+                }
+                if (ch != null) {
+                    action.accept(ch);
+                }
+            }
+        }
+    }
+
+    /** 从任意对象（典型是 MC 的 {@code Connection}）的 {@code channel} 字段取 netty 通道。 */
+    private static Channel readChannelField(Object target) {
+        if (target == null || target instanceof Channel) {
+            return target instanceof Channel c ? c : null;
+        }
+        for (Class<?> c = target.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
+            try {
+                Field f = c.getDeclaredField("channel");
+                Object v = readQuietly(f, target);
+                if (v instanceof Channel ch) {
+                    return ch;
+                }
+            } catch (Throwable ignored) {
+                // 该层没有该字段：继续往父类找
+            }
+        }
+        return null;
     }
 
     /**
