@@ -273,17 +273,32 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
 
         LOGGER.debug("[Zstd] 正在安装 zstd 编解码器 (attempt={}, pipeline={})",
                 attempt, channel.pipeline().names());
-        if (!mgr.installEncoder(channel) || !mgr.installDecoder(channel)) {
-            // ⚠️ 原版的 compress/decompress 是在 SetCompression 写出**之后**才安装的
-            // （MC 先发包再 setupCompression），首次尝试时它们往往还不存在。
-            // 这里必须继续重试而不是放弃——实战（Leaf 26.2）就因此永久回落到 zlib。
-            // 重试期间 holding 保持为 true，待发数据仍被扣住，不会发出与原版不一致的帧。
+        // ⚠️ 先确认**两端都能替换**再动手（对齐 Velocity 端）：
+        // 若先装编码器、再发现解码器锚点缺失就返回，管道会停在"zstd 出站 / 原版入站"
+        // 的半装状态——客户端会以 zstd 发帧、却按原版解帧，是必然的乱码断连，
+        // 且成因极难定位（两侧日志都显示"激活过"）。
+        // 原版 compress/decompress 由 SetCompression 一次性安装，因此这里检查的是
+        // 同一个前提，只是把判断提前到任何替换动作之前。
+        if (!mgr.hasEncoderAnchor(channel) || !mgr.hasDecoderAnchor(channel)) {
             if (attempt < MAX_RETRIES) {
                 channel.eventLoop().schedule(() -> tryActivate(ctx, attempt + 1),
                         RETRY_MS, TimeUnit.MILLISECONDS);
                 return;
             }
             LOGGER.warn("[Zstd] anchors 始终未出现（compress/decompress 缺失）— 回落原版; pipeline={}",
+                    channel.pipeline().names());
+            finishVanilla(ctx);
+            return;
+        }
+        if (!mgr.installEncoder(channel) || !mgr.installDecoder(channel)) {
+            // 锚点已齐备却仍装不上：属异常（例如处理器正被其它插件动态移除）。
+            // 同样按重试 / 最终回落处理，绝不留半装管道。
+            if (attempt < MAX_RETRIES) {
+                channel.eventLoop().schedule(() -> tryActivate(ctx, attempt + 1),
+                        RETRY_MS, TimeUnit.MILLISECONDS);
+                return;
+            }
+            LOGGER.warn("[Zstd] zstd 编解码器安装失败（锚点在位却替换失败）— 回落原版; pipeline={}",
                     channel.pipeline().names());
             finishVanilla(ctx);
             return;

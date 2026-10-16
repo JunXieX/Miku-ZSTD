@@ -246,6 +246,31 @@ public class ZstdPaperChannelManager {
         return false;
     }
 
+    /**
+     * 出站方向是否已有可替换的锚点（原版 {@code compress} 或其别名）。
+     *
+     * <p>用途：激活前先确认<b>两个方向都可替换</b>再动手，避免"只装上编码器"造成
+     * 单侧 zstd 的必断连组合（见 {@code ZstdPaperNegotiator.tryActivate0}）。</p>
+     */
+    public boolean hasEncoderAnchor(Channel channel) {
+        var p = channel.pipeline();
+        return p.get("zstd_encoder") != null
+                || p.get("compress") != null
+                || p.get("compression-encoder") != null;
+    }
+
+    /**
+     * 入站方向是否已有可替换的锚点（原版 {@code decompress} 或其别名）。
+     *
+     * <p>同上：必须在任何替换动作之前与出站方向一起校验。</p>
+     */
+    public boolean hasDecoderAnchor(Channel channel) {
+        var p = channel.pipeline();
+        return p.get("zstd_decoder") != null
+                || p.get("decompress") != null
+                || p.get("compression-decoder") != null;
+    }
+
     public boolean installDecoder(Channel channel) {
         var p = channel.pipeline();
         if (p.get("zstd_decoder") != null) return true;

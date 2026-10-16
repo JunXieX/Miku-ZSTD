@@ -117,18 +117,33 @@ public final class ZstdClientActivation {
         }
         final ZstdChannelManager mgr = existing;
 
-        boolean encOk = installEncoder(p);
-        boolean decOk = installDecoder(p);
-        if (!encOk || !decOk) {
+        // ⚠️ 先查两端锚点是否都在，再动手替换（对齐服务端两侧）：
+        // 否则可能出现"编码器替换成功、解码器还没装好"——本端以 zstd 发帧、却仍按原版
+        // 解帧，与服务端形成必断连组合，且两侧日志都显示"activated"，极难定位。
+        boolean encReady = p.get("zstd_encoder") != null || p.get("compress") != null
+                || p.get("compression-encoder") != null;
+        boolean decReady = p.get("zstd_decoder") != null || p.get("decompress") != null
+                || p.get("compression-decoder") != null;
+        if (!encReady || !decReady) {
             if (quiet) {
                 // 字典比 SetCompression 先到：压缩处理器还没装上，属正常时序。
                 // 真正决定成败的那次尝试在 setupCompression / handleCompression 的 TAIL 上，那里会报错。
                 LOGGER.debug("[Zstd] activation deferred — compression handlers not installed yet "
-                        + "(encoder={}, decoder={})", encOk, decOk);
+                        + "(encoder={}, decoder={})", encReady, decReady);
             } else {
                 LOGGER.error("[Zstd] activation aborted — pipeline anchors missing "
-                        + "(encoder={}, decoder={}); pipeline={}", encOk, decOk, p.names());
+                        + "(encoder={}, decoder={}); pipeline={}", encReady, decReady, p.names());
             }
+            return;
+        }
+
+        boolean encOk = installEncoder(p);
+        boolean decOk = installDecoder(p);
+        if (!encOk || !decOk) {
+            // 锚点已确认齐备却仍替换失败：属异常（例如处理器被别的模组动态移除）。
+            // 绝不置 ACTIVATED —— 让另一条触发路径仍有补救机会。
+            LOGGER.error("[Zstd] activation aborted — handler replacement failed despite anchors "
+                    + "(encoder={}, decoder={}); pipeline={}", encOk, decOk, p.names());
             return;
         }
 
