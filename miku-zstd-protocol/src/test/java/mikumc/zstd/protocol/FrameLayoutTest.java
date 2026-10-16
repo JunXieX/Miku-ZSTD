@@ -234,7 +234,7 @@ class FrameLayoutTest {
 
     @Test
     @DisplayName("压缩上下文已关闭时：在途压缩任务必须干净放弃（不得触碰 native ctx，也不得丢 promise）")
-    void compressionAbortsSafelyWhenContextClosed() {
+    void compressionAbortsSafelyWhenContextClosed() throws InterruptedException {
         // 回归用例：压缩任务可能"在连接断开前提交、在 ChannelManager#close() 释放 native
         // 上下文之后才轮到执行"。若那时仍调用 compressCtx，就是 use-after-free → SIGSEGV
         // （整进程崩，不止这条连接），而在纯 JVM 测试里它会表现为 JVM 崩溃或 native 报错。
@@ -243,7 +243,10 @@ class FrameLayoutTest {
         // 模拟"连接已断、上下文已关"：必须在写入之前置位，让池线程拿到锁后立刻放弃。
         encoder.lock.markClosed();
 
-        io.netty.channel.ChannelFuture f = ch.writeOutbound(packet(repetitive(4096)));
+        // ⚠️ 用 ch.write(...) 而不是 ch.writeOutbound(...)：后者的返回值是 boolean，
+        // 拿不到本次写的 promise —— 而本用例要断言的正是"promise 必须被完成"。
+        io.netty.channel.ChannelFuture f = ch.write(packet(repetitive(4096)));
+        ch.flush();
         // 放弃结论由池线程经 eventLoop 回投，嵌入式 channel 需要手动推进任务队列。
         long deadline = System.currentTimeMillis() + 3000;
         while (!f.isDone() && System.currentTimeMillis() < deadline) {
