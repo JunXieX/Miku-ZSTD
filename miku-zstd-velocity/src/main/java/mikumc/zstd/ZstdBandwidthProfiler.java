@@ -62,10 +62,18 @@ public final class ZstdBandwidthProfiler {
      *
      * <p><b>幂等</b>：{@code /mikuzstd reload} 会再调一次——若不判重，每 reload 一次就会
      * 多出一个上报线程，带宽剖析越看越花。</p>
+     *
+     * <p>⚠️ 反向也要处理：{@code reload} 把 {@code logging.debug} 从 true 改成 false 时，
+     * 必须<b>停掉</b>已在运行的上报线程。旧实现只把 {@code enabled} 置假就返回
+     * （{@code if (!debugEnabled) return;}），线程仍按周期空转——统计虽不再累加
+     *（{@link #record} 会早退），但"关了开关线程还在"本身就是一个泄漏点。</p>
      */
     public static synchronized void start(boolean debugEnabled, int intervalSeconds) {
         enabled = debugEnabled;
-        if (!debugEnabled) return;
+        if (!debugEnabled) {
+            shutdown(); // reload 关闭 debug：连同线程一起收掉
+            return;
+        }
         if (scheduler != null) return; // 已在运行
         scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "miku-zstd-bwprof");

@@ -89,27 +89,38 @@ public class ZstdPaperChannelManager {
     /**
      * 把共享字典装进两端上下文（仅在客户端确认就绪后调用）。
      * 字典对象由 {@link ZstdPaperDictRegistry} 进程级共享，此处只取引用。
+     *
+     * <p>⚠️ <b>必须幂等</b>：本方法在激活路径上，而激活失败会重试
+     * （{@code ZstdPaperNegotiator.tryActivate0} 的锚点重试是<b>常态</b>——原版
+     * compress/decompress 是在 SetCompression 写出之后才安装的，首次尝试必然找不到锚点）。
+     * 每次重试都重新 {@code acquireEncoder()} 会<b>丢掉上一次引用的归还</b>：注册表引用计数
+     * 只增不减，换字典时条目永远等不到归零，那几 MB 原生字典内存就此泄漏。
+     * 现在改为"已持有则不再取"，顺带省掉重复的 {@code loadDict}。</p>
      */
     public void loadTrainerDicts() {
         synchronized (compressLock) {
         // 通道已关闭（上下文已释放）：装载字典等于写已释放的原生内存，直接放弃
         //（正常时序下不会走到这里，此判仅作为兜底，见 ZstdCompressLock 的类注释）。
         if (compressLock.isClosed()) return;
-        ZstdPaperDictRegistry.Entry enc = ZstdPaperDictRegistry.acquireEncoder();
-        if (enc != null && enc.compressDict() != null) {
-            compressCtx.loadDict(enc.compressDict());
-            encoderDictEntry = enc;
-            compressCtx.setMagicless(true);
-            compressCtx.setContentSize(false);
-            compressCtx.setDictID(false);
-            LOGGER.debug("[Zstd] 已装载压缩字典 id={} ({}B)", enc.id(), enc.bytes().length);
+        if (encoderDictEntry == null) {
+            ZstdPaperDictRegistry.Entry enc = ZstdPaperDictRegistry.acquireEncoder();
+            if (enc != null && enc.compressDict() != null) {
+                compressCtx.loadDict(enc.compressDict());
+                encoderDictEntry = enc;
+                compressCtx.setMagicless(true);
+                compressCtx.setContentSize(false);
+                compressCtx.setDictID(false);
+                LOGGER.debug("[Zstd] 已装载压缩字典 id={} ({}B)", enc.id(), enc.bytes().length);
+            }
         }
-        ZstdPaperDictRegistry.Entry dec = ZstdPaperDictRegistry.acquireDecoder();
-        if (dec != null && dec.decompressDict() != null) {
-            decompressCtx.loadDict(dec.decompressDict());
-            decoderDictEntry = dec;
-            decompressCtx.setMagicless(true);
-            LOGGER.debug("[Zstd] 已装载解压字典 id={} ({}B)", dec.id(), dec.bytes().length);
+        if (decoderDictEntry == null) {
+            ZstdPaperDictRegistry.Entry dec = ZstdPaperDictRegistry.acquireDecoder();
+            if (dec != null && dec.decompressDict() != null) {
+                decompressCtx.loadDict(dec.decompressDict());
+                decoderDictEntry = dec;
+                decompressCtx.setMagicless(true);
+                LOGGER.debug("[Zstd] 已装载解压字典 id={} ({}B)", dec.id(), dec.bytes().length);
+            }
         }
         }
     }

@@ -422,27 +422,47 @@ public class ZstdHijacker extends ChannelDuplexHandler {
             return;
         }
 
-        activateZstd(ctx, mgr, attempt);
-        releaseHeld(ctx); // zstd 编解码器已就位：补发扣下的包（走 zstd 路径）
+        // 只有"确实激活成功"才补发；重试 / 回落原版这两条路径已由 activateZstd 自行收尾
+        //（见该方法的返回值约定）。
+        if (activateZstd(ctx, mgr, attempt)) {
+            releaseHeld(ctx); // zstd 编解码器已就位：补发扣下的包（走 zstd 路径）
+        }
     }
 
     private boolean pipelineRemoved(Channel channel) {
         return channel.pipeline().get(ZstdHijacker.class) == null;
     }
 
-    private void activateZstd(ChannelHandlerContext ctx, ZstdChannelManager mgr, int attempt) {
+    /**
+     * 安装 zstd 编解码器并置位激活状态。
+     *
+     * <p>⚠️ <b>返回值语义必须严格遵守</b>，它是"扣住的包该不该现在补发"的唯一判据：</p>
+     * <ul>
+     *   <li>{@code true}：激活成功，管道已定型为 zstd —— 调用方应 {@code releaseHeld}
+     *       按 zstd 路径补发；</li>
+     *   <li>{@code false}：本方法<b>已自行收尾</b>（排定了重试，或已补发并回落原版），
+     *       调用方<b>不得</b>再动扣住的包。</li>
+     * </ul>
+     * <p>曾经调用方是无条件 {@code releaseHeld}：重试路径上（锚点尚未就绪，这在原版
+     * SetCompression 之后是常态）会把扣住的包<b>提前</b>用尚未定型、甚至仍是原版压缩的
+     * 路径发出去，同时把 {@code holding} 置假——激活窗口的门控就此失效，正是 v4 批量帧
+     * 与原版帧混发导致客户端解析错乱的成因。</p>
+     */
+    private boolean activateZstd(ChannelHandlerContext ctx, ZstdChannelManager mgr, int attempt) {
         Channel channel = ctx.channel();
         ChannelPipeline p = channel.pipeline();
 
         if (p.get(MINECRAFT_DECODER) == null || p.get(MINECRAFT_ENCODER) == null) {
             LOGGER.warn("[Zstd] Cannot activate zstd — not a frontend Minecraft channel");
-            return;
+            releaseHeld(ctx); // 不可激活：必须补发扣住的包，否则连接卡死
+            return false;
         }
         // 先确认两端都能替换，再动手——避免只装上一侧造成单侧 zstd 的必断连组合
         if (!hasEncoderAnchor(p) || !hasDecoderAnchor(p)) {
             LOGGER.error("[Zstd] Cannot activate zstd — pipeline anchors missing (encoder={}, decoder={}); "
                     + "pipeline={}", hasEncoderAnchor(p), hasDecoderAnchor(p), p.names());
-            return;
+            releaseHeld(ctx); // 同上：不能把包一直扣着
+            return false;
         }
 
         // 字典门控：仅客户端确认就绪时加载字典
@@ -452,8 +472,14 @@ public class ZstdHijacker extends ChannelDuplexHandler {
             LOGGER.info("[Zstd] Activating without trained dicts (client not ready) — compression still active");
         }
 
-        mgr.setReplaced(true);
-
+        // ⚠️ 先在**代码路径上**把两个处理器都装上，成功了才置 replaced。
+        //
+        // 曾经这里先 setReplaced(true) 再安装：安装失败走重试时，{@code tryActivate0}
+        // 开头的 {@code mgr.isReplaced()} 早退会把重试**整个吃掉**（replaced 已为 true
+        // → 直接 return），于是 ①重试形同虚设；②那条 return 不会 releaseHeld，
+        // 激活窗口内扣住的包与 promise 永挂 —— 客户端表现为**连接卡死**（不是断连），
+        // 日志里只有一行 ERROR；③监控里的"使用人数"还被错误 +1 且永不回落。
+        // Paper 端一直是"装完再置位"（见 ZstdPaperNegotiator），此处与它对齐。
         if (!mgr.installEncoder(channel) || !mgr.installDecoder(channel)) {
             // ⚠️ 两件事都必须做：
             // 1) 重试——原版压缩处理器是 SetCompression 之后才装的，可能尚未就绪；
@@ -462,14 +488,15 @@ public class ZstdHijacker extends ChannelDuplexHandler {
             if (attempt < RESPONSE_MAX_RETRIES) {
                 channel.eventLoop().schedule(() -> tryActivate(ctx, attempt + 1),
                         RESPONSE_RETRY_MS, TimeUnit.MILLISECONDS);
-                return;
+                return false; // 重试期间保持 holding：包必须留到管道定型后再发
             }
             LOGGER.error("[Zstd] zstd handler installation failed after {} attempts; pipeline={}",
                     attempt, p.names());
-            mgr.setReplaced(false);
             releaseHeld(ctx); // 回落原版：把扣住的包按原路径补发
-            return;
+            return false;
         }
+
+        mgr.setReplaced(true); // 计数已内聚在 setReplaced 内（幂等）
 
         LOGGER.info("[Zstd] Zstd transport activated (dict={})", mgr.isDictConfirmed());
 
@@ -477,6 +504,8 @@ public class ZstdHijacker extends ChannelDuplexHandler {
         if (p.get(ZstdHijacker.class) != null) {
             p.remove(this);
         }
+        // 管道已定型为 zstd：调用方据此补发扣住的包
+        return true;
     }
 
     private static boolean hasEncoderAnchor(ChannelPipeline p) {

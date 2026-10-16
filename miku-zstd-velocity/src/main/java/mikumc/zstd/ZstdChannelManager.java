@@ -130,25 +130,35 @@ public class ZstdChannelManager {
      *
      * <p>字典对象由 {@link ZstdDictRegistry} 全进程共享，此处只取引用，
      * 不做 {@code new ZstdDictCompress(...)}（后者每连接约 3.2MB）。</p>
+     *
+     * <p>⚠️ <b>必须幂等</b>：本方法位于激活路径上，而激活在锚点未就绪时会重试
+     * （{@code ZstdHijacker.activateZstd} 的锚点重试）。每次重入都重新
+     * {@code acquireEncoder()} 会<b>丢掉上一次引用的归还</b>：注册表引用计数只增不减，
+     * 换字典时条目永远等不到归零，那几 MB 原生字典内存就此泄漏。
+     * 现在改为"已持有则不再取"，顺带省掉重复的 {@code loadDict}。</p>
      */
     public void loadTrainerDicts() {
         synchronized (compressLock) {
         // 通道已关闭（上下文已释放）：装载字典等于写已释放的原生内存，直接放弃
         //（正常时序下不会走到这里，此判仅作为兜底，见 ZstdCompressLock 的类注释）。
         if (compressLock.isClosed()) return;
-        ZstdDictRegistry.Entry enc = ZstdDictRegistry.acquireEncoder();
-        if (enc != null && enc.compressDict() != null) {
-            compressCtx.loadDict(enc.compressDict());
-            encoderDictEntry = enc;
-            LOGGER.debug("[Zstd] Loaded encoder dict {} ({}B) -> compressCtx",
-                    enc.id(), enc.bytes().length);
+        if (encoderDictEntry == null) {
+            ZstdDictRegistry.Entry enc = ZstdDictRegistry.acquireEncoder();
+            if (enc != null && enc.compressDict() != null) {
+                compressCtx.loadDict(enc.compressDict());
+                encoderDictEntry = enc;
+                LOGGER.debug("[Zstd] Loaded encoder dict {} ({}B) -> compressCtx",
+                        enc.id(), enc.bytes().length);
+            }
         }
-        ZstdDictRegistry.Entry dec = ZstdDictRegistry.acquireDecoder();
-        if (dec != null && dec.decompressDict() != null) {
-            decompressCtx.loadDict(dec.decompressDict());
-            decoderDictEntry = dec;
-            LOGGER.debug("[Zstd] Loaded decoder dict {} ({}B) -> decompressCtx",
-                    dec.id(), dec.bytes().length);
+        if (decoderDictEntry == null) {
+            ZstdDictRegistry.Entry dec = ZstdDictRegistry.acquireDecoder();
+            if (dec != null && dec.decompressDict() != null) {
+                decompressCtx.loadDict(dec.decompressDict());
+                decoderDictEntry = dec;
+                LOGGER.debug("[Zstd] Loaded decoder dict {} ({}B) -> decompressCtx",
+                        dec.id(), dec.bytes().length);
+            }
         }
         applySlimFrameFormat(); // loadDict 后幂等重申，避免参数被重置
         }
