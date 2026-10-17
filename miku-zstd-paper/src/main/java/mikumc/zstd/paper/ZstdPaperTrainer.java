@@ -249,9 +249,11 @@ public final class ZstdPaperTrainer {
         }
 
         int size;
+        boolean budgetExhausted = false;
         synchronized (this) {
             for (byte[] s : batch) {
                 if (sampleBytes >= sampleSize) {
+                    budgetExhausted = true;
                     if (ring.size() >= minSamples) {
                         ringFull = true; // 满环且样本数够 → 后续 addBatch 走早退路径
                     }
@@ -264,17 +266,38 @@ public final class ZstdPaperTrainer {
         }
         if (size >= minSamples) {
             maybeTrain();
+        } else if (budgetExhausted) {
+            // ⚠️ 字节预算先于样本数门槛耗尽时必须仍然归档并清空，否则永久静默卡死：
+            // 环里已有 sample_target_bytes 字节但不足 min_samples → ringFull 不置位
+            // → 每批都白解析白拷贝却一个也加不进 → maybeTrain 又因 size < minSamples 永远早退。
+            // 触发条件是"平均单包 > sample_target_bytes / min_samples"（默认约 512B）。
+            // 与 Velocity 端同一处修正。
+            LOGGER.info("[Zstd] {} 字节预算已满但样本数仅 {} < {}，提前归档以清空样本环",
+                    name, size, minSamples);
+            maybeTrain(true);
         }
     }
 
     private void maybeTrain() {
+        maybeTrain(false);
+    }
+
+    /**
+     * @param forceByBudget {@code true} 表示"字节预算已耗尽，样本数不足也要清空环"
+     *                      （见 {@link #addBatch} 里的说明）。
+     */
+    private void maybeTrain(boolean forceByBudget) {
         synchronized (this) {
-            if (ring.size() < minSamples) return;
+            int count = ring.size();
+            if (count == 0) return;
             long now = System.currentTimeMillis();
-            if (now - lastTrainTime < cooldownMs) return;
-            boolean full = ring.size() >= maxSamples;
-            boolean timedOut = (now - lastTrainTime) >= fallbackTimeoutMs;
-            if (!full && !timedOut) return;
+            if (!forceByBudget) {
+                if (count < minSamples) return;
+                if (now - lastTrainTime < cooldownMs) return;
+                boolean full = count >= maxSamples;
+                boolean timedOut = (now - lastTrainTime) >= fallbackTimeoutMs;
+                if (!full && !timedOut) return;
+            }
             if (!training.compareAndSet(false, true)) return;
             lastTrainTime = now;
         }
@@ -287,19 +310,41 @@ public final class ZstdPaperTrainer {
         // 否则 trainAndAdopt 的 finally 永不执行，标志卡在 true，此后所有训练请求
         // 都被"already in progress"挡掉 —— 字典机制静默失效（与 Velocity 端同一处修正）。
         try {
-            te.execute(this::trainAndAdopt);
+            te.execute(() -> trainAndAdopt(forceByBudget));
         } catch (RejectedExecutionException e) {
             training.set(false);
         }
     }
 
     private void trainAndAdopt() {
+        trainAndAdopt(false);
+    }
+
+    /**
+     * @param allowBelowMin {@code true} 表示"字节预算已耗尽，样本数不足也先清空环"
+     *                      （见 {@link #addBatch}）。这条路径必须同样归档+清空，
+     *                      否则环仍满、下一批又触发，形成反复空转。
+     */
+    private void trainAndAdopt(boolean allowBelowMin) {
         try {
             List<byte[]> snapshot;
             synchronized (this) {
                 snapshot = new ArrayList<>(ring);
             }
-            if (snapshot.size() < minSamples) return;
+            if (snapshot.isEmpty()) return;
+            if (snapshot.size() < minSamples) {
+                if (!allowBelowMin) return;
+                LOGGER.info("[Zstd] {} 样本数低于门槛（{} < {}）但字节预算已满，归档并清空样本环",
+                        name, snapshot.size(), minSamples);
+                persist(false);
+                synchronized (this) {
+                    ring.clear();
+                    sampleBytes = 0;
+                    ringFull = false;
+                    savedCount = 0;
+                }
+                return;
+            }
 
             LOGGER.info("[Zstd] {} 开始训练: {} 个样本", name, snapshot.size());
             byte[] newDict = train(snapshot);

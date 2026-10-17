@@ -331,9 +331,11 @@ public class ZstdSampleTrainer {
         }
 
         int size;
+        boolean budgetExhausted = false;
         synchronized (this) {
             for (byte[] s : batch) {
                 if (sampleBytes >= sampleSize) {
+                    budgetExhausted = true;
                     if (sampleRing.size() >= minSamples) {
                         ringFull = true; // 满环且样本数够 → 后续 addBatch 走早退路径
                     }
@@ -346,18 +348,41 @@ public class ZstdSampleTrainer {
         }
         if (size >= minSamples) {
             maybeTrain();
+        } else if (budgetExhausted) {
+            // ⚠️ 字节预算先于样本数门槛耗尽时必须仍然训练，否则会**永久静默卡死**：
+            // 环里已有 1MB 样本但不足 min_samples → ringFull 不会被置位（因为 size < minSamples），
+            // 于是每个批次都重新解析+拷贝、却一个样本也加不进去，而 maybeTrain 又因
+            // size < minSamples 永远早退 —— 字典训练从此再不发生（且样本也不会被归档）。
+            // 触发条件是"平均单包 > sample_target_bytes / min_samples"（默认约 512B），
+            // 在区块/实体数据占比高的流量形态下完全可能出现。
+            // 宁可样本少一点也先训一轮（训练失败会照常打日志并清空环），也不能停摆。
+            LOGGER.info("[Zstd] {} 字节预算已满但样本数仅 {} < {}，提前训练一轮以避免停摆",
+                    name, size, minSamples);
+            maybeTrain(true);
         }
     }
 
     /** 判断是否满足训练条件（满足则以 training 原子标志占位，异步执行）。 */
     private void maybeTrain() {
+        maybeTrain(false);
+    }
+
+    /**
+     * @param forceByBudget {@code true} 表示"字节预算已耗尽，即使样本数不足也要训一轮"
+     *                      （见 {@link #addBatch} 里的说明）。此时跳过样本数与冷却门槛。
+     */
+    private void maybeTrain(boolean forceByBudget) {
         synchronized (this) {
-            if (sampleRing.size() < minSamples) return;
+            int count = sampleRing.size();
+            if (count == 0) return;
             long now = System.currentTimeMillis();
-            if (now - lastTrainTime < trainCooldownMs) return;
-            boolean full = sampleRing.size() >= maxSamples;
-            boolean timedOut = (now - lastTrainTime) >= fallbackTimeoutMs;
-            if (!full && !timedOut) return;
+            if (!forceByBudget) {
+                if (count < minSamples) return;
+                if (now - lastTrainTime < trainCooldownMs) return;
+                boolean full = count >= maxSamples;
+                boolean timedOut = (now - lastTrainTime) >= fallbackTimeoutMs;
+                if (!full && !timedOut) return;
+            }
             if (!training.compareAndSet(false, true)) return;
             lastTrainTime = now;
         }
@@ -368,10 +393,15 @@ public class ZstdSampleTrainer {
         }
         // 同 forceTrain：提交被拒（执行器已 shutdown）时必须复位标志，否则训练永久卡死
         try {
-            te.execute(this::trainAndAdopt);
+            te.execute(() -> trainAndAdopt(forceByBudget));
         } catch (RejectedExecutionException e) {
             training.set(false);
         }
+    }
+
+    /** 训练 + 评估 + 采纳 + 归档 + 清空样本环（训练线程调用）。 */
+    private void trainAndAdopt() {
+        trainAndAdopt(false);
     }
 
     /**
@@ -379,15 +409,38 @@ public class ZstdSampleTrainer {
      *
      * <p>关键：<b>无论是否采纳新字典，样本环都会归档并清空</b>。否则环一旦攒满，
      * 入环时的容量早退会让它永久拒绝新样本，字典再无进化可能。</p>
+     *
+     * @param allowBelowMin {@code true} 表示"字节预算已耗尽，样本数不足也先训一轮"。
+     *                      这条路径<b>必须</b>同样走完归档+清空——否则环仍然是满的，
+     *                      下一批又会触发，形成"反复空转 + 刷日志"。
      */
-    private void trainAndAdopt() {
+    private void trainAndAdopt(boolean allowBelowMin) {
         try {
             List<byte[]> snapshot;
             synchronized (this) {
                 snapshot = new ArrayList<>(sampleRing);
             }
+            if (snapshot.isEmpty()) {
+                return;
+            }
             if (snapshot.size() < minSamples) {
-                LOGGER.info("[Zstd] {} not enough samples to train ({} < {})", name, snapshot.size(), minSamples);
+                if (!allowBelowMin) {
+                    LOGGER.info("[Zstd] {} not enough samples to train ({} < {})",
+                            name, snapshot.size(), minSamples);
+                    return;
+                }
+                // 低于门槛但预算已满：先把这批样本归档并清空环，避免永久停摆。
+                // 训练本身仍照常尝试——样本少可能训不出字典（会打 WARN），
+                // 但"清空环让新样本能继续进来"比"死守门槛"重要得多。
+                LOGGER.info("[Zstd] {} 样本数低于门槛（{} < {}）但字节预算已满，仍归档并清空样本环",
+                        name, snapshot.size(), minSamples);
+                persist(false);
+                synchronized (this) {
+                    sampleRing.clear();
+                    sampleBytes = 0;
+                    ringFull = false;
+                    savedCount = 0;
+                }
                 return;
             }
 

@@ -78,8 +78,12 @@ public final class ZstdHudRenderer {
     }
 
     /**
-     * 诊断输出：帮助判定"HUD 为什么没内容"。类别变化时立即输出，否则按
-     * {@link #DIAG_INTERVAL_MS} 限频——正常游玩时不会刷屏。
+     * 诊断输出：帮助判定"HUD 为什么没内容"。类别变化时立即以 <b>INFO</b> 输出一次
+     * （那才是用户真正需要看到的那一条），之后同一类别的周期性重复降为 <b>DEBUG</b>。
+     *
+     * <p>⚠️ 原先这里对每次限频放行都打 INFO：HUD 一旦开着，就会<b>每 30 秒一行、永不停止</b>。
+     * 长时间游玩（几小时）会把日志刷成几百行无信息量的重复内容，反而掩盖真正的问题。
+     * 现在的口径是"状态变化才值得进 INFO"——类别没变说明情况与上次报告完全一致。</p>
      */
     private static void diag(String key, String message) {
         long now = System.currentTimeMillis();
@@ -87,7 +91,11 @@ public final class ZstdHudRenderer {
         if (!changed && now - lastDiagMs < DIAG_INTERVAL_MS) return;
         lastDiagKey = key;
         lastDiagMs = now;
-        LOGGER.info("[Zstd] {}", message);
+        if (changed) {
+            LOGGER.info("[Zstd] {}", message);
+        } else {
+            LOGGER.debug("[Zstd] {}", message);
+        }
     }
 
     private static void drawHud(GuiGraphicsExtractor g, Font font, String tx, String rx) {
