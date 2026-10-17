@@ -73,9 +73,16 @@ public class ZstdVelocityConfig {
      * <b>建连路径</b>上（握手嗅探器 / Paper 的通道初始化）——于是"一个配置打错"
      * 的后果从"zstd 不生效"恶化成"玩家连不上"。夹取把它变回无害。</p>
      *
-     * <p>{@code dict_max_bytes} 的上限刻意取 1MB：客户端 {@code loadOne} 会拒绝
-     * 超过 0x100000 的字典并回报告"不可用"，那会被当成协议不匹配而整条回落。
-     * 夹在这里，越界配置就不会造成"字典白训练"。</p>
+     * <p>{@code dict_max_bytes} 的上限不是 1MB，而是 {@link ZstdVarInts#MAX_DICT_BYTES_PER_DIRECTION}
+     * （约 1000KB）。原因有两层，取更严的那个：</p>
+     * <ul>
+     *   <li>客户端 {@code loadOne} 会拒绝超过 0x100000（1MB）的字典并回报"不可用"，</li>
+     *   <li>更硬的一条：{@code zstd:dict} 把<b>两个方向</b>的字典放进<b>同一个包</b>，
+     *       而 MC 的单帧上限是 {@code 2^21-1 ≈ 2MB}。两方向各 1MB 会直接撑破帧上限，
+     *       客户端抛 {@code length wider than 21-bit} 并断连（不是"字典不生效"，是"进不去"）。
+     *       该包在 Paper 端还是在原版压缩启用之前发出的裸帧，不会被压缩缩小。</li>
+     * </ul>
+     * <p>夹在这里，越界配置就不会造成"训练出来的字典根本发不出去"。</p>
      */
     private ZstdVelocityConfig(Map<String, Object> map) {
         Map<String, Object> c = getMap(map, "compression");
@@ -94,7 +101,8 @@ public class ZstdVelocityConfig {
         this.trainerMinSamples = clamp(getInt(t, "min_samples", 2000), 1, this.trainerMaxSamples);
         this.trainerCooldownMs = Math.max(0L, getLong(t, "cooldown_ms", 300000));
         this.trainerFallbackTimeoutMs = Math.max(1000L, getLong(t, "fallback_timeout_ms", 600000));
-        this.trainerDictMaxBytes = clamp(getInt(t, "dict_max_bytes", 131072), 1024, 0x100000);
+        this.trainerDictMaxBytes = clamp(getInt(t, "dict_max_bytes", 131072), 1024,
+                mikumc.zstd.protocol.ZstdVarInts.MAX_DICT_BYTES_PER_DIRECTION);
         this.trainerSampleTargetBytes = clamp(getInt(t, "sample_target_bytes", 1048576), 1024, 1 << 30);
         this.trainerMaxHistorySamples = clamp(getInt(t, "max_history_samples", 20000), 0, 10_000_000);
         this.trainerAdoptionThreshold = clampD(getDouble(t, "adoption_threshold", 0.01), 0.0, 1.0);

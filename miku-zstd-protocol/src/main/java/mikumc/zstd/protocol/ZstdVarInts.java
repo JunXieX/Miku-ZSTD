@@ -31,6 +31,39 @@ public final class ZstdVarInts {
     /** 单帧长度上限的默认值（32MB，26.x configuration 阶段存在超大 Registry 包） */
     public static final int DEFAULT_MAX_VALUE = 32 * 1024 * 1024;
 
+    /**
+     * Minecraft 单个网络帧的<b>硬上限</b>：{@code 2^21 - 1 = 2097151} 字节。
+     *
+     * <p>依据：MC 的外层帧长前缀是 3 字节 VarInt（{@code Varint21FrameDecoder} /
+     * {@code Varint21LengthFieldPrepender}），能表示的最大值就是 2^21-1；超过它客户端会
+     * 直接抛 {@code CorruptedFrameException: length wider than 21-bit}，服务端侧则是
+     * prepender 抛 "unable to fit ... into 3 bytes" 后断连。</p>
+     *
+     * <p>⚠️ 这是<b>帧</b>的上限，不是包的上限：一个包超过它就无法上线，无论内容多合法。
+     * 本项目里唯一可能触碰它的是 {@code zstd:dict} —— 它把<b>两个方向</b>的字典放进
+     * <b>同一个包</b>，且该包在 Paper 端是在原版压缩启用<b>之前</b>发出的（裸帧，
+     * 不会被压缩缩小）。所以 {@code dict_max_bytes} 必须按"两倍 + 头开销"来卡上限，
+     * 见 {@link #MAX_DICT_BYTES_PER_DIRECTION}。</p>
+     */
+    public static final int MC_MAX_FRAME_BYTES = (1 << 21) - 1;
+
+    /**
+     * 单方向字典字节数的安全上限：保证"两个方向同帧发送"时不会撑破
+     * {@link #MC_MAX_FRAME_BYTES}。
+     *
+     * <p>一个 {@code zstd:dict} 包的布局：
+     * {@code [varint pktId][varint txId][varint len + "zstd:dict"][byte flags]}
+     * + 每方向 {@code [int crc][int len][bytes]}。固定开销为
+     * 包 id 1 + txId ≤5 + 字符串 10 + flags 1 + 两组的 crc/len 16 ≈ 33 字节，
+     * 保守留 64 字节余量：{@code 2 × D + 64 ≤ 2097151} → {@code D ≤ 1048543}。
+     * 取 {@code 1000 × 1024 = 1024000}（约 1000KB）：既留足余量，也是个好记的整数。</p>
+     *
+     * <p>它比"客户端 {@code loadOne} 能接受的 1MB"略小，两者取小是刻意的：客户端那条限制
+     * 防的是畸形载荷，而这里的限制防的是<b>协议帧上限</b>——后者更硬，一旦触发就是
+     * "连不上"，而不是"字典不生效"。</p>
+     */
+    public static final int MAX_DICT_BYTES_PER_DIRECTION = 1000 * 1024;
+
     /** 数据不足，需要更多字节 */
     public static final int NEED_MORE = -1;
     /** 非法编码或超出上限 */

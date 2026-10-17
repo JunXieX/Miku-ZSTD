@@ -104,6 +104,39 @@ class ProtocolUnitsTest {
     }
 
     // ────────────────────────────────────────────────────────────────
+    // 协议帧上限（跨端硬约束）
+    // ────────────────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("帧上限：MC 外层帧是 3 字节 VarInt，上限 2^21-1")
+    void mcFrameLimitIs21Bit() {
+        // 这不是"我们选的"，而是 MC 的 Varint21FrameDecoder 决定的：
+        // 超过它客户端抛 "length wider than 21-bit"，服务端 prepender 也装不下。
+        assertEquals(2_097_151, ZstdVarInts.MC_MAX_FRAME_BYTES);
+        // 用一个 3 字节 varint 刚好能写出这个值、但写不出 +1 —— 交叉验证常量本身
+        assertEquals(3, ZstdVarInts.length(ZstdVarInts.MC_MAX_FRAME_BYTES));
+        assertEquals(4, ZstdVarInts.length(ZstdVarInts.MC_MAX_FRAME_BYTES + 1));
+    }
+
+    @Test
+    @DisplayName("帧上限：两个方向的字典同帧发送也不得撑破帧上限（含包头开销）")
+    void bothDictionariesFitInOneFrame() {
+        // zstd:dict 把两个方向的字典放进同一个包：
+        //   [pktId][txId][len+"zstd:dict"][flags] + 2 × ([int crc][int len][bytes])
+        // 包头固定开销按 64 字节保守估算（本题的判据与服务端 sendDictQuery 的兜底一致）。
+        int perDir = ZstdVarInts.MAX_DICT_BYTES_PER_DIRECTION;
+        long frameBytes = 2L * (perDir + 8) + 64;
+        assertTrue(frameBytes <= ZstdVarInts.MC_MAX_FRAME_BYTES,
+                "两方向各 " + perDir + "B 时合帧需要 " + frameBytes
+                        + "B，已超过 MC 帧上限 " + ZstdVarInts.MC_MAX_FRAME_BYTES);
+
+        // 反面：如果仍按 1MB 单方向来夹，两方向就会超限 —— 这正是本常量存在的理由
+        long oneMegEach = 2L * (0x100000 + 8) + 64;
+        assertTrue(oneMegEach > ZstdVarInts.MC_MAX_FRAME_BYTES,
+                "前提校验：两方向各 1MB 应当超限，否则本上限就没有必要");
+    }
+
+    // ────────────────────────────────────────────────────────────────
     // 字典 id（跨端契约）
     // ────────────────────────────────────────────────────────────────
 
@@ -248,6 +281,27 @@ class ProtocolUnitsTest {
         assertEquals(before, ZstdTrafficCounter.sample().players, "计数不得为负");
 
         ZstdTrafficCounter.setEnabled(false);
+    }
+
+    @Test
+    @DisplayName("连接统计：只统计真正走过 zstd 的连接（Paper 端每条连接都会登记）")
+    void connStatsExcludesNeverUsedConnections() {
+        // Paper 端为**每条连接**都建 manager（含原版客户端，它也要走协商），
+        // 因此 ACTIVE 集合里必然混着"只协商过、一帧都没发"的连接。
+        // 若 top/totalSummary 不过滤，命令输出会被在线人数灌水。
+        ZstdConnStats idle = new ZstdConnStats();   // 只登记、从未成帧（模拟原版客户端）
+        ZstdConnStats active = new ZstdConnStats();
+        active.record(1000, 200);
+        try {
+            String summary = ZstdConnStats.totalSummary();
+            assertTrue(summary.contains("活跃 1 条"), "只应统计成过帧的连接：" + summary);
+
+            java.util.List<String> rows = ZstdConnStats.top(10);
+            assertEquals(1, rows.size(), "零帧连接不得出现在 top 列表中");
+        } finally {
+            idle.remove();
+            active.remove();
+        }
     }
 
     // ────────────────────────────────────────────────────────────────

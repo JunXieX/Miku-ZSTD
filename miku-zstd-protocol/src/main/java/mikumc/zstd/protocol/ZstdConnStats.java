@@ -46,9 +46,24 @@ public final class ZstdConnStats {
         ACTIVE.remove(this);
     }
 
+    /**
+     * 本连接是否<b>真的走了 zstd 流量</b>（至少成过一帧）。
+     *
+     * <p>⚠️ 必须按这个口径筛选，而不是"在 ACTIVE 集合里就算"：两端登记时机的语义不同——
+     * Velocity 只在识别到 zstd 客户端时才创建 manager（集合里天然全是 zstd 连接），
+     * 而 Paper 的 manager 是<b>每条连接</b>都建的（它要做协商，原版客户端也要发过协商查询）。
+     * 若不过滤，Paper 端的 {@code /mikuzstd top} 会把所有原版玩家都列进来（零字节、零帧），
+     * "活跃 N 条"被在线人数灌水，且"当前没有走 zstd 的连接"这句话永远不会出现。</p>
+     */
+    private boolean carriesZstd() {
+        return frames.sum() > 0;
+    }
+
     /** 按「原始字节」降序取前 n 条摘要，供命令输出。 */
     public static List<String> top(int n) {
         List<ZstdConnStats> list = new ArrayList<>(ACTIVE);
+        // 只保留真正产生过 zstd 帧的连接（见 carriesZstd 的说明）
+        list.removeIf(s -> !s.carriesZstd());
         list.sort((a, b) -> Long.compare(b.rawBytes.sum(), a.rawBytes.sum()));
         List<String> out = new ArrayList<>();
         for (int i = 0; i < Math.min(n, list.size()); i++) {
@@ -57,17 +72,20 @@ public final class ZstdConnStats {
         return out;
     }
 
-    /** 全部连接的合计压缩率（用于和全局统计对账）。 */
+    /** 全部连接（仅计真正走过 zstd 的）的合计压缩率（用于和全局统计对账）。 */
     public static String totalSummary() {
         long raw = 0;
         long wire = 0;
+        int count = 0;
         for (ZstdConnStats s : ACTIVE) {
+            if (!s.carriesZstd()) continue; // 同 top：排除只协商过、从未走过 zstd 的连接
             raw += s.rawBytes.sum();
             wire += s.wireBytes.sum();
+            count++;
         }
         double ratio = raw > 0 ? 100.0 * wire / raw : 100.0;
         return String.format("活跃 %d 条 | 合计原始 %s → %s (%.1f%%)",
-                ACTIVE.size(), ZstdBossBarFormat.fmtBytes(raw), ZstdBossBarFormat.fmtBytes(wire), ratio);
+                count, ZstdBossBarFormat.fmtBytes(raw), ZstdBossBarFormat.fmtBytes(wire), ratio);
     }
 
     private String describe() {

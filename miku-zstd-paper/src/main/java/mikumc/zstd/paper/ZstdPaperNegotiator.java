@@ -171,6 +171,19 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
         if (mgr == null) return;
         byte[] enc = needEncoder ? ZstdPaperDictRegistry.encoderDictBytes() : null;
         byte[] dec = needDecoder ? ZstdPaperDictRegistry.decoderDictBytes() : null;
+        // ⚠️ 兜底：本包把两个方向的字典放在一起，而 MC 单帧上限是 2^21-1。
+        // 本端这条包还是在原版压缩启用**之前**发出的裸帧，不会被压缩缩小，因此更危险。
+        // 超限就放弃推送 → 客户端停在"等字典" → 硬门控让本端安全回落原版
+        //（好过发出一个客户端必然拒绝的超长帧：那是"进不去"，比"没压缩"严重得多）。
+        long payload = (long) (enc == null ? 0 : enc.length + 8)
+                + (long) (dec == null ? 0 : dec.length + 8);
+        if (payload + 64 > ZstdVarInts.MC_MAX_FRAME_BYTES) {
+            LOGGER.warn("[Zstd] 字典过大，拒绝推送（enc={}B dec={}B，合帧上限 {}B）"
+                            + "— 本连接将回落原版；请调小 trainer.dict_max_bytes",
+                    enc == null ? 0 : enc.length, dec == null ? 0 : dec.length,
+                    ZstdVarInts.MC_MAX_FRAME_BYTES);
+            return;
+        }
         byte flags = 0;
         if (enc != null && enc.length > 0) flags |= 1;
         if (dec != null && dec.length > 0) flags |= 2;

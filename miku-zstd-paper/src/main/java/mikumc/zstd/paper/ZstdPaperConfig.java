@@ -71,8 +71,13 @@ public class ZstdPaperConfig {
         this.trainerMinSamples = clamp(getInt(t, "min_samples", 2000), 1, this.trainerMaxSamples);
         this.trainerCooldownMs = Math.max(0L, getLong(t, "cooldown_ms", 300000));
         this.trainerFallbackTimeoutMs = Math.max(1000L, getLong(t, "fallback_timeout_ms", 600000));
-        // 上限 1MB：客户端 loadOne 会拒绝超过 0x100000 的字典并回"不可用"
-        this.trainerDictMaxBytes = clamp(getInt(t, "dict_max_bytes", 131072), 1024, 0x100000);
+        // 上限取 MAX_DICT_BYTES_PER_DIRECTION（约 1000KB），不是 1MB：
+        //   · 客户端 loadOne 会拒绝超过 0x100000 的字典并回"不可用"；
+        //   · 更硬的一条：zstd:dict 把两个方向的字典放进同一个包，而 MC 单帧上限是
+        //     2^21-1 ≈ 2MB。两方向各 1MB 会撑破帧上限 → 客户端抛 "length wider than
+        //     21-bit" 并断连（不是"字典不生效"，是"进不去"）。详见 ZstdVarInts 的常量注释。
+        this.trainerDictMaxBytes = clamp(getInt(t, "dict_max_bytes", 131072), 1024,
+                mikumc.zstd.protocol.ZstdVarInts.MAX_DICT_BYTES_PER_DIRECTION);
         this.trainerSampleTargetBytes = clamp(getInt(t, "sample_target_bytes", 1048576), 1024, 1 << 30);
         this.trainerMaxHistorySamples = clamp(getInt(t, "max_history_samples", 20000), 0, 10_000_000);
         this.trainerAdoptionThreshold = clampD(getDouble(t, "adoption_threshold", 0.01), 0.0, 1.0);
