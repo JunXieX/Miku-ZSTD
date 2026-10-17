@@ -429,19 +429,14 @@ public class ZstdSampleTrainer {
                             name, snapshot.size(), minSamples);
                     return;
                 }
-                // 低于门槛但预算已满：先把这批样本归档并清空环，避免永久停摆。
-                // 训练本身仍照常尝试——样本少可能训不出字典（会打 WARN），
-                // 但"清空环让新样本能继续进来"比"死守门槛"重要得多。
-                LOGGER.info("[Zstd] {} 样本数低于门槛（{} < {}）但字节预算已满，仍归档并清空样本环",
+                // 低于门槛但字节预算已满：**照常训练**，而不是把样本丢掉。
+                // 训练器本身对样本数没有硬要求（少则训出的字典质量差、甚至训不出，
+                // 那会走下面的"训练结果为空"分支并照常清空环）；而采纳环节还有
+                // shouldAdoptDict 把关，质量不够的字典不会替换现有字典。
+                // 关键是**必须走完归档 + 清空环**，否则环一直是满的，下一批又会触发，
+                // 形成"反复空转 + 刷日志"，且新样本永远进不来。
+                LOGGER.info("[Zstd] {} 样本数低于门槛（{} < {}）但字节预算已满，仍训练一轮并清空样本环",
                         name, snapshot.size(), minSamples);
-                persist(false);
-                synchronized (this) {
-                    sampleRing.clear();
-                    sampleBytes = 0;
-                    ringFull = false;
-                    savedCount = 0;
-                }
-                return;
             }
 
             LOGGER.info("[Zstd] {} starting training with {} samples ({} bytes)",

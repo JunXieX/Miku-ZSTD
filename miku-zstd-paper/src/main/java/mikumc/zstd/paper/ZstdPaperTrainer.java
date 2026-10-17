@@ -334,16 +334,10 @@ public final class ZstdPaperTrainer {
             if (snapshot.isEmpty()) return;
             if (snapshot.size() < minSamples) {
                 if (!allowBelowMin) return;
-                LOGGER.info("[Zstd] {} 样本数低于门槛（{} < {}）但字节预算已满，归档并清空样本环",
+                // 低于门槛但预算已满：照常训练（质量不够的字典会被 shouldAdoptDict 挡下），
+                // 关键是必须走完归档+清空，否则环一直满、下一批又触发，形成空转。
+                LOGGER.info("[Zstd] {} 样本数低于门槛（{} < {}）但字节预算已满，仍训练一轮并清空样本环",
                         name, snapshot.size(), minSamples);
-                persist(false);
-                synchronized (this) {
-                    ring.clear();
-                    sampleBytes = 0;
-                    ringFull = false;
-                    savedCount = 0;
-                }
-                return;
             }
 
             LOGGER.info("[Zstd] {} 开始训练: {} 个样本", name, snapshot.size());
