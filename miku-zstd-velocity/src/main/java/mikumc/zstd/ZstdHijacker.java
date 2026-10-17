@@ -452,7 +452,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
 
         // 只有"确实激活成功"才补发；重试 / 回落原版这两条路径已由 activateZstd 自行收尾
         //（见该方法的返回值约定）。
-        if (activateZstd(ctx, mgr, attempt)) {
+        if (activateZstd(ctx, mgr)) {
             releaseHeld(ctx); // zstd 编解码器已就位：补发扣下的包（走 zstd 路径）
         }
     }
@@ -476,7 +476,21 @@ public class ZstdHijacker extends ChannelDuplexHandler {
      * 路径发出去，同时把 {@code holding} 置假——激活窗口的门控就此失效，正是 v4 批量帧
      * 与原版帧混发导致客户端解析错乱的成因。</p>
      */
-    private boolean activateZstd(ChannelHandlerContext ctx, ZstdChannelManager mgr, int attempt) {
+    private boolean activateZstd(ChannelHandlerContext ctx, ZstdChannelManager mgr) {
+        return installHandlers(ctx, mgr, 0);
+    }
+
+    /**
+     * 安装阶段的独立重试循环（预算 {@link #RESPONSE_MAX_RETRIES}，与应答等待阶段互不影响）。
+     *
+     * <p>⚠️ 必须与 {@code tryActivate0} 的 attempt 分开计数：那个 attempt 指的是
+     * "等协商/字典应答等了多少轮"，字典阶段可等 100 轮。若共用，慢链路上进入安装阶段时
+     * attempt 已 > 20，安装重试会被立刻判为耗尽 → 明明锚点马上就好，却直接回落原版。</p>
+     *
+     * @param installAttempt 安装阶段自己的重试序号（首轮 0）
+     * @return 语义同 {@link #activateZstd}：true = 已激活，调用方应补发扣包
+     */
+    private boolean installHandlers(ChannelHandlerContext ctx, ZstdChannelManager mgr, int installAttempt) {
         Channel channel = ctx.channel();
         ChannelPipeline p = channel.pipeline();
 
@@ -513,13 +527,13 @@ public class ZstdHijacker extends ChannelDuplexHandler {
             // 1) 重试——原版压缩处理器是 SetCompression 之后才装的，可能尚未就绪；
             // 2) 重试用尽后必须 releaseHeld——否则 hold 期间扣下的包永不补发，
             //    客户端表现为**连接卡死**（而不是断连），且日志里只有一行 ERROR，极难排查。
-            if (attempt < RESPONSE_MAX_RETRIES) {
-                channel.eventLoop().schedule(() -> tryActivate(ctx, attempt + 1),
+            if (installAttempt < RESPONSE_MAX_RETRIES) {
+                channel.eventLoop().schedule(() -> installHandlers(ctx, mgr, installAttempt + 1),
                         RESPONSE_RETRY_MS, TimeUnit.MILLISECONDS);
                 return false; // 重试期间保持 holding：包必须留到管道定型后再发
             }
             LOGGER.error("[Zstd] zstd handler installation failed after {} attempts; pipeline={}",
-                    attempt, p.names());
+                    installAttempt, p.names());
             releaseHeld(ctx); // 回落原版：把扣住的包按原路径补发
             return false;
         }

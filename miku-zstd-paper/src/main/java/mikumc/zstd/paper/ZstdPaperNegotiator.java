@@ -300,17 +300,33 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
         }
 
 
-        LOGGER.debug("[Zstd] 正在安装 zstd 编解码器 (attempt={}, pipeline={})",
-                attempt, channel.pipeline().names());
-        // ⚠️ 先确认**两端都能替换**再动手（对齐 Velocity 端）：
-        // 若先装编码器、再发现解码器锚点缺失就返回，管道会停在"zstd 出站 / 原版入站"
-        // 的半装状态——客户端会以 zstd 发帧、却按原版解帧，是必然的乱码断连，
-        // 且成因极难定位（两侧日志都显示"激活过"）。
-        // 原版 compress/decompress 由 SetCompression 一次性安装，因此这里检查的是
-        // 同一个前提，只是把判断提前到任何替换动作之前。
+        LOGGER.debug("[Zstd] 正在安装 zstd 编解码器 (pipeline={})", channel.pipeline().names());
+        // 安装阶段走自己的重试循环：与"等协商/字典应答"的 attempt 完全分开计数。
+        // 若共用，慢链路上（字典阶段可等 100 轮）进入安装阶段时 attempt 已 > 20，
+        // 安装重试会被立即判为耗尽 → 锚点明明马上就好，却直接回落原版。
+        installHandlers(ctx, mgr, 0);
+    }
+
+    /**
+     * 安装 zstd 编解码器（独立重试循环，预算 {@link #MAX_RETRIES}）。
+     *
+     * <p>先确认<b>两端都能替换</b>再动手：若先装编码器、再发现解码器锚点缺失就返回，
+     * 管道会停在"zstd 出站 / 原版入站"的半装状态——客户端以 zstd 发帧、却按原版解帧，
+     * 是必然的乱码断连，且两侧日志都显示"激活过"，极难定位。</p>
+     *
+     * <p>原版 compress/decompress 是在 SetCompression 写出<b>之后</b>才安装的，
+     * 所以首轮必然找不到锚点——必须重试，但重试期间要保持 holding，
+     * 否则扣住的包会用尚未定型的路径提前发出去。</p>
+     *
+     * @param installAttempt 安装阶段自己的重试序号（首轮 0）
+     */
+    private void installHandlers(ChannelHandlerContext ctx, ZstdPaperChannelManager mgr, int installAttempt) {
+        Channel channel = ctx.channel();
+        if (!channel.isActive()) return;
+
         if (!mgr.hasEncoderAnchor(channel) || !mgr.hasDecoderAnchor(channel)) {
-            if (attempt < MAX_RETRIES) {
-                channel.eventLoop().schedule(() -> tryActivate(ctx, attempt + 1),
+            if (installAttempt < MAX_RETRIES) {
+                channel.eventLoop().schedule(() -> installHandlers(ctx, mgr, installAttempt + 1),
                         RETRY_MS, TimeUnit.MILLISECONDS);
                 return;
             }
@@ -322,8 +338,8 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
         if (!mgr.installEncoder(channel) || !mgr.installDecoder(channel)) {
             // 锚点已齐备却仍装不上：属异常（例如处理器正被其它插件动态移除）。
             // 同样按重试 / 最终回落处理，绝不留半装管道。
-            if (attempt < MAX_RETRIES) {
-                channel.eventLoop().schedule(() -> tryActivate(ctx, attempt + 1),
+            if (installAttempt < MAX_RETRIES) {
+                channel.eventLoop().schedule(() -> installHandlers(ctx, mgr, installAttempt + 1),
                         RETRY_MS, TimeUnit.MILLISECONDS);
                 return;
             }
