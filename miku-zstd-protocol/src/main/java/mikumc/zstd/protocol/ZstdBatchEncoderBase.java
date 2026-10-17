@@ -80,6 +80,8 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
     private boolean compressing;
     /** 在途压缩任务持有的 promise（仅 event loop 线程读写）；通道关闭时需一并失败化 */
     private List<ChannelPromise> inflightPromises;
+    /** handler 被移除后，异步压缩回调不得再向当前 pipeline 写帧。 */
+    private boolean removed;
 
     /**
      * 独享锁（子类钩子为默认值 {@link #compressLock()} 时使用）。
@@ -186,6 +188,11 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
 
     @Override
     public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) {
+        if (removed) {
+            ReferenceCountUtil.release(msg);
+            promise.tryFailure(new ClosedChannelException());
+            return;
+        }
         if (!(msg instanceof ByteBuf packet)) {
             ctx.write(msg, promise);
             return;
@@ -232,6 +239,12 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
      * 直存路径（小包）仍在 event loop 上完成——它本来就不调用 zstd，多绕一次线程池不划算。
      */
     private void emitBatch(ChannelHandlerContext ctx) {
+        if (removed) {
+            releasePending();
+            failPending(new ClosedChannelException());
+            pendingPromises.clear();
+            return;
+        }
         if (windowTask != null) {
             windowTask.cancel(false);
             windowTask = null;
@@ -246,13 +259,20 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
             return;
         }
 
-        List<ChannelPromise> promises = new ArrayList<>(pendingPromises);
-        pendingPromises.clear();
+        int batchCount = takeFrameBatch();
+        if (batchCount == 0) {
+            if (!removed && !pending.isEmpty()) {
+                schedulePendingBatch(ctx);
+            }
+            return;
+        }
+        List<ByteBuf> batchPackets = new ArrayList<>(pending.subList(0, batchCount));
+        List<ChannelPromise> promises = new ArrayList<>(pendingPromises.subList(0, batchCount));
 
         final int rawTotal;
         final byte[] raw;
         try {
-            rawTotal = concatPending();
+            rawTotal = concatPending(batchPackets);
             raw = batchRaw; // 本批实际使用的缓冲：大帧是临时数组，必须捕获实例传给池线程
             // 立刻摘掉字段引用：此后只有上面这个局部变量持有它。否则大帧（如进服阶段的
             // 注册表帧，几十 MB）会被字段一直留到下一批 —— 刚进服就挂机的连接会白占一份。
@@ -262,11 +282,19 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
             // 分配失败等）。此时 pending 里仍压着已 retain 的 ByteBuf：不在这里释放并清空，
             // 它们永远没人释放（引用计数泄漏），而且下一批会把这批残缺数据一并发出去，
             // 同时让 pendingPromises 与 pending 彻底失去对应关系。
-            releasePending();
+            batchRaw = null; // 失败批次的缓冲也不再被本 handler 引用（大帧可立即回收）
+            pending.subList(0, batchCount).clear();
+            pendingPromises.subList(0, batchCount).clear();
+            releasePackets(batchPackets);
             failAll(promises, t);
             LOGGER.error("[Zstd] encoder batch concat failed", t);
+            if (!removed && !pending.isEmpty()) {
+                schedulePendingBatch(ctx);
+            }
             return;
         }
+        pending.subList(0, batchCount).clear();
+        pendingPromises.subList(0, batchCount).clear();
 
         final boolean withBodyLen = writeBodyLen();
 
@@ -279,6 +307,9 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
             } catch (Throwable t) {
                 failAll(promises, t);
                 LOGGER.error("[Zstd] encoder stored-frame build failed", t);
+            }
+            if (!pending.isEmpty()) {
+                schedulePendingBatch(ctx);
             }
             return;
         }
@@ -326,7 +357,10 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
             compressing = false;
             inflightPromises = null;
 
-            if (failure != null) {
+            if (removed) {
+                failAll(promises, new ClosedChannelException());
+                return;
+            } else if (failure != null) {
                 failAll(promises, failure);
             } else if (!ctx.channel().isActive()) {
                 // 通道已关：结果无处可去，promise 也已由 channelInactive 失败化（tryFailure 幂等）
@@ -350,22 +384,60 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
     }
 
     /** 把 pending 拼成 {@code [varint pktLen][pkt]...}，返回原始总长；随后释放并清空 pending。 */
-    private int concatPending() {
-        int rawTotal = 0;
-        for (ByteBuf b : pending) {
-            rawTotal += ZstdVarInts.length(b.readableBytes()) + b.readableBytes();
+    private int takeFrameBatch() {
+        int maxBytes = maxRawBatchBytes();
+        long batchBytes = 0;
+        int count = 0;
+        while (count < pending.size()) {
+            ByteBuf packet = pending.get(count);
+            int readable = packet.readableBytes();
+            long packetBytes = (long) ZstdVarInts.length(readable) + readable;
+            if (packetBytes > maxBytes) {
+                if (count == 0) {
+                    IllegalArgumentException failure = new IllegalArgumentException(
+                            "packet size " + packetBytes + " exceeds Minecraft frame budget " + maxBytes);
+                    ByteBuf rejected = pending.remove(0);
+                    ChannelPromise promise = pendingPromises.remove(0);
+                    ReferenceCountUtil.release(rejected);
+                    promise.tryFailure(failure);
+                    LOGGER.warn("[Zstd] rejected outbound packet: {}B exceeds frame budget {}B",
+                            packetBytes, maxBytes);
+                    return 0;
+                }
+                break;
+            }
+            if (batchBytes + packetBytes > maxBytes) {
+                break;
+            }
+            batchBytes += packetBytes;
+            count++;
+            if (count >= batchMaxPackets) {
+                break;
+            }
         }
+        return count;
+    }
+
+    private int concatPending(List<ByteBuf> packets) {
+        long rawTotalLong = 0;
+        for (ByteBuf b : packets) {
+            rawTotalLong += (long) ZstdVarInts.length(b.readableBytes()) + b.readableBytes();
+        }
+        if (rawTotalLong > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException("batch raw size exceeds integer range: " + rawTotalLong);
+        }
+        int rawTotal = (int) rawTotalLong;
         final byte[] raw = ensureRawCapacity(rawTotal);
         batchRaw = raw;
         int off = 0;
-        for (ByteBuf b : pending) {
+        for (ByteBuf b : packets) {
             int n = b.readableBytes();
             off = ZstdVarInts.writeTo(raw, off, n);
             b.getBytes(b.readerIndex(), raw, off, n);
             off += n;
         }
         onRawBatch(raw, rawTotal); // 采样（必须在缓冲复用前）
-        releasePending();
+        releasePackets(packets);
         return rawTotal;
     }
 
@@ -429,11 +501,24 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
         return frame;
     }
 
+    private int maxRawBatchBytes() {
+        int outer = writeBodyLen() ? 5 : 0;
+        return ZstdVarInts.MC_MAX_FRAME_BYTES - outer - 5;
+    }
+
+    private void schedulePendingBatch(ChannelHandlerContext ctx) {
+        ctx.executor().execute(() -> emitBatch(ctx));
+    }
+
     private void releasePending() {
-        for (ByteBuf b : pending) {
+        releasePackets(pending);
+        pending.clear();
+    }
+
+    private static void releasePackets(List<ByteBuf> packets) {
+        for (ByteBuf b : packets) {
             ReferenceCountUtil.release(b);
         }
-        pending.clear();
     }
 
     /**
@@ -474,9 +559,12 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
         }
         // 只有「通道还在、且没有在途压缩任务占用每连接的缓冲」时才有可能补发；
         // 有在途任务时 emitBatch 会直接返回（见那里的说明），于是下面必须自己收尾。
+        // ⚠️ 补发必须在置 removed 之前：emitBatch 见到 removed 会直接丢弃残留，
+        // 若先置位，这段补发就成了永远不会生效的死代码。
         if (!pending.isEmpty() && !compressing && ctx.channel().isActive()) {
             emitBatch(ctx); // 处理器被移除前把残留数据送出去，避免丢包
         }
+        removed = true;
         // ⚠️ 没能补发的残留必须在这里处理干净：本处理器已被移除，emitBatch 的
         //「等压缩回来再发」那条路径不会再走回来，留下的是永不完成的 promise 与永不释放的缓冲
         //（后者是 ReferenceCounted，扣在 pending 里没人替我们 release）。
@@ -486,6 +574,8 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
         }
         pendingPromises.clear();
         failInflight(new ClosedChannelException());
+        inflightPromises = null;
+        compressing = false;
     }
 
     @Override
