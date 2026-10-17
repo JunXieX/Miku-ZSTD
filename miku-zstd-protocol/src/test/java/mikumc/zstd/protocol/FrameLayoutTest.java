@@ -261,6 +261,74 @@ class FrameLayoutTest {
         ch.finishAndReleaseAll();
     }
 
+    @Test
+    @DisplayName("编码器移除后：在途压缩回调不得向仍活跃的 pipeline 写出帧")
+    void removedEncoderDoesNotWriteInflightFrame() throws InterruptedException {
+        TestEncoder encoder = new TestEncoder(true, 0 /* 一律压缩 */, 1);
+        EmbeddedChannel ch = new EmbeddedChannel(encoder);
+
+        io.netty.channel.ChannelFuture writeFuture;
+        synchronized (encoder.lock) {
+            writeFuture = ch.write(packet(repetitive(4096)));
+            ch.flush();
+            // 持锁期间提交压缩任务：池线程必然阻塞在 lock 上，此时移除 handler
+            // 才确定覆盖「压缩已在途、回调尚未回到 event loop」这一竞态。
+            ch.pipeline().remove(encoder);
+        }
+
+        long deadline = System.currentTimeMillis() + 3000;
+        while (!writeFuture.isDone() && System.currentTimeMillis() < deadline) {
+            ch.runPendingTasks();
+            Thread.sleep(2);
+        }
+        // handlerRemoved 已失败化 promise，但池线程此刻可能仍在压缩（或正阻塞在这把锁上）。
+        // 拿一次锁并 markClosed：若任务尚未进入压缩，它会读到标志直接放弃；若正在压缩，
+        // 这里会等它结束。两种顺序下 @AfterEach 关闭 native 上下文都不会踩到 use-after-free。
+        synchronized (encoder.lock) {
+            encoder.lock.markClosed();
+        }
+        ch.runPendingTasks();
+
+        assertTrue(writeFuture.isDone(), "handlerRemoved 必须完成在途 promise");
+        assertFalse(writeFuture.isSuccess(), "被移除 handler 持有的写必须失败");
+        assertTrue(encoder.frames.isEmpty(), "handler 移除后不允许迟到的压缩帧写入 pipeline");
+        assertNull(readFrame(ch), "不应有迟到的出站帧");
+        ch.finishAndReleaseAll();
+    }
+
+    @Test
+    @DisplayName("编码器按包边界拆分批次，避免超过 MC 21-bit 外层帧上限")
+    void splitsBatchesAtFrameBudget() throws InterruptedException {
+        // 用真实生产预算（无需测试钩子）：单个包 ~1.1MB 合法，两个合起来
+        // （2,200,008B）必然突破 2,097,141B 的 raw 预算，因此必须拆成两帧。
+        // 若拆分逻辑失效，它们会被塞进同一帧 —— 帧数 1，且外层长度超出 21-bit 上限。
+        final int payload = 1_100_000;
+        // 两个包就攒满 max_packets → 立即成帧，正好在成帧点验证预算拆分
+        TestEncoder encoder = new TestEncoder(true, Integer.MAX_VALUE, 2);
+        EmbeddedChannel ch = new EmbeddedChannel(encoder);
+        ch.write(packet(new byte[payload]));
+        ch.write(packet(new byte[payload]));
+        long deadline = System.currentTimeMillis() + 3000;
+        while (encoder.frames.size() < 2 && System.currentTimeMillis() < deadline) {
+            ch.runPendingTasks();
+            Thread.sleep(1);
+        }
+
+        int frames = 0;
+        ByteBuf frame;
+        while ((frame = readFrame(ch)) != null) {
+            frames++;
+            assertTrue(frame.readableBytes() <= ZstdVarInts.MC_MAX_FRAME_BYTES,
+                    "每帧都必须处于 MC 21-bit 外层长度上限内");
+            frame.release();
+        }
+        assertEquals(2, frames, "超出字节预算的包必须另起一帧，而不是合并");
+        int perPacket = payload + 1 + ZstdVarInts.length(payload + 1);
+        assertEquals(2 * (1 + perPacket), encoder.frames.stream().mapToInt(v -> v[0]).sum(),
+                "两帧各自的 rawSize 字段都要计入");
+        ch.finishAndReleaseAll();
+    }
+
     // ────────────────────────────────────────────────────────────────
     // 畸形输入：一律 fail-fast（关连接），绝不放行
     // ────────────────────────────────────────────────────────────────
@@ -603,9 +671,7 @@ class FrameLayoutTest {
         boolean lastCompressed;
         int lastRaw;
         int lastWire;
-
-        /** 本测试专用编码器的锁（与默认 {@code compressLock()} 同一实例），供生命周期用例置位。 */
-        final ZstdCompressLock lock = compressLock();
+        final ZstdCompressLock lock = new ZstdCompressLock();
 
         TestEncoder(boolean bodyLen, int skip, int maxPackets) {
             this.bodyLen = bodyLen;
@@ -616,6 +682,11 @@ class FrameLayoutTest {
         @Override
         protected ZstdCompressCtx resolveCompressContext(ChannelHandlerContext ctx) {
             return compressCtx;
+        }
+
+        @Override
+        protected ZstdCompressLock compressLock() {
+            return lock;
         }
 
         @Override
