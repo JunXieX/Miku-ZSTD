@@ -62,6 +62,24 @@ public class ZstdNegotiateAnswerSniffer extends MessageToMessageDecoder<ByteBuf>
     /** 应答包 id：login 阶段 C→S 的 custom query answer */
     private static final int PACKET_ID_ANSWER = 0x02;
 
+    /**
+     * 可能被当成"应答帧"来解析的<b>最大帧长</b>。超过此长度的帧一律不做解析。
+     *
+     * <p>⚠️ 这不是为了省一次判断，而是为了堵住一条<b>无上限的热路径开销</b>：
+     * {@link #asRawPacket} 在"裸帧 / 直存帧"分支里会 {@code new byte[len]} 把<b>整帧</b>拷出来。
+     * 而本嗅探器的帧数上限在「等待字典应答」期间是<b>刻意关闭</b>的（见 {@link #decode}），
+     * 于是只要出现"服务端推了 {@code zstd:dict}、客户端始终没回"的连接
+     * （模组处理字典时崩了、应答丢了、或客户端根本不认识这个查询却仍连着），
+     * 本嗅探器就会<b>永久驻留</b>，对进入 play 阶段后的<b>每一个入站帧</b>都做一次全帧拷贝
+     * ——区块帧动辄几百 KB，等于给这条连接的每个包都加一次同尺寸分配。</p>
+     *
+     * <p>取 4096 的依据：登录查询应答只有几字节（{@code [0x02][varint txId][bool][varint][varint]}），
+     * 即使被原版压缩帧或 zstd 直存帧包一层也只有十几字节；留出充足余量以兼容
+     * "客户端已切 zstd、应答与其它包合批在同一帧"的极端时序。而 play 阶段的区块/地图数据帧
+     * 远大于此值，会被这条判断直接挡在 {@code asRawPacket} 之外。</p>
+     */
+    private static final int MAX_ANSWER_FRAME_BYTES = 4096;
+
     private int framesChecked;
 
     @Override
@@ -112,6 +130,11 @@ public class ZstdNegotiateAnswerSniffer extends MessageToMessageDecoder<ByteBuf>
         int negotiateTxId = mgr.getNegotiateTxId();
         int dictTxId = mgr.getDictTxId();
         if (negotiateTxId <= 0 && dictTxId <= 0) return false;
+
+        // ⚠️ 必须在 asRawPacket 之前挡住大帧：那个方法对"裸帧 / 直存帧"分支会整帧拷贝。
+        // 详见 MAX_ANSWER_FRAME_BYTES 的注释（等待字典应答期间本嗅探器会长期驻留）。
+        int readable = in.writerIndex() - in.readerIndex();
+        if (readable > MAX_ANSWER_FRAME_BYTES) return false;
 
         byte[] packet = asRawPacket(in);
         if (packet == null || packet.length < 3) return false;

@@ -16,6 +16,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -282,7 +283,14 @@ public final class ZstdPaperTrainer {
             training.set(false);
             return;
         }
-        te.execute(this::trainAndAdopt);
+        // ⚠️ 提交被拒（执行器已 shutdown，关服 / 插件停用时）必须复位 training：
+        // 否则 trainAndAdopt 的 finally 永不执行，标志卡在 true，此后所有训练请求
+        // 都被"already in progress"挡掉 —— 字典机制静默失效（与 Velocity 端同一处修正）。
+        try {
+            te.execute(this::trainAndAdopt);
+        } catch (RejectedExecutionException e) {
+            training.set(false);
+        }
     }
 
     private void trainAndAdopt() {

@@ -374,6 +374,20 @@ class FrameLayoutTest {
     }
 
     @Test
+    @DisplayName("拒绝：直存帧内层 pktLen 超过 32MB 上限（走 INVALID 而非整数溢出）")
+    void rejectStoredInnerLengthOverMax() {
+        // 直存帧的内层 pktLen 由 tryRead 以 DEFAULT_MAX_VALUE（32MB）为上限，
+        // 因此 0x7FFFFFFF 会被直接判成 INVALID 并干净拒绝 —— 这条路径**不存在** int 溢出
+        //（压缩帧那一侧用的是不设上限的 readAt，才需要 long 相加，见下一个用例）。
+        // 本用例钉死这一差异，避免日后有人"顺手"把两侧改成同一套判据而引入回归。
+        ByteBuf frame = Unpooled.buffer();
+        ZstdVarInts.write(frame, 0);                  // rawSize = 0 → 直存帧
+        ZstdVarInts.write(frame, Integer.MAX_VALUE);  // 内层 pktLen = 0x7FFFFFFF > 32MB
+        frame.writeBytes(ascii("short"));
+        assertRejected(frame);
+    }
+
+    @Test
     @DisplayName("拒绝：压缩帧解压后内层 pktLen 巨大（0x7FFFFFFF，整数溢出回归用例）")
     void rejectCompressedInnerLengthOverflow() {
         // 回归用例（S1 同型缺陷）：解压后的负载内层声明约 2GB。若越界判定用 int 相加，

@@ -259,6 +259,10 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
                 return;
             }
             consumed += in.readerIndex() - before;
+            // 注：这里的 pktLen 由 tryRead 以 DEFAULT_MAX_VALUE（32MB）为上限，
+            // 因此 consumed + pktLen 不可能 int 溢出，无需 long 相加。
+            // 压缩帧那一侧（splitAndEmit(byte[])）用的是不设上限的 readAt，
+            // pktLen 可达 2^31-1，所以那里必须用 long —— 两侧的差别是有意的。
             if (consumed + pktLen > total) {
                 protocolError(ctx, "inner packet length " + pktLen + " overruns frame ("
                         + consumed + "+" + pktLen + " > " + total + ")");

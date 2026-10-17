@@ -38,6 +38,17 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
     private static final long RETRY_MS = 100;
     private static final int MAX_RETRIES = 20;
 
+    /**
+     * 「已推送 {@code zstd:dict}、正在等其应答」阶段的重试次数（合计约 10s）。
+     *
+     * <p>⚠️ 不能沿用上面的 2s：字典阶段要传输的是字典字节（两个方向各最多
+     * {@code dict_max_bytes}，默认 128KB / 配置上限 1MB），客户端还要做 CRC32 校验并构建
+     * 原生字典对象。慢链路下这会超过 2s，于是本端超时回落原版、而客户端字典已装载
+     * 并照常切 zstd —— 形成「服务端 zlib / 客户端 zstd」的必断连组合。
+     * 详见 Velocity 端同名常量的完整推理（两端必须一致）。</p>
+     */
+    private static final int DICT_MAX_RETRIES = 100;
+
     private boolean holding;
     private final List<Object> heldPackets = new ArrayList<>();
     private final List<ChannelPromise> heldPromises = new ArrayList<>();
@@ -240,9 +251,14 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
         if (mgr == null || mgr.isReplaced()) return;
 
         if (!mgr.isResponseReceived()) {
-            if (attempt >= MAX_RETRIES) {
+            // ⚠️ 预算必须分阶段：等"协商应答"只要一个 RTT（2s 足够），而等"字典应答"要传完
+            // 字典字节 + 客户端建好原生字典对象，慢链路上远超 2s。用同一个预算会在慢链路
+            // 上超时回落，而客户端那边字典已到、照常切 zstd → 单侧 zstd → 断连。
+            // 详见 DICT_MAX_RETRIES 的注释。
+            int maxRetries = mgr.isDictRequested() ? DICT_MAX_RETRIES : MAX_RETRIES;
+            if (attempt >= maxRetries) {
                 LOGGER.warn("[Zstd] no negotiate response within {}ms — staying vanilla",
-                        RETRY_MS * MAX_RETRIES);
+                        RETRY_MS * maxRetries);
                 finishVanilla(ctx); // 明确回落：补发扣包并自移除
                 return;
             }
@@ -353,19 +369,45 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
 
     @Override
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+        releaseHeldOnTeardown();
+        super.channelInactive(ctx);
+    }
+
+    /**
+     * 本处理器被<b>外部</b>从管线摘除时的收尾（插件停用 / 重载会走这条路）。
+     *
+     * <p>⚠️ 这是 {@code channelInactive} 之外<b>另一条</b>独立的销毁路径：
+     * {@code MikuZstdPaper#uninstallHook} 会遍历在线连接、直接
+     * {@code pipeline.remove("miku-zstd-negotiator")}。若这条连接此刻正处在激活窗口内
+     * （{@code holding == true}，扣着若干包与 promise），而通道<b>仍然活着</b>，
+     * 那么 {@code channelInactive} 永远不会触发 —— 扣住的包没人 release（引用计数泄漏，
+     * Netty leak detector 会报 LEAK），promise 也没人完成（上游 future 永久挂起）。</p>
+     *
+     * <p>所以两条销毁路径必须共用同一份收尾逻辑，且都要幂等。</p>
+     */
+    @Override
+    public void handlerRemoved(ChannelHandlerContext ctx) throws Exception {
+        releaseHeldOnTeardown();
+        super.handlerRemoved(ctx);
+    }
+
+    /** 销毁收尾（幂等）：释放扣住的包并失败化其 promise。列表清空后重复调用无副作用。 */
+    private void releaseHeldOnTeardown() {
         holding = false;
         // ⚠️ 先把包本身 release 掉：它们是 ReferenceCounted 的（内部持有 ByteBuf），
         // 扣下时所有权已转到本处理器；既然永远不会被写出，就没有别人替我们释放。
-        // 少了这一步，每次"激活窗口内断线"都会泄漏一批（Netty leak detector 会报 LEAK）。
         for (Object p : heldPackets) {
             io.netty.util.ReferenceCountUtil.release(p);
         }
         heldPackets.clear();
-        for (ChannelPromise p : heldPromises) {
-            p.tryFailure(new java.nio.channels.ClosedChannelException());
+        if (!heldPromises.isEmpty()) {
+            LOGGER.debug("[Zstd] negotiator torn down with {} held packet(s) — failing their promises",
+                    heldPromises.size());
+            for (ChannelPromise p : heldPromises) {
+                p.tryFailure(new java.nio.channels.ClosedChannelException());
+            }
+            heldPromises.clear();
         }
-        heldPromises.clear();
-        super.channelInactive(ctx);
     }
 
     /**

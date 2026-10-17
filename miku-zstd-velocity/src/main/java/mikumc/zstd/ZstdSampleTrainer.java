@@ -17,6 +17,7 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -127,11 +128,20 @@ public class ZstdSampleTrainer {
             ZstdSampleTrainer enc = encoderInstance;
             ZstdSampleTrainer dec = decoderInstance;
             ExecutorService te = trainExecutor;
-            if (te == null) return;
-            te.execute(() -> {
-                if (enc != null) enc.appendUnsavedSamplesToHistory();
-                if (dec != null) dec.appendUnsavedSamplesToHistory();
-            });
+            // ⚠️ 必须判 isShutdown：scheduleWithFixedDelay 的任务一旦抛出异常，
+            // 后续所有周期执行都会被静默取消。关服时 autoSaveExecutor 与 trainExecutor
+            // 的关闭顺序无法保证，若在此刻向已关闭的 trainExecutor 投递任务，
+            // RejectedExecutionException 会让这个定时任务永久停摆（虽然此时已在关服，
+            // 但同一进程内若只是插件重载，autosave 就真的不再工作了）。
+            if (te == null || te.isShutdown()) return;
+            try {
+                te.execute(() -> {
+                    if (enc != null) enc.appendUnsavedSamplesToHistory();
+                    if (dec != null) dec.appendUnsavedSamplesToHistory();
+                });
+            } catch (RejectedExecutionException ignored) {
+                // 执行器刚好在此刻关闭：本次归档放弃，shutdown() 里还有一次最终落盘
+            }
         }, 5, 5, TimeUnit.MINUTES);
     }
 
@@ -261,7 +271,16 @@ public class ZstdSampleTrainer {
         synchronized (this) {
             lastTrainTime = System.currentTimeMillis();
         }
-        te.execute(this::trainAndAdopt);
+        // ⚠️ 提交失败必须把 training 复位：执行器已 shutdown（关服 / 插件停用）时
+        // execute 会抛 RejectedExecutionException，而 trainAndAdopt 的 finally 永不执行 ——
+        // training 就此卡在 true，此后**所有**训练请求（含自动触发）都被"already in progress"挡掉，
+        // 字典机制静默失效。这类"标志位只在成功路径复位"的缺陷不会报错，只会让功能悄悄死掉。
+        try {
+            te.execute(this::trainAndAdopt);
+        } catch (RejectedExecutionException e) {
+            training.set(false);
+            LOGGER.debug("[Zstd] {} training not submitted (executor shut down)", name);
+        }
     }
 
     /**
@@ -347,7 +366,12 @@ public class ZstdSampleTrainer {
             training.set(false);
             return;
         }
-        te.execute(this::trainAndAdopt);
+        // 同 forceTrain：提交被拒（执行器已 shutdown）时必须复位标志，否则训练永久卡死
+        try {
+            te.execute(this::trainAndAdopt);
+        } catch (RejectedExecutionException e) {
+            training.set(false);
+        }
     }
 
     /**

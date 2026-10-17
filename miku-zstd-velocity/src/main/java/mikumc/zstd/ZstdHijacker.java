@@ -128,6 +128,29 @@ public class ZstdHijacker extends ChannelDuplexHandler {
     private static final int RESPONSE_MAX_RETRIES = 20;
 
     /**
+     * 「已推送 {@code zstd:dict}、正在等其应答」阶段的重试次数（合计约 10s）。
+     *
+     * <p>⚠️ 这一阶段<b>不能</b>沿用上面那个 2s 预算，否则会产出一个<b>必断连</b>组合，
+     * 而不是安全回落：</p>
+     * <ol>
+     *   <li>两个阶段共用同一个 {@code attempt} 计数器（从 SetCompression 写出时开始累加），
+     *       协商应答本身就要吃掉一个 RTT；</li>
+     *   <li>字典阶段要传输的是<b>字典字节</b>——两个方向各最多 {@code dict_max_bytes}
+     *       （默认 128KB、配置上限 1MB，即最多 2MB），客户端还要做 CRC32 校验并构建
+     *       {@code ZstdDictCompress/Decompress}（实测约 3.2MB 的原生预计算）；</li>
+     *   <li>慢链路（移动网络 / 跨境 / 拥塞）下 256KB 就可能超过剩余的 1~2s。</li>
+     * </ol>
+     * <p>一旦超时，本端按"回落原版"补发扣住的包并保持 vanilla zlib；而客户端那边
+     * <b>字典已经装载成功</b>，它会在应答写出后照常切到 zstd —— 于是形成
+     * 「服务端 zlib / 客户端 zstd」，双向都解析错乱、必然断连。
+     * 这与本项目到处防范的那类缺陷完全同型，只是触发条件从"逻辑漏判"变成了"预算不够"。</p>
+     *
+     * <p>取 10s 的取舍：足以让 2MB 字典在约 200KB/s 的慢链路上跑完；同时它有界，
+     * 真正死掉的连接最多让登录卡 10s 后回落原版，不会无限期挂住。</p>
+     */
+    private static final int DICT_RESPONSE_MAX_RETRIES = 100;
+
+    /**
      * 取"发送登录期查询包"的写入位置：<b>只能用 {@code minecraft-encoder} 的 context</b>。
      *
      * <p>⚠️ 这里曾经优先用 {@code compression-encoder} 的 context（还在其上手工拼 MC 压缩帧）。
@@ -388,13 +411,18 @@ public class ZstdHijacker extends ChannelDuplexHandler {
         if (mgr == null || mgr.isReplaced()) return;
 
         if (!mgr.isDictResponseReceived()) {
-            if (attempt >= RESPONSE_MAX_RETRIES) {
+            // ⚠️ 预算必须分阶段：等"协商应答"只要一个 RTT（2s 足够），而等"字典应答"
+            // 要传完字典字节 + 客户端建好原生字典（最多 2MB，慢链路上远超 2s）。
+            // 用同一个 2s 预算会在慢链路上超时回落，而客户端那边字典已到、照常切 zstd
+            // → 单侧 zstd → 断连。详见 DICT_RESPONSE_MAX_RETRIES 的注释。
+            int maxRetries = mgr.isDictRequested() ? DICT_RESPONSE_MAX_RETRIES : RESPONSE_MAX_RETRIES;
+            if (attempt >= maxRetries) {
                 // ⚠️ 这句日志必须能自证"卡在哪一步"：只写"超时"无法区分
                 //「协商应答就没收到」与「协商应答收到了、字典也推了，但字典应答没回来」，
                 // 而两者的排查方向完全相反（前者看客户端有没有收到查询，后者看推送有没有被接受）。
                 LOGGER.warn("[Zstd] Negotiate response not received after {}ms — skipping zstd (vanilla fallback)"
                                 + "（字典已请求={} 字典已确认={}；字典已请求=false 表示连协商应答都没收到）",
-                        RESPONSE_RETRY_MS * RESPONSE_MAX_RETRIES,
+                        RESPONSE_RETRY_MS * maxRetries,
                         mgr.isDictRequested(), mgr.isDictConfirmed());
                 releaseHeld(ctx); // 回落原版：补发扣下的包（原版压缩编码器仍在位）
                 return;

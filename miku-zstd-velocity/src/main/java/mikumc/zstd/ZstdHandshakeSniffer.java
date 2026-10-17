@@ -128,6 +128,15 @@ public class ZstdHandshakeSniffer extends MessageToMessageDecoder<ByteBuf> {
      * 旧实现用 {@code ByteBuffer} 的 {@code position()+hostLen} 与 {@code getShort()}，
      * 越界只靠抛异常再兜住，读起来看不出"哪些情况算非法"。解析失败返回 null，
      * 调用方必须保守处理（不可当作登录连接）。</p>
+     *
+     * <p>⚠️ <b>hostLen 的边界判定必须用 long 相加</b>：hostLen 来自<b>未认证的远程客户端</b>，
+     * 取值可达 {@code Integer.MAX_VALUE}（5 字节 varint 的最大正值）。若按 int 相加，
+     * {@code cursor + hostLen + 2} 会溢出成负数，于是"越界"这一判定<b>恒为假</b>——
+     * 检查形同虚设，紧接着 {@code cursor += hostLen} 把游标推成负值，
+     * 下一次 {@code readOr} 就以负下标读数组，在 netty event loop 上抛
+     * {@code ArrayIndexOutOfBoundsException}。这与本项目在解码器基类、两个训练器里
+     * 已修掉的三处同型缺陷是同一类（那三处都写了 {@code cursor[0] + (long) pktLen}），
+     * 本处曾是漏网的第四个。</p>
      */
     private static Integer parseHandshakeNextState(byte[] data) {
         int[] cursor = {0};
@@ -137,7 +146,8 @@ public class ZstdHandshakeSniffer extends MessageToMessageDecoder<ByteBuf> {
         }
         ZstdVarInts.readOr(data, cursor, ZstdVarInts.INVALID); // protocolVersion（不关心）
         int hostLen = ZstdVarInts.readOr(data, cursor, ZstdVarInts.INVALID);
-        if (hostLen < 0 || cursor[0] + hostLen + 2 > data.length) {
+        // readOr 对 5 字节 varint 可能返回负值（高位溢出），一律按非法处理
+        if (hostLen < 0 || (long) cursor[0] + hostLen + 2L > data.length) {
             return null; // host 或 port 越界
         }
         cursor[0] += hostLen; // host

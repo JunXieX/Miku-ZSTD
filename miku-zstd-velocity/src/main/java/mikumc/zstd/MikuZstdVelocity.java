@@ -153,7 +153,10 @@ public class MikuZstdVelocity {
         // 嗅探器（若已安装）会在 login 处理前同步完成注入；此处仅作兜底与日志。
         Channel channel = extractChannel(inbound);
         if (channel != null && channel.attr(ZstdChannelManager.KEY).get() != null) {
-            logger.info("[Zstd] Connection already negotiated by sniffer: {}",
+            // ⚠️ 必须是 debug：这条路径是**每个 zstd 客户端每次进服都会命中**的正常流程，
+            // 用 INFO 会让服务器日志被"每人一行"刷满（200 人在线就是 200 行噪音），
+            // 而它本身不携带任何需要人工介入的信息 —— 真正值得 INFO 的是激活成功那一行。
+            logger.debug("[Zstd] Connection already negotiated by sniffer: {}",
                     inbound.getRawVirtualHost().orElse(""));
             return;
         }
@@ -178,6 +181,18 @@ public class MikuZstdVelocity {
         channel.eventLoop().execute(() -> {
             if (!channel.isActive()) return;
             try {
+                // ⚠️ 帧层应答嗅探器也必须装上：它<b>只</b>由握手嗅探器安装
+                //（见 ZstdHandshakeSniffer#decode），而本兜底路径恰恰是"握手嗅探器没生效"
+                // 时才会走到（典型场景：installHandshakeSniffer 的反射失败）。
+                // 少了它，离线模式代理下协商应答永远回填不上 —— 应答在客户端发出时还是裸帧，
+                // 而服务端此刻已装好原版 compression-decoder，会把它当压缩帧解析并丢弃，
+                // 包层的 ZstdHijacker 根本看不到这个包，于是 2 秒后静默回落原版
+                //（不断连，但 zstd 完全不生效，且日志里只有一行超时 WARN）。
+                if (channel.pipeline().get("zstd-negotiate-answer") == null
+                        && channel.pipeline().get("frame-decoder") != null) {
+                    channel.pipeline().addAfter("frame-decoder", "zstd-negotiate-answer",
+                            new ZstdNegotiateAnswerSniffer());
+                }
                 if (channel.pipeline().get("zstd_outbound_spy") == null
                         && channel.pipeline().get("handler") != null) {
                     channel.pipeline().addBefore("handler", "zstd_outbound_spy", new ZstdHijacker());
