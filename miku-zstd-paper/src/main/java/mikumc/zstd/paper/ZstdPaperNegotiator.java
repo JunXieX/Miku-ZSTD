@@ -101,7 +101,10 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
         //   并回落原版：<b>凡是需要字典的客户端在 Paper 端永远用不上 zstd</b>。
         //   真正的去重判据是下面的 txId 匹配（dictTxId 未设置时为 -1，不会误命中）；
         //   激活成功后协商器会自移除，也不会留下长期开销。
-        if (mgr != null && msg != null) {
+        // ⚠️ 但必须保留「尚未发起协商就整段跳过」：否则回落原版的连接上，
+        //   本处理器会对**每一个**入站包做 getSimpleName + 字段反射读取，
+        //   是每条原版连接都要永久支付的税（negotiateTxId 为 -1 时不可能命中任何应答）。
+        if (mgr != null && msg != null && mgr.getNegotiateTxId() != -1) {
             String cn = msg.getClass().getSimpleName();
             if (cn.contains("Query") || cn.contains("Plugin")) {
                 int tx = readInt(msg, "transactionId", "id", "transactionID");
@@ -270,7 +273,9 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
             tryActivate0(ctx, attempt);
         } catch (Throwable t) {
             LOGGER.error("[Zstd] 激活流程异常（attempt={}）", attempt, t);
-            releaseHeld(ctx);
+            // ⚠️ 必须走 finishVanilla（补发 + 自移除）：只 releaseHeld 会让协商器
+            // 永久留在入站/出站热路径上，对每个包继续做字符串判定并持有旧类加载器。
+            finishVanilla(ctx);
         }
     }
 

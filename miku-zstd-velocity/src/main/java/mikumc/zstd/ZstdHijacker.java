@@ -243,6 +243,10 @@ public class ZstdHijacker extends ChannelDuplexHandler {
                             // 不要白等满 10 秒的字典阶段预算。
                             LOGGER.warn("[Zstd] zstd:dict 未能发出 — 立即回落原版");
                             releaseHeld(ctx);
+                            // 回落即收尾：不摘掉自身就会永久留在每个出站包的热路径上。
+                            if (ctx.pipeline().get(ZstdHijacker.class) != null) {
+                                ctx.pipeline().remove(this);
+                            }
                             return;
                         }
                     } else {
@@ -425,6 +429,12 @@ public class ZstdHijacker extends ChannelDuplexHandler {
             LOGGER.error("[Zstd] activation flow failed (attempt={}) — releasing held packets, staying vanilla",
                     attempt, t);
             releaseHeld(ctx);
+            // ⚠️ 同时摘掉自身：本端与 Paper 不同，回落分支若不显式移除，处理器就会
+            // 永久留在每个出站包的热路径上（write 里每次都做 attr 查询与 SetCompression 判定），
+            // 并持续持有本插件的类加载器。
+            if (ctx.pipeline().get(ZstdHijacker.class) != null) {
+                ctx.pipeline().remove(this);
+            }
         }
     }
 
