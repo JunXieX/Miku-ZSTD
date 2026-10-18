@@ -147,6 +147,10 @@ public class ZstdChannelManager {
      * 单机测试完全复现不到。</p>
      *
      * <p>zstd 的 {@code loadDict} 没有"卸载字典"接口，只能用新建上下文来清空。</p>
+     *
+     * <p>⚠️ 与压缩任务共用同一把锁：压缩跑在池线程上，若这里直接 close 上下文，
+     * 在途压缩就会写到已释放的原生内存（SIGSEGV）。解压侧只在 event loop 上跑，
+     * 而本方法在登录回调（也在 event loop）上执行，天然串行。</p>
      */
     public void resetDicts() {
         synchronized (compressLock) {

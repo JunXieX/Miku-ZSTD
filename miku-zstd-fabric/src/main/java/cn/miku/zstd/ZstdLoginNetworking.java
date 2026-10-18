@@ -59,6 +59,15 @@ public final class ZstdLoginNetworking {
             Connection connection = ((ClientHandshakePacketListenerAccessor) handler).getConnection();
             Channel channel = ((ConnectionAccessor) connection).getChannel();
 
+            // ⚠️ 必须在解析版本之前就清掉上一轮残留的字典：这条连接可能是重放登录流程
+            // （ViaFabricPlus 协议切换 / 重连到另一台服务器）。若新服务端版本不匹配、
+            // 直接回落原版，旧上下文里的字典不会有人再用——但若不清，下一次协商
+            // （同一条 Channel）就会带着它，形成"本端带字典、对端无字典"的必断连组合。
+            ZstdChannelManager existing = channel.attr(ZstdChannelManager.KEY).get();
+            if (existing != null) {
+                existing.resetDicts();
+            }
+
             int protocolVersion = data.readInt();
             if (protocolVersion != ZstdChannelManager.PROTOCOL_VERSION) {
                 LOGGER.error("[Zstd] Protocol version mismatch: server={}, client={} \u2014 staying vanilla",
@@ -69,8 +78,6 @@ public final class ZstdLoginNetworking {
             long decoderDictId = data.readLong();
             data.readByte(); // flags：v4 不再据此判断是否内联字节，仅保留字段以兼容读取
 
-            ZstdChannelManager existing = channel.attr(ZstdChannelManager.KEY).get();
-            boolean reused = existing != null;
             if (existing == null) {
                 existing = new ZstdChannelManager();
                 channel.attr(ZstdChannelManager.KEY).set(existing);
@@ -78,15 +85,6 @@ public final class ZstdLoginNetworking {
                 channel.closeFuture().addListener(f -> toClose.close());
             }
             final ZstdChannelManager mgr = existing;
-
-            // ⚠️ 复用已有 manager 时，先清空上一轮残留的字典：同一条 Channel 可能被
-            // 重放登录流程（ViaFabricPlus 协议切换 / 重连到另一台服务器）。若新服务端
-            // 某个方向 dictId=0，resolve() 会直接返回 READY，而上下文里仍装着旧字典 ——
-            // 于是本端带字典压缩、对端无字典解压（或反向），必然断连。
-            // 新建的 manager 本来就是空上下文，跳过以免白做一次原生分配。
-            if (reused) {
-                mgr.resetDicts();
-            }
 
             // 每个方向：READY = 已就绪（无需字典或本地已缓存），NEED_DICT = 需要服务端推送
             byte encoderStatus = resolve(mgr, encoderDictId, true);
