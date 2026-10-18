@@ -364,6 +364,36 @@ class FrameLayoutTest {
         ch.finishAndReleaseAll();
     }
 
+    @Test
+    @DisplayName("批次拆分后仍能正常工作：拆分出的多帧顺序与内容都不丢")
+    void splitBatchesPreserveOrderAndContent() {
+        // 与 splitsBatchesAtFrameBudget 互补：那条验证"必须拆开"，这条验证
+        // "拆开之后内容与顺序仍然正确"（拆分逻辑直接操作 pending 下标，最容易错位）。
+        final int payload = 1_100_000;
+        TestEncoder encoder = new TestEncoder(true, Integer.MAX_VALUE, 8);
+        EmbeddedChannel ch = new EmbeddedChannel(encoder);
+        EmbeddedChannel in = new EmbeddedChannel(new TestDecoder(decompressCtx));
+        ch.write(packet(repetitive(payload)));
+        ch.write(packet(ascii("tail-packet")));
+        ch.flush();
+        ch.runPendingTasks();
+
+        int frames = 0;
+        List<byte[]> got = new ArrayList<>();
+        ByteBuf frame;
+        while ((frame = readFrame(ch)) != null) {
+            frames++;
+            feed(in, frame);
+            got.addAll(drainInbound(in));
+        }
+        assertTrue(frames >= 2, "大包 + 小包应至少拆成两帧，实际 " + frames);
+        assertEquals(2, got.size(), "拆批不得丢包或重复：" + got.size());
+        assertEquals(payload + 1, got.get(0).length, "第 1 个包应是那个大包");
+        assertArrayEquals(fullPacket(ascii("tail-packet")), got.get(1), "第 2 个包内容必须正确");
+        in.finishAndReleaseAll();
+        ch.finishAndReleaseAll();
+    }
+
     // ────────────────────────────────────────────────────────────────
     // 畸形输入：一律 fail-fast（关连接），绝不放行
     // ────────────────────────────────────────────────────────────────
