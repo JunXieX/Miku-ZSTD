@@ -243,7 +243,11 @@ public class ZstdPaperConfig {
                       # 训练出的字典大小上限（字节），默认 128KB
                       dict_max_bytes: 131072
 
-                      # 单轮训练的目标样本总量（字节）
+                      # 单轮训练的目标样本总量（字节）。
+                      # 注意：这个预算只有在样本数已达 min_samples 后才会真正封环 ——
+                      # 样本数不足时会让环继续增长（上限由 max_samples 兜住），
+                      # 否则真实流量下"1MB / 几 KB 平均包长 = 仅几百个样本"，
+                      # 每轮都会在远低于 min_samples 的状态下训练，字典质量长期偏低。
                       sample_target_bytes: 1048576
 
                       # 跨重启保留的历史样本上限
