@@ -547,7 +547,10 @@ public class ZstdHijacker extends ChannelDuplexHandler {
         if (mgr.isDictConfirmed()) {
             mgr.loadTrainerDicts();
         } else {
-            LOGGER.info("[Zstd] Activating without trained dicts (client not ready) — compression still active");
+            // ⚠️ 不能在这里排除"无字典"：没有字典时协商少了一轮字典往返，服务端往往
+            // 在客户端还没处理到 SetCompression 时就已激活——原版帧会晚到几个包，
+            // 正是基类 acceptsLegacyFrames 兜住的切换窗口。debug 即可，这是正常路径。
+            LOGGER.debug("[Zstd] Activating without trained dicts (client not ready) — compression still active");
         }
 
         // ⚠️ 先在**代码路径上**把两个处理器都装上，成功了才置 replaced。
