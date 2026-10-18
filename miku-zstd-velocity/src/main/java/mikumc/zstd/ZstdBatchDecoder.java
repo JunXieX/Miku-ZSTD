@@ -42,6 +42,19 @@ public class ZstdBatchDecoder extends ZstdBatchDecoderBase {
         return true;
     }
 
+    /**
+     * 服务端必须兼容「切换窗口」内的原版帧。
+     *
+     * <p>没有字典时，服务端一收到 negotiate 应答就激活；此刻客户端可能还没处理到
+     * SetCompression，仍在发原版帧。原版未压缩帧 {@code [dataLength=0][裸包]} 与
+     * zstd 直存帧同形，按 zstd 解释会切出垃圾并让 Minecraft 解码器抛
+     * {@code A packet frame decoder failed} 断连（详见基类同名钩子的说明）。</p>
+     */
+    @Override
+    protected boolean acceptsLegacyFrames() {
+        return true;
+    }
+
     /** 直存帧采样：格式与解压帧相同，直接整帧批量提交。 */
     @Override
     protected void onStoredPayload(byte[] data) {

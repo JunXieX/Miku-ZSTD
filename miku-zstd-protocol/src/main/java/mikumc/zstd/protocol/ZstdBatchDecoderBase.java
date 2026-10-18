@@ -97,6 +97,14 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
     private ZstdDecompressCtx decompressCtx;
     /** 压缩输入 scratch（方法内即用即弃，可安全复用） */
     private byte[] scratch = new byte[0];
+    /**
+     * 是否已经成功解析过至少一个真正的 zstd 帧。
+     *
+     * <p>用于界定「协议切换窗口」：窗口内对端可能仍在发送原版帧（见
+     * {@link #acceptsLegacyFrames()}）。一旦见过合法 zstd 帧，就再也不做兼容解释，
+     * 保持对畸形输入的严格拒绝。</p>
+     */
+    private boolean sawZstdFrame;
     /** {@link #readVarIntAt} 的结束位置出参（避免热路径上每包一次 int[] 分配） */
     private int varintEnd;
     /** 传给 {@link ZstdVarInts#readAt} 的出参容器（复用，零分配） */
@@ -185,6 +193,31 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
         }
     }
 
+    /**
+     * 是否在「切换窗口」内兼容解释原版帧。
+     *
+     * <p>默认 {@code false}（客户端不需要：它的对端一定会先切换）。服务端两端覆写为
+     * {@code true}，原因是一个真实的生产时序竞态：</p>
+     *
+     * <ol>
+     *   <li>服务端先发 negotiate，客户端立刻应答（此时它还没收到 SetCompression）；</li>
+     *   <li>服务端收到应答就激活并替换了入站解码器；</li>
+     *   <li>此刻客户端仍在用<b>原版帧</b>发送后续登录包（它还没处理到 SetCompression）。</li>
+     * </ol>
+     *
+     * <p>原版未压缩帧是 {@code [dataLength=0][裸包]}，与 zstd 直存帧
+     * {@code [rawSize=0][varint pktLen][pkt]} 的首字节<b>完全同形</b>。按 zstd 解释时，
+     * 裸包首字节（包 id）会被当成 {@code pktLen} 去切包，切出的垃圾交给 Minecraft 解码器后
+     * 抛出 {@code A packet frame decoder failed} 并断连 —— 而本类不会记录任何
+     * {@code frame rejected}，极难归因。</p>
+     *
+     * <p>有了字典时这个问题不会显现：协商多了一轮字典推送 + 应答，等服务端激活时
+     * 客户端早已切换完毕。<b>删掉字典文件后少了这一轮往返，竞态才被暴露出来。</b></p>
+     */
+    protected boolean acceptsLegacyFrames() {
+        return false;
+    }
+
     @Override
     protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) {
         if (!in.isReadable()) return;
@@ -200,7 +233,7 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
         }
         if (rawSize == ZstdVarInts.INVALID) {
             protocolError(ctx, "illegal frame header (bad varint or rawSize > "
-                    + ZstdVarInts.DEFAULT_MAX_VALUE + ")");
+                    + ZstdVarInts.DEFAULT_MAX_VALUE);
             return;
         }
 
@@ -211,6 +244,15 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
         }
 
         if (rawSize == 0) {
+            // 直存帧。⚠️ 切换窗口内必须先校验内层结构：原版未压缩帧与它同形，
+            // 盲目切包会把裸包当成 [pktLen][pkt] 解析并吐出垃圾（见 acceptsLegacyFrames）。
+            if (legacyFallbackAllowed() && !isWellFormedStoredPayload(in, remaining)) {
+                LOGGER.debug("[Zstd] legacy frame detected during switch window — "
+                        + "treating as vanilla uncompressed frame ({}B)", remaining);
+                emitWholeBody(in, remaining, out);
+                return;
+            }
+            sawZstdFrame = true;
             // 直存帧：payload 就在输入缓冲里，用 retained slice 零拷贝切分
             onStoredFrame(remaining);
             if (wantsStoredPayload()) {
@@ -248,13 +290,110 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
         }
         try {
             byte[] data = dctx.decompress(src, 0, remaining, rawSize);
+            sawZstdFrame = true;
             in.skipBytes(remaining);
             onCompressedFrame(remaining, data.length);
             onDecodedPayload(data); // 采样（data 为本帧独占数组，可安全持有）
             splitAndEmit(ctx, data, out);
         } catch (Exception e) {
+            // 切换窗口内：对端可能仍在发原版 zlib 压缩帧（[dataLength][deflate]）。
+            // zstd 解不开是预期内的，改用原版规则解释一次。
+            if (legacyFallbackAllowed() && inflateLegacyFrame(ctx, in, remaining, out)) {
+                LOGGER.debug("[Zstd] legacy zlib frame detected during switch window — decoded as vanilla");
+                return;
+            }
             protocolError(ctx, "decompress failed (rawSize=" + rawSize + ", compressed=" + remaining
                     + "): " + e);
+        }
+    }
+
+    /** 仅当子类声明兼容、且尚未见过任何真正的 zstd 帧时才允许原版回退。 */
+    private boolean legacyFallbackAllowed() {
+        return !sawZstdFrame && acceptsLegacyFrames();
+    }
+
+    /**
+     * 校验直存帧的内层结构是否真的是一串 {@code [varint pktLen][pkt]}。
+     *
+     * <p>只做只读扫描，不移动读指针。任一步不成立即判为"不是 zstd 直存帧"。</p>
+     */
+    private static boolean isWellFormedStoredPayload(ByteBuf in, int total) {
+        int idx = in.readerIndex();
+        int end = idx + total;
+        int packets = 0;
+        while (idx < end) {
+            // 用只读方式读 varint，避免动 readerIndex
+            int value = 0;
+            int shift = 0;
+            int start = idx;
+            while (idx < end && shift <= 28) {
+                byte b = in.getByte(idx++);
+                value |= (b & 0x7F) << shift;
+                if ((b & 0x80) == 0) break;
+                shift += 7;
+            }
+            if (idx == start) return false;          // 空 varint
+            if ((in.getByte(idx - 1) & 0x80) != 0) return false; // 5 字节仍未结束
+            if (value <= 0 || (long) idx + value > end) return false;
+            idx += value;
+            packets++;
+            if (packets > 65536) return false; // 防御：异常帧不要扫太久
+        }
+        // 必须正好走完，且至少一个包
+        return packets > 0 && idx == end;
+    }
+
+    /** 原版未压缩帧：整个帧体就是一个包，直接下传。 */
+    private static void emitWholeBody(ByteBuf in, int remaining, List<Object> out) {
+        out.add(in.readRetainedSlice(remaining));
+    }
+
+    /**
+     * 按原版规则解释一个压缩帧：{@code [dataLength][raw deflate(packet)]}。
+     *
+     * <p>⚠️ 必须是 <b>raw deflate</b>（{@code nowrap = true}）：Minecraft 用的是
+     * {@code new Inflater(true)}，线上没有 zlib 头/尾。</p>
+     *
+     * <p>两种布局都要处理，因为前置 frame-decoder 只按<b>外层</b>长度切帧，
+     * 而 {@code dataLength} 与"压缩字节数"没有必然的大小关系：</p>
+     * <ul>
+     *   <li><b>混批帧</b>（{@code dataLength < 压缩字节数}）：解码器收到的帧体里，
+     *       压缩帧的剩余部分之后还紧跟着下一个原版帧。此时按 {@code dataLength}
+     *       只解出<b>一个</b>包，整段帧体消费掉 —— 多发一个"裸包"或漏掉一个，
+     *       都会让上层帧边界错位。剩余的几个字节不属于任何包，直接丢弃。</li>
+     *   <li><b>整帧</b>（{@code dataLength >= 压缩字节数}）：整帧就是这一个包。</li>
+     * </ul>
+     *
+     * <p>只在切换窗口内使用；成功返回 {@code true}。</p>
+     */
+    private boolean inflateLegacyFrame(ChannelHandlerContext ctx, ByteBuf in, int remaining,
+                                       List<Object> out) {
+        try {
+            int start = in.readerIndex();
+            byte[] src = new byte[remaining];
+            in.getBytes(start, src, 0, remaining);
+            java.util.zip.Inflater inflater = new java.util.zip.Inflater(true);
+            try {
+                inflater.setInput(src);
+                byte[] out0 = new byte[Math.min(Math.max(remaining * 4, 8192), 1 << 20)];
+                int got = inflater.inflate(out0);
+                // 还有输出却已经塞满缓冲：说明这不是"帧体里多挂了几个字节"的混批帧
+                // （那样多出的字节极少），而是别的东西，交给上层 fail-fast。
+                // 不在这里扩容重解——那会把畸形输入解成任意大小的包。
+                if (got == out0.length
+                        && !(inflater.finished() && inflater.getRemaining() == 0)) {
+                    return false;
+                }
+                if (got <= 0) return false;
+                in.skipBytes(remaining);
+                out.add(Unpooled.wrappedBuffer(out0, 0, got));
+                return true;
+            } finally {
+                inflater.end();
+            }
+        } catch (Throwable t) {
+            LOGGER.debug("[Zstd] legacy inflate attempt failed: {}", t.toString());
+            return false;
         }
     }
 

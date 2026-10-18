@@ -37,6 +37,12 @@ public class ZstdPaperDecoder extends ZstdBatchDecoderBase {
         return true;
     }
 
+    /** 与服务端另一端一致：兼容切换窗口内仍在路上的原版帧（见基类同名钩子）。 */
+    @Override
+    protected boolean acceptsLegacyFrames() {
+        return true;
+    }
+
     /** 直存帧采样：格式与解压帧相同，直接整帧批量提交。 */
     @Override
     protected void onStoredPayload(byte[] data) {
