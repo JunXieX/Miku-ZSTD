@@ -211,6 +211,31 @@ class ProtocolUnitsTest {
         assertTrue(ZstdSampleFilter.shouldKeep(pkt(1, 4), 1));
     }
 
+    @Test
+    @DisplayName("采样过滤：按偏移判定（免复制路径）必须与整包判定逐例一致")
+    void sampleFilterOffsetOverloadMatchesByteArray() {
+        // 训练器热路径现在直接在整帧缓冲上按 (offset,length) 判定，只有通过才复制。
+        // 两条路径的结论必须完全相同——否则"过滤掉哪些包"会随调用方式漂移。
+        int[] payloads = {0, 1, 2, 3, 8, 9, 15, 16, 64};
+        int[] thresholds = {0, 1, 16};
+        for (int payload : payloads) {
+            byte[] packet = pkt(1, payload);
+            // 前面塞一段干扰字节，确保实现真的用了 offset 而不是从 0 开始
+            byte[] frame = new byte[packet.length + 3];
+            Arrays.fill(frame, 0, 3, (byte) 0x7F);
+            System.arraycopy(packet, 0, frame, 3, packet.length);
+            for (int th : thresholds) {
+                assertEquals(ZstdSampleFilter.shouldKeep(packet, th),
+                        ZstdSampleFilter.shouldKeep(frame, 3, packet.length, th),
+                        "payload=" + payload + " threshold=" + th + " 两种判定的结论必须一致");
+            }
+        }
+        // 越界一律拒绝（绝不因算错长度而读到帧外）
+        assertFalse(ZstdSampleFilter.shouldKeep(new byte[4], 3, 5, 0));
+        assertFalse(ZstdSampleFilter.shouldKeep(new byte[4], -1, 2, 0));
+        assertFalse(ZstdSampleFilter.shouldKeep(new byte[4], 0, 0, 0));
+    }
+
     // ────────────────────────────────────────────────────────────────
     // BossBar 模板与单位
     // ────────────────────────────────────────────────────────────────

@@ -40,18 +40,38 @@ public final class ZstdSampleFilter {
      * @return 是否保留为样本
      */
     public static boolean shouldKeep(byte[] packetBytes, int pruneMinPayload) {
-        if (packetBytes == null || packetBytes.length == 0) {
+        return packetBytes != null && shouldKeep(packetBytes, 0, packetBytes.length, pruneMinPayload);
+    }
+
+    /**
+     * 同一套判定，但直接在<b>整帧缓冲区</b>上按偏移检查，<b>不复制</b>。
+     *
+     * <p>⚠️ 存在的理由是可测量的开销：采样入口原先对<b>每一个</b>包都
+     * {@code new byte[pktLen]} + {@code arraycopy}，然后才判断"要不要留"。
+     * 而绝大多数包（KeepAlive、动作确认、短状态包）都会在这一步被丢掉——
+     * 也就是说，网络线程上白白分配并复制了它们。判定只依赖长度与包 id 首字节，
+     * 完全没必要先复制；只有真正入库的样本才需要独占数组。</p>
+     *
+     * @param data            整帧缓冲区
+     * @param offset          该包在缓冲区中的起点
+     * @param length          该包长度
+     * @param pruneMinPayload 采样时忽略载荷小于此值的包
+     */
+    public static boolean shouldKeep(byte[] data, int offset, int length, int pruneMinPayload) {
+        if (data == null || length <= 0 || offset < 0 || (long) offset + length > data.length) {
             return false;
         }
+        int end = offset + length;
         int idLen = 0;
-        while (idLen < packetBytes.length && idLen < 5) {
-            byte b = packetBytes[idLen];
+        int i = offset;
+        while (i < end && idLen < 5) {
+            byte b = data[i++];
             idLen++;
             if ((b & 0x80) == 0) {
                 break;
             }
         }
-        int payloadLen = packetBytes.length - idLen;
+        int payloadLen = length - idLen;
         if (payloadLen <= 2) {
             return false;
         }
