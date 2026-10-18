@@ -369,14 +369,24 @@ class FrameLayoutTest {
     void splitBatchesPreserveOrderAndContent() {
         // 与 splitsBatchesAtFrameBudget 互补：那条验证"必须拆开"，这条验证
         // "拆开之后内容与顺序仍然正确"（拆分逻辑直接操作 pending 下标，最容易错位）。
+        // 用两个 1.1MB 包：合计超软预算，所以第二个包必然被推到下一帧。
         final int payload = 1_100_000;
+        byte[] big1 = repetitive(payload);
+        byte[] big2 = repetitive(payload);
+        big2[0] = 0x55; // 让两包内容不同，便于验证顺序
         TestEncoder encoder = new TestEncoder(true, Integer.MAX_VALUE, 8);
         EmbeddedChannel ch = new EmbeddedChannel(encoder);
         EmbeddedChannel in = new EmbeddedChannel(new TestDecoder(decompressCtx));
-        ch.write(packet(repetitive(payload)));
-        ch.write(packet(ascii("tail-packet")));
+        ch.write(packet(big1));
+        ch.write(packet(big2));
         ch.flush();
-        ch.runPendingTasks();
+
+        // EmbeddedChannel 不会自动推进定时任务：必须循环 runPendingTasks 让 1ms 窗口到期。
+        long deadline = System.currentTimeMillis() + 3000;
+        while (encoder.frames.size() < 2 && System.currentTimeMillis() < deadline) {
+            ch.runPendingTasks();
+            Thread.sleep(2);
+        }
 
         int frames = 0;
         List<byte[]> got = new ArrayList<>();
@@ -386,10 +396,11 @@ class FrameLayoutTest {
             feed(in, frame);
             got.addAll(drainInbound(in));
         }
-        assertTrue(frames >= 2, "大包 + 小包应至少拆成两帧，实际 " + frames);
+        assertTrue(frames >= 2, "两个大包应至少拆成两帧，实际 " + frames);
         assertEquals(2, got.size(), "拆批不得丢包或重复：" + got.size());
-        assertEquals(payload + 1, got.get(0).length, "第 1 个包应是那个大包");
-        assertArrayEquals(fullPacket(ascii("tail-packet")), got.get(1), "第 2 个包内容必须正确");
+        assertEquals(payload + 1, got.get(0).length, "第 1 个包应是第一个大包");
+        assertEquals(payload + 1, got.get(1).length, "第 2 个包应是第二个大包");
+        assertEquals((byte) 0x55, got.get(1)[1], "顺序必须保持：第二个包的负载首字节应来自 big2");
         in.finishAndReleaseAll();
         ch.finishAndReleaseAll();
     }
