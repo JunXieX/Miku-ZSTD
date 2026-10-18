@@ -592,14 +592,32 @@ public class ZstdHijacker extends ChannelDuplexHandler {
         return true;
     }
 
+    /**
+     * 出站方向是否有**可替换**的锚点。
+     *
+     * <p>⚠️ 必须与 {@link ZstdChannelManager#installEncoder} 支持的锚点集合完全一致。</p>
+     *
+     * <p>早期这里还把 {@code cipher-encoder} / {@code minecraft-encoder} 当成可用锚点，
+     * 而安装逻辑（曾用 addAfter/addBefore）把它们当成"在旁边加一层"——
+     * 那等于**保留原版压缩编码器**，本端的 zstd 帧会被它再压一遍（双层压缩）。
+     * 现在安装只做替换，因此这里也只能认原版压缩处理器；否则门控会认为可以安装、
+     * 实际却必然失败，白白重试 20 次才回落。</p>
+     */
     private static boolean hasEncoderAnchor(ChannelPipeline p) {
         return p.get("zstd_encoder") != null || p.get(COMPRESSION_ENCODER) != null
-                || p.get("cipher-encoder") != null || p.get(MINECRAFT_ENCODER) != null;
+                || p.get("compress") != null;
     }
 
+    /**
+     * 入站方向是否有**可替换**的锚点。
+     *
+     * <p>⚠️ 同上：绝不能把 {@code minecraft-decoder} 算作锚点。在它之前插入一层会让
+     * 本解码器输出的裸包被它再当成外层帧解析一次，症状是 Velocity 打出
+     * "A packet frame decoder failed" 并断连。</p>
+     */
     private static boolean hasDecoderAnchor(ChannelPipeline p) {
         return p.get("zstd_decoder") != null || p.get(COMPRESSION_DECODER) != null
-                || p.get("decompress") != null || p.get(MINECRAFT_DECODER) != null;
+                || p.get("decompress") != null;
     }
 
     /**
