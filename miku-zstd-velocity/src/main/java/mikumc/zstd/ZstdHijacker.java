@@ -237,8 +237,14 @@ public class ZstdHijacker extends ChannelDuplexHandler {
                         // 协议 v4：客户端报告缺字典 —— 单独推送一次 zstd:dict，
                         // 门控结论等这次推送的应答到达后再定（见 markDictResponse 调用点）
                         mgr.markDictRequested();
-                        sendDictQuery(ctx.channel(), ZstdNegotiateStatus.needsDict(encStatus),
-                                ZstdNegotiateStatus.needsDict(decStatus));
+                        if (!sendDictQuery(ctx.channel(), ZstdNegotiateStatus.needsDict(encStatus),
+                                ZstdNegotiateStatus.needsDict(decStatus))) {
+                            // 推送没发出去（字典过大 / 锚点缺失）：立即回落原版，
+                            // 不要白等满 10 秒的字典阶段预算。
+                            LOGGER.warn("[Zstd] zstd:dict 未能发出 — 立即回落原版");
+                            releaseHeld(ctx);
+                            return;
+                        }
                     } else {
                         mgr.markDictResponse(encStatus, decStatus, success);
                         if (isDict) {
@@ -326,6 +332,26 @@ public class ZstdHijacker extends ChannelDuplexHandler {
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
         failHeldPromises(new ClosedChannelException());
         super.channelInactive(ctx);
+    }
+
+    /**
+     * 本处理器被<b>外部</b>从管线摘除时的收尾（插件卸载 / 管线重建）。
+     *
+     * <p>⚠️ 这是 {@code channelInactive} 之外<b>另一条</b>独立的销毁路径：通道仍然活着，
+     * 但处理器已经不在管线里。此时 {@code channelInactive} 永远不会触发，而激活流程也
+     * 因为 {@link #pipelineRemoved(Channel)} 直接 return —— 扣住的包与 promise 无人收尾：
+     * 包是 ReferenceCounted 的（不释放就是泄漏，Netty leak detector 会报 LEAK），
+     * promise 不完成则上游 future 永久挂起。</p>
+     *
+     * <p>Paper 端从一开始就有这段收尾（见 {@code ZstdPaperNegotiator#handlerRemoved}），
+     * Velocity 端此前缺失，属同类销毁路径只覆盖了一半。</p>
+     *
+     * <p>正常激活路径不受影响：那时调用方已经 {@code releaseHeld}，列表为空，本方法幂等。</p>
+     */
+    @Override
+    public void handlerRemoved(ChannelHandlerContext ctx) throws Exception {
+        failHeldPromises(new ClosedChannelException());
+        super.handlerRemoved(ctx);
     }
 
     /** 用给定异常补完所有扣住的 promise（幂等：列表清空后重复调用无副作用）。 */
@@ -453,7 +479,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
         // 只有"确实激活成功"才补发；重试 / 回落原版这两条路径已由 activateZstd 自行收尾
         //（见该方法的返回值约定）。
         if (activateZstd(ctx, mgr)) {
-            releaseHeld(ctx); // zstd 编解码器已就位：补发扣下的包（走 zstd 路径）
+            releaseHeld(ctx); // 激活路径内已补发；此处为空操作，保留以防调用顺序变动
         }
     }
 
@@ -542,11 +568,17 @@ public class ZstdHijacker extends ChannelDuplexHandler {
 
         LOGGER.info("[Zstd] Zstd transport activated (dict={})", mgr.isDictConfirmed());
 
+        // ⚠️ 顺序必须【先补发、后自移除】：handlerRemoved 会把"仍被扣住的包"当作销毁
+        // 泄漏收尾（释放 + 失败化 promise）。若先移除，这些包就永远发不出去——登录阶段的
+        // LoginSuccess 等会直接被丢弃，玩家表现为卡在登录。Paper 端一直就是这个顺序。
+        // （releaseHeld 会清空列表，调用方再调一次是空操作。）
+        releaseHeld(ctx);
+
         // 使命完成，自移除——热路径（每个出站包）不再经过本处理器
         if (p.get(ZstdHijacker.class) != null) {
             p.remove(this);
         }
-        // 管道已定型为 zstd：调用方据此补发扣住的包
+        // 管道已定型为 zstd：调用方据此补发扣住的包（此处已补发，为空操作）
         return true;
     }
 
@@ -624,15 +656,18 @@ public class ZstdHijacker extends ChannelDuplexHandler {
      *
      * <p>包可见：帧层嗅探器（{@link ZstdNegotiateAnswerSniffer}）捕获到 negotiate 应答后
      * 也要走这条路——它是主路径，且应答在帧层就被消费掉了，Hijacker 的包层分支看不到。</p>
+     *
+     * @return 是否确实发出；{@code false} 表示字典过大或写锚点缺失，
+     *         调用方应立即触发回落（否则只能白等满一个字典阶段的应答预算）
      */
-    static void sendDictQuery(Channel channel, boolean needEncoder, boolean needDecoder) {
+    static boolean sendDictQuery(Channel channel, boolean needEncoder, boolean needDecoder) {
         try {
             ZstdChannelManager mgr = channel.attr(ZstdChannelManager.KEY).get();
-            if (mgr == null) return;
+            if (mgr == null) return false;
             ChannelHandlerContext writeCtx = loginQueryWriteCtx(channel.pipeline());
             if (writeCtx == null) {
                 LOGGER.warn("[Zstd] cannot send zstd:dict — minecraft-encoder anchor missing");
-                return;
+                return false;
             }
 
             int txId = ThreadLocalRandom.current().nextInt(1, Integer.MAX_VALUE);
@@ -652,7 +687,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
                                 + "— 本连接将回落原版；请调小 trainer.dict_max_bytes",
                         enc == null ? 0 : enc.length, dec == null ? 0 : dec.length,
                         ZstdVarInts.MC_MAX_FRAME_BYTES);
-                return;
+                return false;
             }
             byte flags = 0;
             if (enc != null && enc.length > 0) flags |= 1;
@@ -669,12 +704,14 @@ public class ZstdHijacker extends ChannelDuplexHandler {
                 writeCtx.writeAndFlush(buf);
                 LOGGER.info("[Zstd] 已推送 zstd:dict txId={} flags={} (enc={}B dec={}B)，等待其应答",
                         txId, flags, enc == null ? 0 : enc.length, dec == null ? 0 : dec.length);
+                return true;
             } catch (Throwable t) {
                 if (buf.refCnt() > 0) buf.release();
                 throw t;
             }
         } catch (Exception e) {
             LOGGER.error("[Zstd] Failed to send dict query", e);
+            return false;
         }
     }
 

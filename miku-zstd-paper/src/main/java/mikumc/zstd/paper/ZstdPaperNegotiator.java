@@ -94,7 +94,14 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
         }
 
         // 2) 包层拦截协商应答（需在 packet_handler 之前消费，否则原版会当成"意外应答"断连）
-        if (mgr != null && msg != null && !mgr.isResponseReceived()) {
+        // ⚠️ 这里<b>不能</b>用 `!mgr.isResponseReceived()` 做前置门控：
+        //   该标志在收到 negotiate 应答时就已置 true，而协议 v4 的 zstd:dict 应答
+        //   是<b>之后</b>才到的第二条应答。加上这个门控的后果是——字典应答既不被消费、
+        //   也不解析，`confirmed` 永远为 false，激活前的硬门控判定"客户端请求了字典但未确认"
+        //   并回落原版：<b>凡是需要字典的客户端在 Paper 端永远用不上 zstd</b>。
+        //   真正的去重判据是下面的 txId 匹配（dictTxId 未设置时为 -1，不会误命中）；
+        //   激活成功后协商器会自移除，也不会留下长期开销。
+        if (mgr != null && msg != null) {
             String cn = msg.getClass().getSimpleName();
             if (cn.contains("Query") || cn.contains("Plugin")) {
                 int tx = readInt(msg, "transactionId", "id", "transactionID");
@@ -119,8 +126,12 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
                     if (isNegotiate && ZstdPaperNegotiator.needsDictPush(enc, dec)) {
                         // 协议 v4：客户端缺字典 → 单独推送 zstd:dict，门控结论等其应答
                         mgr.markDictRequested();
-                        sendDictQuery(ctx, ZstdNegotiateStatus.needsDict(enc),
-                                ZstdNegotiateStatus.needsDict(dec));
+                        if (!sendDictQuery(ctx, ZstdNegotiateStatus.needsDict(enc),
+                                ZstdNegotiateStatus.needsDict(dec))) {
+                            // 推送没发出去（字典过大 / 锚点缺失）：立即回落原版，
+                            // 不要白等满 10 秒的字典应答预算。
+                            finishVanilla(ctx);
+                        }
                     } else {
                         mgr.markResponse(enc, dec, success);
                         ctx.channel().eventLoop().execute(() -> tryActivate(ctx, 0));
@@ -165,10 +176,15 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
         }
     }
 
-    /** 协议 v4：按需推送字典（仅当客户端报告某个方向缺字典时）。 */
-    private void sendDictQuery(ChannelHandlerContext ctx, boolean needEncoder, boolean needDecoder) {
+    /**
+     * 协议 v4：按需推送字典（仅当客户端报告某个方向缺字典时）。
+     *
+     * @return 是否确实发出；{@code false} 表示字典过大或写锚点缺失，调用方应立即回落原版
+     *         （否则会白等满一个字典阶段的应答预算）
+     */
+    private boolean sendDictQuery(ChannelHandlerContext ctx, boolean needEncoder, boolean needDecoder) {
         ZstdPaperChannelManager mgr = ctx.channel().attr(ZstdPaperChannelManager.KEY).get();
-        if (mgr == null) return;
+        if (mgr == null) return false;
         byte[] enc = needEncoder ? ZstdPaperDictRegistry.encoderDictBytes() : null;
         byte[] dec = needDecoder ? ZstdPaperDictRegistry.decoderDictBytes() : null;
         // ⚠️ 兜底：本包把两个方向的字典放在一起，而 MC 单帧上限是 2^21-1。
@@ -182,7 +198,7 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
                             + "— 本连接将回落原版；请调小 trainer.dict_max_bytes",
                     enc == null ? 0 : enc.length, dec == null ? 0 : dec.length,
                     ZstdVarInts.MC_MAX_FRAME_BYTES);
-            return;
+            return false;
         }
         byte flags = 0;
         if (enc != null && enc.length > 0) flags |= 1;
@@ -202,6 +218,7 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
             ctx.writeAndFlush(buf);
             LOGGER.debug("[Zstd] 已推送 zstd:dict txId={} flags={} (enc={}B dec={}B)", txId, flags,
                     enc == null ? 0 : enc.length, dec == null ? 0 : dec.length);
+            return true;
         } catch (Throwable t) {
             if (buf.refCnt() > 0) buf.release();
             throw t;

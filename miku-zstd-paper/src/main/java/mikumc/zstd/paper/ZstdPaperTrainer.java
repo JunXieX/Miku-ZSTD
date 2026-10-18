@@ -578,20 +578,27 @@ public final class ZstdPaperTrainer {
         Path samplesFile = dictDir.resolve(name + "_samples.zst");
         if (!Files.exists(samplesFile)) return new ArrayList<>();
         byte[] compressed = Files.readAllBytes(samplesFile);
-        Long sizeHint = Zstd.getFrameContentSize(compressed);
-        if (sizeHint == null || sizeHint <= 0 || sizeHint > 256L * 1024 * 1024) return new ArrayList<>();
-        byte[] data = Zstd.decompress(compressed, sizeHint.intValue());
+        // ⚠️ 连 RuntimeException 一起兜住：损坏/截断的文件会让 zstd-jni 抛 ZstdException，
+        // 而调用方只声明 IOException —— 一个坏文件就会让插件初始化失败（服务器起不来）。
+        try {
+            Long sizeHint = Zstd.getFrameContentSize(compressed);
+            if (sizeHint == null || sizeHint <= 0 || sizeHint > 256L * 1024 * 1024) return new ArrayList<>();
+            byte[] data = Zstd.decompress(compressed, sizeHint.intValue());
 
-        List<byte[]> result = new ArrayList<>();
-        ByteBuffer buf = ByteBuffer.wrap(data);
-        while (buf.remaining() >= 4) {
-            int len = buf.getInt();
-            if (len <= 0 || len > buf.remaining()) break;
-            byte[] sample = new byte[len];
-            buf.get(sample);
-            result.add(sample);
+            List<byte[]> result = new ArrayList<>();
+            ByteBuffer buf = ByteBuffer.wrap(data);
+            while (buf.remaining() >= 4) {
+                int len = buf.getInt();
+                if (len <= 0 || len > buf.remaining()) break;
+                byte[] sample = new byte[len];
+                buf.get(sample);
+                result.add(sample);
+            }
+            return result;
+        } catch (RuntimeException e) {
+            LOGGER.warn("[Zstd] {} 历史样本文件损坏，已忽略（{}）", name, e.toString());
+            return new ArrayList<>();
         }
-        return result;
     }
 
     private void writeSamples(List<byte[]> samples) throws IOException {

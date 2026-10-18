@@ -754,20 +754,32 @@ public class ZstdSampleTrainer {
         Path samplesFile = dictDir.resolve(name + "_samples.zst");
         if (!Files.exists(samplesFile)) return new ArrayList<>();
         byte[] compressed = Files.readAllBytes(samplesFile);
-        Long sizeHint = Zstd.getFrameContentSize(compressed);
-        if (sizeHint == null || sizeHint <= 0 || sizeHint > 256L * 1024 * 1024) return new ArrayList<>();
-        byte[] data = Zstd.decompress(compressed, sizeHint.intValue());
+        // ⚠️ 这里必须连 RuntimeException 一起兜住：文件被截断/手改/磁盘损坏时，
+        // Zstd.getFrameContentSize / decompress 抛的是 ZstdException（RuntimeException），
+        // 而调用方（init → loadFromDisk）只声明了 IOException —— 一个坏文件会直接
+        // 让插件初始化失败，表现为「装了这个插件服务器起不来」。
+        // 归档只是优化手段，读不出来就当没有历史，绝不该阻断启动。
+        try {
+            Long sizeHint = Zstd.getFrameContentSize(compressed);
+            if (sizeHint == null || sizeHint <= 0 || sizeHint > 256L * 1024 * 1024) {
+                return new ArrayList<>();
+            }
+            byte[] data = Zstd.decompress(compressed, sizeHint.intValue());
 
-        List<byte[]> result = new ArrayList<>();
-        ByteBuffer buf = ByteBuffer.wrap(data);
-        while (buf.remaining() >= 4) {
-            int len = buf.getInt();
-            if (len <= 0 || len > buf.remaining()) break;
-            byte[] sample = new byte[len];
-            buf.get(sample);
-            result.add(sample);
+            List<byte[]> result = new ArrayList<>();
+            ByteBuffer buf = ByteBuffer.wrap(data);
+            while (buf.remaining() >= 4) {
+                int len = buf.getInt();
+                if (len <= 0 || len > buf.remaining()) break;
+                byte[] sample = new byte[len];
+                buf.get(sample);
+                result.add(sample);
+            }
+            return result;
+        } catch (RuntimeException e) {
+            LOGGER.warn("[Zstd] {} 历史样本文件损坏，已忽略（{}）", name, e.toString());
+            return new ArrayList<>();
         }
-        return result;
     }
 
     private void writeSamples(List<byte[]> samples) throws IOException {

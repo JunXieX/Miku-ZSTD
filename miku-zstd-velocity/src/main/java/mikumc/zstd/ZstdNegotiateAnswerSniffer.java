@@ -164,8 +164,16 @@ public class ZstdNegotiateAnswerSniffer extends MessageToMessageDecoder<ByteBuf>
             // 协议 v4：客户端缺字典。推一次 zstd:dict，**先不下结论**——
             // 门控必须等这次推送的应答，否则服务端会先于客户端激活（单侧 zstd）。
             mgr.markDictRequested();
-            ZstdHijacker.sendDictQuery(ctx.channel(),
-                    ZstdNegotiateStatus.needsDict(encStatus), ZstdNegotiateStatus.needsDict(decStatus));
+            if (!ZstdHijacker.sendDictQuery(ctx.channel(),
+                    ZstdNegotiateStatus.needsDict(encStatus), ZstdNegotiateStatus.needsDict(decStatus))) {
+                // 推送没发出去（字典过大 / 锚点缺失）：按"客户端保持原版"回填结论，
+                // 让激活流程立刻走回落分支 —— 否则本连接要白等满 10 秒的字典阶段预算，
+                // 期间扣住的登录包一直不发出，玩家表现为长时间卡在登录界面。
+                LOGGER.warn("[Zstd] zstd:dict 未能发出 — 立即回落原版（不等字典应答预算）");
+                mgr.markDictResponse(ZstdNegotiateStatus.VANILLA, ZstdNegotiateStatus.VANILLA, true);
+                ZstdHijacker.notifyDictResponse(ctx.channel());
+                return true;
+            }
             LOGGER.debug("[Zstd] negotiate 应答要求字典（enc={} dec={}），已推送 zstd:dict，继续等待其应答",
                     encStatus, decStatus);
             return true;
