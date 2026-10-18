@@ -324,19 +324,18 @@ public class ZstdChannelManager {
         if (channel == null) return false;
         var p = channel.pipeline();
         if (p.get("zstd_encoder") != null) return true;
-        if (p.get("compression-encoder") != null) {
-            p.replace("compression-encoder", "zstd_encoder", new ZstdBatchEncoder());
-            return true;
+        // Velocity 4.x 的原版压缩编码器可能叫 compression-encoder 或 compress
+        for (String anchor : new String[]{"compression-encoder", "compress"}) {
+            if (p.get(anchor) != null) {
+                p.replace(anchor, "zstd_encoder", new ZstdBatchEncoder());
+                return true;
+            }
         }
-        if (p.get("cipher-encoder") != null) {
-            p.addAfter("cipher-encoder", "zstd_encoder", new ZstdBatchEncoder());
-            return true;
-        }
-        if (p.get("minecraft-encoder") != null) {
-            p.addBefore("minecraft-encoder", "zstd_encoder", new ZstdBatchEncoder());
-            return true;
-        }
-        LOGGER.warn("[Zstd] encoder not installed — no anchor found in pipeline {}", p.names());
+        // ⚠️ 同理，绝不能 addAfter("cipher-encoder") / addBefore("minecraft-encoder")：
+        // 那会**保留**原版压缩编码器，本编码器产出的 zstd 帧会被它再压缩一遍（双层压缩），
+        // 对端解一层后得到的仍是 zstd 帧，表现为解析错乱/断连。
+        // "接管压缩"的唯一正确形态是**替换**原版压缩处理器。
+        LOGGER.warn("[Zstd] encoder not installed — no replaceable anchor found in pipeline {}", p.names());
         return false;
     }
 
@@ -357,11 +356,12 @@ public class ZstdChannelManager {
             p.replace("decompress", "zstd_decoder", new ZstdBatchDecoder());
             return true;
         }
-        if (p.get("minecraft-decoder") != null) {
-            p.addBefore("minecraft-decoder", "zstd_decoder", new ZstdBatchDecoder());
-            return true;
-        }
-        LOGGER.warn("[Zstd] decoder not installed — no anchor found in pipeline {}", p.names());
+        // ⚠️ 绝不能 addBefore("minecraft-decoder")：那是在**保留** Minecraft 帧解码器的
+        // 前提下再加一层，本解码器输出的裸包会被 minecraft-decoder 当成外层帧**再解析一次**，
+        // 必然失败 —— 症状是 Velocity 打出 "A packet frame decoder failed"
+        // （QuietRuntimeException）并断连，而我们自己的解码器不会报任何 "frame rejected"，
+        // 极难归因。正确做法与上面两条一致：**替换**，让"拆外层帧 + 解压"只由一层负责。
+        LOGGER.warn("[Zstd] decoder not installed — no replaceable anchor found in pipeline {}", p.names());
         return false;
     }
 
