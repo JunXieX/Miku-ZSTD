@@ -329,6 +329,41 @@ class FrameLayoutTest {
         ch.finishAndReleaseAll();
     }
 
+    @Test
+    @DisplayName("单个大包（原始超 21-bit、压缩后很小）必须正常发出，不得按原始大小拒绝")
+    void largeCompressiblePacketIsNotRejected() throws InterruptedException {
+        // 回归用例：曾把 MC 的 21-bit 帧上限直接套在**原始**字节上，于是配置阶段
+        // 数 MB 的 Registry 包会在编码器里被丢弃、promise 失败 → 玩家进不了服。
+        // 实际上限约束的是压缩后的线路帧，这类包压缩后只有几百 KB。
+        final int payload = 4 * 1024 * 1024;
+        TestEncoder encoder = new TestEncoder(true, 0 /* 一律压缩 */, 1);
+        EmbeddedChannel ch = new EmbeddedChannel(encoder);
+        io.netty.channel.ChannelFuture f = ch.write(packet(repetitive(payload)));
+        ch.flush();
+
+        long deadline = System.currentTimeMillis() + 5000;
+        while (!f.isDone() && System.currentTimeMillis() < deadline) {
+            ch.runPendingTasks();
+            Thread.sleep(2);
+        }
+        assertTrue(f.isDone(), "写 promise 必须被完成");
+        assertTrue(f.isSuccess(), "大包压缩后远小于帧上限，必须成功发出而不是被拒绝");
+
+        ByteBuf frame = readFrame(ch, 5000);
+        assertNotNull(frame, "应当产出一帧");
+        assertTrue(frame.readableBytes() <= ZstdVarInts.MC_MAX_FRAME_BYTES,
+                "线路帧必须处于 21-bit 上限内");
+        assertTrue(encoder.lastCompressed, "应当走压缩路径");
+
+        EmbeddedChannel in = new EmbeddedChannel(new TestDecoder(decompressCtx));
+        feed(in, frame);
+        List<byte[]> got = drainInbound(in);
+        assertEquals(1, got.size(), "应还原成 1 个包");
+        assertEquals(payload + 1, got.get(0).length, "包内容长度应与原始一致");
+        in.finishAndReleaseAll();
+        ch.finishAndReleaseAll();
+    }
+
     // ────────────────────────────────────────────────────────────────
     // 畸形输入：一律 fail-fast（关连接），绝不放行
     // ────────────────────────────────────────────────────────────────

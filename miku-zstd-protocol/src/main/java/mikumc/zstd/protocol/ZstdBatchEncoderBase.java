@@ -319,34 +319,43 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
         inflightPromises = promises;
         final ZstdCompressLock lock = compressLock();
 
-        ZstdCompressPool.execute(() -> {
-            final int produced;
-            final byte[] dst;
-            try {
-                // 与「换字典 / close」互斥：ctx 不是线程安全的，且可能已被释放
-                synchronized (lock) {
-                    // ⚠️ 拿到锁之后再判一次：本任务可能在连接断开**之前**提交、
-                    // 在 close() 释放 native 上下文**之后**才轮到执行。此时必须直接放弃，
-                    // 绝不能碰 compressCtx（那是已释放的内存 → SIGSEGV，整进程崩）。
-                    // 判据必须在锁内读——见 ZstdCompressLock 的类注释。
-                    if (lock.isClosed()) {
-                        backToEventLoop(ctx, promises, new ClosedChannelException(),
-                                0, null, raw, rawTotal, withBodyLen);
-                        return;
+        try {
+            ZstdCompressPool.execute(() -> {
+                final int produced;
+                final byte[] dst;
+                try {
+                    // 与「换字典 / close」互斥：ctx 不是线程安全的，且可能已被释放
+                    synchronized (lock) {
+                        // ⚠️ 拿到锁之后再判一次：本任务可能在连接断开**之前**提交、
+                        // 在 close() 释放 native 上下文**之后**才轮到执行。此时必须直接放弃，
+                        // 绝不能碰 compressCtx（那是已释放的内存 → SIGSEGV，整进程崩）。
+                        // 判据必须在锁内读——见 ZstdCompressLock 的类注释。
+                        if (lock.isClosed()) {
+                            backToEventLoop(ctx, promises, new ClosedChannelException(),
+                                    0, null, raw, rawTotal, withBodyLen);
+                            return;
+                        }
+                        // raw 是本批捕获的实例（大帧是临时数组）；dst 也按需临时分配
+                        dst = ensureCompressDstCapacity(rawTotal);
+                        // 第 3 个参数是"目标缓冲区可用空间"，必须传数组实际长度
+                        // （传 srcSize 会报 Destination buffer is too small）
+                        produced = compressCtx.compressByteArray(
+                                dst, 0, dst.length, raw, 0, rawTotal);
                     }
-                    // raw 是本批捕获的实例（大帧是临时数组）；dst 也按需临时分配
-                    dst = ensureCompressDstCapacity(rawTotal);
-                    // 第 3 个参数是"目标缓冲区可用空间"，必须传数组实际长度
-                    // （传 srcSize 会报 Destination buffer is too small）
-                    produced = compressCtx.compressByteArray(
-                            dst, 0, dst.length, raw, 0, rawTotal);
+                } catch (Throwable t) {
+                    backToEventLoop(ctx, promises, t, 0, null, raw, rawTotal, withBodyLen);
+                    return;
                 }
-            } catch (Throwable t) {
-                backToEventLoop(ctx, promises, t, 0, null, raw, rawTotal, withBodyLen);
-                return;
-            }
-            backToEventLoop(ctx, promises, null, produced, dst, raw, rawTotal, withBodyLen);
-        });
+                backToEventLoop(ctx, promises, null, produced, dst, raw, rawTotal, withBodyLen);
+            });
+        } catch (Throwable t) {
+            // 池被关闭 / 线程创建失败：这批已经移出 pending 且 promises 已进 inflight，
+            // 不在这里收尾就是"promise 永挂 + compressing 永久为真"（该连接之后再也发不出帧）。
+            compressing = false;
+            inflightPromises = null;
+            failAll(promises, t);
+            LOGGER.error("[Zstd] encoder compression task rejected", t);
+        }
     }
 
     /** 压缩完成后回到 event loop：组帧、写出、并立刻接手积压的下一批。 */
@@ -383,31 +392,42 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
         });
     }
 
-    /** 把 pending 拼成 {@code [varint pktLen][pkt]...}，返回原始总长；随后释放并清空 pending。 */
+    /**
+     * 选出本帧要装的包（前缀），返回包数。
+     *
+     * <p>只有一种包会被拒绝：单包自身超过对端解码器的 rawSize 上限
+     * （{@link ZstdVarInts#DEFAULT_MAX_VALUE}，32MB）。那种包无论怎么压缩都送不出去
+     * （解码侧 {@code tryRead} 会直接判非法），留着只会让后续批次永远卡在队首。</p>
+     *
+     * <p>⚠️ 超过 {@link #maxRawBatchBytes()} 的包<b>不拒绝</b>，只是让它独占一帧：
+     * 那只是合批的软目标。按原始大小拒绝会把配置阶段的大 Registry 包（原始数 MB、
+     * 压缩后几百 KB）直接掐死，玩家进不了服。</p>
+     */
     private int takeFrameBatch() {
-        int maxBytes = maxRawBatchBytes();
+        int softMax = maxRawBatchBytes();
         long batchBytes = 0;
         int count = 0;
         while (count < pending.size()) {
             ByteBuf packet = pending.get(count);
             int readable = packet.readableBytes();
             long packetBytes = (long) ZstdVarInts.length(readable) + readable;
-            if (packetBytes > maxBytes) {
+            if (packetBytes > ZstdVarInts.DEFAULT_MAX_VALUE) {
                 if (count == 0) {
                     IllegalArgumentException failure = new IllegalArgumentException(
-                            "packet size " + packetBytes + " exceeds Minecraft frame budget " + maxBytes);
+                            "packet size " + packetBytes + " exceeds decoder rawSize limit "
+                                    + ZstdVarInts.DEFAULT_MAX_VALUE);
                     ByteBuf rejected = pending.remove(0);
                     ChannelPromise promise = pendingPromises.remove(0);
                     ReferenceCountUtil.release(rejected);
                     promise.tryFailure(failure);
-                    LOGGER.warn("[Zstd] rejected outbound packet: {}B exceeds frame budget {}B",
-                            packetBytes, maxBytes);
+                    LOGGER.warn("[Zstd] rejected outbound packet: {}B exceeds decoder rawSize limit {}B",
+                            packetBytes, ZstdVarInts.DEFAULT_MAX_VALUE);
                     return 0;
                 }
                 break;
             }
-            if (batchBytes + packetBytes > maxBytes) {
-                break;
+            if (count > 0 && batchBytes + packetBytes > softMax) {
+                break; // 软预算：装不下就起新帧（第一个包总是能进）
             }
             batchBytes += packetBytes;
             count++;
@@ -473,6 +493,7 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
         }
         ZstdVarInts.write(frame, 0);
         frame.writeBytes(raw, 0, rawTotal);
+        ensureFrameFitsMcLimit(frame, rawTotal);
         onFrame(1 + rawTotal, frame.readableBytes(), false);
         return frame;
     }
@@ -497,13 +518,50 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
         } else {
             frame.writeBytes(raw, 0, rawTotal);
         }
+        ensureFrameFitsMcLimit(frame, rawTotal);
         onFrame(1 + rawTotal, frame.readableBytes(), compressed);
         return frame;
     }
 
+    /**
+     * 线路帧的<b>硬</b>上限：MC 的外层长度前缀只有 21 bit，超了客户端必断连。
+     *
+     * <p>能走到这里且仍然超限的只有一种情况：单个包原始就接近/超过帧上限、
+     * 且 zstd 压不动（已压缩过的数据）。原版 zlib 在这种输入上同样发不出去，
+     * 所以失败化 promise（而不是发出一个对端必然拒绝的帧）是唯一正确的处理。</p>
+     *
+     * <p>注意判的是<b>最终帧</b>而不是原始字节：几 MB 的 Registry 包压缩后只有几百 KB，
+     * 属于完全合法的常态流量，绝不能按原始大小拒绝（见 {@link #maxRawBatchBytes()}）。</p>
+     */
+    private static void ensureFrameFitsMcLimit(ByteBuf frame, int rawTotal) {
+        if (frame.readableBytes() <= ZstdVarInts.MC_MAX_FRAME_BYTES) {
+            return;
+        }
+        int actual = frame.readableBytes();
+        frame.release();
+        throw new IllegalArgumentException("frame " + actual + "B exceeds MC 21-bit limit "
+                + ZstdVarInts.MC_MAX_FRAME_BYTES + "B (raw=" + rawTotal + "B)");
+    }
+
+    /**
+     * 合批的<b>软</b>目标：原始负载达到这个量就起新帧，<b>但绝不因此拒绝单个包</b>。
+     *
+     * <p>⚠️ 这里曾经直接把 MC 的 21-bit 帧上限套在<b>原始</b>字节上，并据此拒绝"超限"的包。
+     * 那是个会让玩家进不了服的错误：21-bit 约束的是<b>压缩后的外层帧</b>，而配置阶段的
+     * Registry 包原始可达数 MB、zstd 压缩后只有几百 KB（解码器本身也允许 rawSize 到 32MB）。
+     * 按原始大小拒绝，等于把最需要压缩的大包直接掐死。</p>
+     *
+     * <p>真正的硬上限只有两条，分别在 {@link #takeFrameBatch()}（对端解码器的 32MB rawSize
+     * 上限）与 {@link #buildCompressedFrame}（最终线路帧的 21-bit 上限）里判。</p>
+     */
     private int maxRawBatchBytes() {
         int outer = writeBodyLen() ? 5 : 0;
-        return ZstdVarInts.MC_MAX_FRAME_BYTES - outer - 5;
+        int maxFrame = ZstdVarInts.MC_MAX_FRAME_BYTES - outer - 5;
+        // 再扣掉 zstd 的最坏膨胀量（compressBound = n + n/256 + 64）。
+        // 否则"压不动"的满批会产出一个刚好越过 21-bit 的帧，只能整批失败丢包；
+        // 少装几个包换"永远发得出去"，对不可压缩流量才是正确取舍。
+        // 直存路径（rawTotal < skip 阈值）不受影响：它没有膨胀，且阈值远小于此。
+        return maxFrame - (maxFrame >>> 8) - 64;
     }
 
     private void schedulePendingBatch(ChannelHandlerContext ctx) {
