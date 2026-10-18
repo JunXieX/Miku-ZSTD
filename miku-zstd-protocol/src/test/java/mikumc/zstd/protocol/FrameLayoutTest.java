@@ -370,18 +370,19 @@ class FrameLayoutTest {
         // 与 splitsBatchesAtFrameBudget 互补：那条验证"必须拆开"，这条验证
         // "拆开之后内容与顺序仍然正确"（拆分逻辑直接操作 pending 下标，最容易错位）。
         // 用两个 1.1MB 包：合计超软预算，所以第二个包必然被推到下一帧。
+        // maxPackets=2 才会在第二个包写入时立即触发成帧（测试窗口是 60s，永不到期）。
         final int payload = 1_100_000;
         byte[] big1 = repetitive(payload);
         byte[] big2 = repetitive(payload);
         big2[0] = 0x55; // 让两包内容不同，便于验证顺序
-        TestEncoder encoder = new TestEncoder(true, Integer.MAX_VALUE, 8);
+        TestEncoder encoder = new TestEncoder(true, Integer.MAX_VALUE, 2);
         EmbeddedChannel ch = new EmbeddedChannel(encoder);
         EmbeddedChannel in = new EmbeddedChannel(new TestDecoder(decompressCtx));
         ch.write(packet(big1));
         ch.write(packet(big2));
         ch.flush();
 
-        // EmbeddedChannel 不会自动推进定时任务：必须循环 runPendingTasks 让 1ms 窗口到期。
+        // EmbeddedChannel 不会自动推进定时任务：必须循环 runPendingTasks 让后续批次跑完。
         long deadline = System.currentTimeMillis() + 3000;
         while (encoder.frames.size() < 2 && System.currentTimeMillis() < deadline) {
             ch.runPendingTasks();
