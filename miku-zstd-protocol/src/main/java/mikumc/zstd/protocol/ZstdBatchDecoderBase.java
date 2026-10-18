@@ -114,6 +114,17 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
     protected abstract ZstdDecompressCtx resolveDecompressContext(ChannelHandlerContext ctx);
 
     /**
+     * 本帧实际要使用的解压上下文（每帧调用）。
+     *
+     * <p>默认返回 {@code handlerAdded} 时解析出的实例——服务端两端的上下文生命周期与
+     * 连接一致，够用。<b>客户端必须覆写</b>：它在重协商到"无字典"的服务器时会换掉
+     * 上下文来清空旧字典，旧实例随即被 close。</p>
+     */
+    protected ZstdDecompressCtx decompressContextForFrame() {
+        return decompressCtx;
+    }
+
+    /**
      * 直存帧的统计回调（{@code frameBodyBytes} = 帧体字节数）。
      * 服务端无统计，空实现即可。
      */
@@ -230,7 +241,7 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
         byte[] src = acquireScratch(remaining);
         in.getBytes(in.readerIndex(), src, 0, remaining);
 
-        ZstdDecompressCtx dctx = decompressCtx;
+        ZstdDecompressCtx dctx = decompressContextForFrame();
         if (dctx == null) {
             protocolError(ctx, "decompress context unavailable");
             return;

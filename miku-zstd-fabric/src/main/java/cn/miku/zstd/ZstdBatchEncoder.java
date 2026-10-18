@@ -28,6 +28,21 @@ public class ZstdBatchEncoder extends ZstdBatchEncoderBase {
     }
 
     /**
+     * 每批压缩前重新取一次上下文。
+     *
+     * <p>⚠️ 必须动态取，不能只用 {@link #resolveCompressContext} 缓存的实例：
+     * 客户端在"重新协商到无字典的服务器"时，{@code ZstdChannelManager#resetDicts()}
+     * 会 close 旧上下文并换一个新的来清空字典（zstd 没有卸载接口）。若这里仍拿着
+     * 旧实例，压缩就会写已释放的原生内存 → SIGSEGV。读取在池线程、调用方已在
+     * {@code compressLock} 内，因此不会与替换并发。</p>
+     */
+    @Override
+    protected ZstdCompressCtx compressContextForBatch() {
+        ZstdChannelManager m = manager;
+        return m == null ? null : m.getCompressCtx();
+    }
+
+    /**
      * 压缩已卸载到线程池；字典由 ChannelManager 改写 {@code compressCtx}、且它负责在
      * 关连接时 close 该上下文，所以这里必须返回<b>与它相同的那把锁</b>——否则池线程压缩
      * 会与「换字典 / close」并发，后者是 use-after-free（SIGSEGV）。

@@ -190,6 +190,20 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
         return ownLock;
     }
 
+    /**
+     * 本批实际要使用的压缩上下文（在池线程、已持有 {@link #compressLock()} 时调用）。
+     *
+     * <p>默认返回 {@code handlerAdded} 时解析出的实例——对上下文生命周期与连接一致的一端
+     * （服务端两端）这就够了。<b>客户端必须覆写</b>：它在重新协商到"无字典"的服务器时
+     * 需要换一个新的上下文来清空旧字典（zstd 没有卸载接口），届时旧实例会被 close。
+     * 若仍用缓存实例，压缩就会写已释放的原生内存 → SIGSEGV。</p>
+     *
+     * @return 压缩上下文；{@code null} 表示当前不可用（本批按失败处理）
+     */
+    protected ZstdCompressCtx compressContextForBatch() {
+        return compressCtx;
+    }
+
     // ────────────────────────────────────────────────────────────────
     // 共享实现
     // ────────────────────────────────────────────────────────────────
@@ -229,6 +243,10 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
             LOGGER.error("[Zstd] outbound backlog {}B exceeds {}B — closing connection {}",
                     pendingBytes, MAX_PENDING_BYTES, ctx.channel().remoteAddress());
             // 先按"通道关闭"语义收尾：释放 pending、失败化 promise（否则上游 future 永挂）
+            if (windowTask != null) {
+                windowTask.cancel(false);
+                windowTask = null;
+            }
             releasePending();
             failPending(new ClosedChannelException());
             pendingPromises.clear();
@@ -367,9 +385,16 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
                         }
                         // raw 是本批捕获的实例（大帧是临时数组）；dst 也按需临时分配
                         dst = ensureCompressDstCapacity(rawTotal);
+                        // 上下文必须每批重新取：客户端可能在重协商后换掉了它（见钩子注释）
+                        ZstdCompressCtx batchCtx = compressContextForBatch();
+                        if (batchCtx == null) {
+                            backToEventLoop(ctx, promises, new ClosedChannelException(),
+                                    0, null, raw, rawTotal, withBodyLen);
+                            return;
+                        }
                         // 第 3 个参数是"目标缓冲区可用空间"，必须传数组实际长度
                         // （传 srcSize 会报 Destination buffer is too small）
-                        produced = compressCtx.compressByteArray(
+                        produced = batchCtx.compressByteArray(
                                 dst, 0, dst.length, raw, 0, rawTotal);
                     }
                 } catch (Throwable t) {

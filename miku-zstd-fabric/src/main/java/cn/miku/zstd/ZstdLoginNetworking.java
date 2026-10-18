@@ -70,6 +70,7 @@ public final class ZstdLoginNetworking {
             data.readByte(); // flags：v4 不再据此判断是否内联字节，仅保留字段以兼容读取
 
             ZstdChannelManager existing = channel.attr(ZstdChannelManager.KEY).get();
+            boolean reused = existing != null;
             if (existing == null) {
                 existing = new ZstdChannelManager();
                 channel.attr(ZstdChannelManager.KEY).set(existing);
@@ -77,6 +78,15 @@ public final class ZstdLoginNetworking {
                 channel.closeFuture().addListener(f -> toClose.close());
             }
             final ZstdChannelManager mgr = existing;
+
+            // ⚠️ 复用已有 manager 时，先清空上一轮残留的字典：同一条 Channel 可能被
+            // 重放登录流程（ViaFabricPlus 协议切换 / 重连到另一台服务器）。若新服务端
+            // 某个方向 dictId=0，resolve() 会直接返回 READY，而上下文里仍装着旧字典 ——
+            // 于是本端带字典压缩、对端无字典解压（或反向），必然断连。
+            // 新建的 manager 本来就是空上下文，跳过以免白做一次原生分配。
+            if (reused) {
+                mgr.resetDicts();
+            }
 
             // 每个方向：READY = 已就绪（无需字典或本地已缓存），NEED_DICT = 需要服务端推送
             byte encoderStatus = resolve(mgr, encoderDictId, true);
