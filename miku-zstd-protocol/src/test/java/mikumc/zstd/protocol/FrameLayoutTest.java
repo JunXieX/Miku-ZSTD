@@ -366,7 +366,7 @@ class FrameLayoutTest {
 
     @Test
     @DisplayName("批次拆分后仍能正常工作：拆分出的多帧顺序与内容都不丢")
-    void splitBatchesPreserveOrderAndContent() {
+    void splitBatchesPreserveOrderAndContent() throws InterruptedException {
         // 与 splitsBatchesAtFrameBudget 互补：那条验证"必须拆开"，这条验证
         // "拆开之后内容与顺序仍然正确"（拆分逻辑直接操作 pending 下标，最容易错位）。
         // 用两个 1.1MB 包：合计超软预算，所以第二个包必然被推到下一帧。
