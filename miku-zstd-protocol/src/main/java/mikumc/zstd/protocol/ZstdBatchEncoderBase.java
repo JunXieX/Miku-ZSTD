@@ -72,8 +72,26 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
      */
     private byte[] batchRaw;
 
+    /**
+     * 单连接待发送数据的硬上限（字节）。
+     *
+     * <p>⚠️ 这是防「一条连接拖垮整个服务端」的最后一道闸：压缩任务在途时
+     * （{@code compressing=true}）{@code emitBatch} 会直接返回，而上游仍可继续写包，
+     * {@code pending} 因此<b>没有天然上限</b>。正常流量下 1ms 窗口 + 几毫秒压缩
+     * 只会积压几十个包；但若某个大包压缩异常慢（或线程池被其它连接占满），
+     * 积压会无界增长——而这是<b>堆内存</b>，最终 OOM 的是整个服务端进程，
+     * 不是这一条连接。</p>
+     *
+     * <p>取 128MB：远高于正常进服峰值（几 MB 的 Registry 包 + 数十个包合批），
+     * 只有异常情况才可能触发。触发时选择<b>关闭这一条连接</b>并明确记日志——
+     * 与"整个服务器 OOM"相比，这是唯一合理的取舍（包不能丢，丢了协议就错乱）。</p>
+     */
+    private static final long MAX_PENDING_BYTES = 128L * 1024 * 1024;
+
     private final List<ByteBuf> pending = new ArrayList<>();
     private final List<ChannelPromise> pendingPromises = new ArrayList<>();
+    /** {@link #pending} 中 ByteBuf 的总可读字节数（仅 event loop 线程读写） */
+    private long pendingBytes;
     private ScheduledFuture<?> windowTask;
 
     /** 是否有压缩任务在途（仅 event loop 线程读写） */
@@ -172,6 +190,20 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
         return ownLock;
     }
 
+    /**
+     * 本批实际要使用的压缩上下文（在池线程、已持有 {@link #compressLock()} 时调用）。
+     *
+     * <p>默认返回 {@code handlerAdded} 时解析出的实例——对上下文生命周期与连接一致的一端
+     * （服务端两端）这就够了。<b>客户端必须覆写</b>：它在重新协商到"无字典"的服务器时
+     * 需要换一个新的上下文来清空旧字典（zstd 没有卸载接口），届时旧实例会被 close。
+     * 若仍用缓存实例，压缩就会写已释放的原生内存 → SIGSEGV。</p>
+     *
+     * @return 压缩上下文；{@code null} 表示当前不可用（本批按失败处理）
+     */
+    protected ZstdCompressCtx compressContextForBatch() {
+        return compressCtx;
+    }
+
     // ────────────────────────────────────────────────────────────────
     // 共享实现
     // ────────────────────────────────────────────────────────────────
@@ -203,6 +235,24 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
         }
         pending.add(packet);
         pendingPromises.add(promise);
+        pendingBytes += packet.readableBytes();
+        // 积压超硬上限：关闭该连接，而不是让堆无界增长（见 MAX_PENDING_BYTES）。
+        // 走到这里说明压缩已经长时间跟不上这一条连接的上游产出，继续累积只会
+        // 把整个进程拖进 OOM；而丢包会造成协议错乱，所以只能断开重连。
+        if (pendingBytes > MAX_PENDING_BYTES) {
+            LOGGER.error("[Zstd] outbound backlog {}B exceeds {}B — closing connection {}",
+                    pendingBytes, MAX_PENDING_BYTES, ctx.channel().remoteAddress());
+            // 先按"通道关闭"语义收尾：释放 pending、失败化 promise（否则上游 future 永挂）
+            if (windowTask != null) {
+                windowTask.cancel(false);
+                windowTask = null;
+            }
+            releasePending();
+            failPending(new ClosedChannelException());
+            pendingPromises.clear();
+            ctx.close();
+            return;
+        }
 
         if (pending.size() >= batchMaxPackets) {
             emitBatch(ctx);
@@ -283,8 +333,7 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
             // 它们永远没人释放（引用计数泄漏），而且下一批会把这批残缺数据一并发出去，
             // 同时让 pendingPromises 与 pending 彻底失去对应关系。
             batchRaw = null; // 失败批次的缓冲也不再被本 handler 引用（大帧可立即回收）
-            pending.subList(0, batchCount).clear();
-            pendingPromises.subList(0, batchCount).clear();
+            removePendingPrefix(batchCount);
             releasePackets(batchPackets);
             failAll(promises, t);
             LOGGER.error("[Zstd] encoder batch concat failed", t);
@@ -293,8 +342,7 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
             }
             return;
         }
-        pending.subList(0, batchCount).clear();
-        pendingPromises.subList(0, batchCount).clear();
+        removePendingPrefix(batchCount);
 
         final boolean withBodyLen = writeBodyLen();
 
@@ -337,9 +385,16 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
                         }
                         // raw 是本批捕获的实例（大帧是临时数组）；dst 也按需临时分配
                         dst = ensureCompressDstCapacity(rawTotal);
+                        // 上下文必须每批重新取：客户端可能在重协商后换掉了它（见钩子注释）
+                        ZstdCompressCtx batchCtx = compressContextForBatch();
+                        if (batchCtx == null) {
+                            backToEventLoop(ctx, promises, new ClosedChannelException(),
+                                    0, null, raw, rawTotal, withBodyLen);
+                            return;
+                        }
                         // 第 3 个参数是"目标缓冲区可用空间"，必须传数组实际长度
                         // （传 srcSize 会报 Destination buffer is too small）
-                        produced = compressCtx.compressByteArray(
+                        produced = batchCtx.compressByteArray(
                                 dst, 0, dst.length, raw, 0, rawTotal);
                     }
                 } catch (Throwable t) {
@@ -418,6 +473,7 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
                                     + ZstdVarInts.DEFAULT_MAX_VALUE);
                     ByteBuf rejected = pending.remove(0);
                     ChannelPromise promise = pendingPromises.remove(0);
+                    pendingBytes -= rejected.readableBytes();
                     ReferenceCountUtil.release(rejected);
                     promise.tryFailure(failure);
                     LOGGER.warn("[Zstd] rejected outbound packet: {}B exceeds decoder rawSize limit {}B",
@@ -571,6 +627,24 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
     private void releasePending() {
         releasePackets(pending);
         pending.clear();
+        pendingBytes = 0;
+    }
+
+    /**
+     * 从队首移除 {@code count} 个包并同步字节计数。
+     *
+     * <p>⚠️ 字节计数必须与实际出队严格一致：它只用于 {@link #MAX_PENDING_BYTES} 的
+     * 防 OOM 判定，一旦漂移，要么误关正常连接，要么让上限形同虚设。因此所有
+     * 「从 pending 出队」的地方都必须走这里（或等价的显式扣减），不要再直接
+     * {@code pending.subList(...).clear()}。</p>
+     */
+    private void removePendingPrefix(int count) {
+        for (int i = 0; i < count; i++) {
+            pendingBytes -= pending.get(i).readableBytes();
+        }
+        pending.subList(0, count).clear();
+        pendingPromises.subList(0, count).clear();
+        if (pendingBytes < 0) pendingBytes = 0; // 防御性归零（不应发生）
     }
 
     private static void releasePackets(List<ByteBuf> packets) {

@@ -364,6 +364,48 @@ class FrameLayoutTest {
         ch.finishAndReleaseAll();
     }
 
+    @Test
+    @DisplayName("批次拆分后仍能正常工作：拆分出的多帧顺序与内容都不丢")
+    void splitBatchesPreserveOrderAndContent() throws InterruptedException {
+        // 与 splitsBatchesAtFrameBudget 互补：那条验证"必须拆开"，这条验证
+        // "拆开之后内容与顺序仍然正确"（拆分逻辑直接操作 pending 下标，最容易错位）。
+        // 用两个 1.1MB 包：合计超软预算，所以第二个包必然被推到下一帧。
+        // maxPackets=2 才会在第二个包写入时立即触发成帧（测试窗口是 60s，永不到期）。
+        final int payload = 1_100_000;
+        byte[] big1 = repetitive(payload);
+        byte[] big2 = repetitive(payload);
+        big2[0] = 0x55; // 让两包内容不同，便于验证顺序
+        TestEncoder encoder = new TestEncoder(true, Integer.MAX_VALUE, 2);
+        EmbeddedChannel ch = new EmbeddedChannel(encoder);
+        EmbeddedChannel in = new EmbeddedChannel(new TestDecoder(decompressCtx));
+        ch.write(packet(big1));
+        ch.write(packet(big2));
+        ch.flush();
+
+        // EmbeddedChannel 不会自动推进定时任务：必须循环 runPendingTasks 让后续批次跑完。
+        long deadline = System.currentTimeMillis() + 3000;
+        while (encoder.frames.size() < 2 && System.currentTimeMillis() < deadline) {
+            ch.runPendingTasks();
+            Thread.sleep(2);
+        }
+
+        int frames = 0;
+        List<byte[]> got = new ArrayList<>();
+        ByteBuf frame;
+        while ((frame = readFrame(ch)) != null) {
+            frames++;
+            feed(in, frame);
+            got.addAll(drainInbound(in));
+        }
+        assertTrue(frames >= 2, "两个大包应至少拆成两帧，实际 " + frames);
+        assertEquals(2, got.size(), "拆批不得丢包或重复：" + got.size());
+        assertEquals(payload + 1, got.get(0).length, "第 1 个包应是第一个大包");
+        assertEquals(payload + 1, got.get(1).length, "第 2 个包应是第二个大包");
+        assertEquals((byte) 0x55, got.get(1)[1], "顺序必须保持：第二个包的负载首字节应来自 big2");
+        in.finishAndReleaseAll();
+        ch.finishAndReleaseAll();
+    }
+
     // ────────────────────────────────────────────────────────────────
     // 畸形输入：一律 fail-fast（关连接），绝不放行
     // ────────────────────────────────────────────────────────────────

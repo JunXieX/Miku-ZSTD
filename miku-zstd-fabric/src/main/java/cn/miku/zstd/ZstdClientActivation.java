@@ -97,7 +97,20 @@ public final class ZstdClientActivation {
         // 路径根本不会执行清理。
         removeStaleVanillaHandlers(p);
 
-        if (Boolean.TRUE.equals(channel.attr(ACTIVATED).get())) return;
+        // ⚠️ 激活标志只在"zstd 处理器仍在位"时才算数。
+        // 曾直接把 ACTIVATED 当作终态早退：一旦这条 Channel 上重放登录流程
+        // （ViaFabricPlus 协议切换、或同一条连接重新协商），原版 compress/decompress
+        // 会被重新装回并替换掉 zstd 处理器，而 ACTIVATED 仍为 true →
+        // 后续所有激活入口都提前返回，zstd 再也不生效（且日志上只有一条 debug）。
+        if (Boolean.TRUE.equals(channel.attr(ACTIVATED).get())) {
+            if (p.get("zstd_encoder") != null && p.get("zstd_decoder") != null) {
+                return; // 确实已激活且处理器在位：无需重复安装
+            }
+            // 处理器已被原版重新覆盖：清掉标志，让下面的安装流程重新接管
+            channel.attr(ACTIVATED).set(Boolean.FALSE);
+            LOGGER.debug("[Zstd] reactivating — zstd handlers were replaced by vanilla again; pipeline={}",
+                    p.names());
+        }
 
         ZstdChannelManager.TransportState state = channel.attr(ZstdChannelManager.ZSTD_STATE).get();
         if (state != ZstdChannelManager.TransportState.NEGOTIATING) {

@@ -90,8 +90,28 @@ public class ZstdSampleTrainer {
     private volatile long currentDictId;
     private final AtomicBoolean training = new AtomicBoolean();
 
+    /**
+     * 训练样本缓冲的硬上限（字节）。
+     *
+     * <p>{@code ZstdDictTrainer} 会在构造时 {@code allocateDirect(capacity)}，
+     * 该容量必须覆盖整个样本集，否则 {@code addSample} 返回 false、样本被静默丢弃。
+     * 上限只是防"配置异常导致一次分配几个 GB"的兜底：正常情况下样本环由
+     * {@code max_samples} 与字节预算双重约束，远小于此值。</p>
+     */
+    private static final int MAX_TRAIN_SAMPLE_BYTES = 256 * 1024 * 1024;
+
     private final int maxSamples;
     private final int minSamples;
+    /**
+     * 样本环的<b>硬</b>字节上限。
+     *
+     * <p>⚠️ {@code sample_target_bytes} 只在样本数已达 {@code min_samples} 后才是封环条件
+     * （见 {@link #addBatch}），所以样本数不足时环会继续长。若没有这条硬上限，
+     * "几个 KB~几 MB 的大包 + min_samples=2000"会让环累积到 GB 级，训练时还要
+     * {@code allocateDirect} 同等容量 —— 直接把服务端内存打爆。
+     * 取 {@code max(sample_target_bytes, 64MB)}：正常配置下永不触发，纯属安全阀。</p>
+     */
+    private final long hardSampleBytes;
     private final long trainCooldownMs;
     private final long fallbackTimeoutMs;
     private final int dictSize;
@@ -219,6 +239,7 @@ public class ZstdSampleTrainer {
         this.fallbackTimeoutMs = cfg.trainerFallbackTimeoutMs;
         this.dictSize = cfg.trainerDictMaxBytes;
         this.sampleSize = cfg.trainerSampleTargetBytes;
+        this.hardSampleBytes = Math.max((long) sampleSize, 64L * 1024 * 1024);
         this.maxHistorySamples = cfg.trainerMaxHistorySamples;
         this.adoptRatioImprovement = cfg.trainerAdoptionThreshold;
         this.pruneMinPayload = cfg.trainerPruneMinPayload;
@@ -276,15 +297,22 @@ public class ZstdSampleTrainer {
             LOGGER.info("[Zstd] {} training already in progress", name);
             return;
         }
+        int count;
         synchronized (this) {
             lastTrainTime = System.currentTimeMillis();
+            count = sampleRing.size();
         }
+        // ⚠️ 必须把"低于门槛"的结论带进训练线程：force 的语义就是绕过样本门槛，
+        // 而 trainAndAdopt 在样本不足时默认会直接 return。曾经这里固定传 false，
+        // 于是 /mikuzstd train force 在样本不足时只会打一条 "Training triggered"，
+        // 实际什么也没做 —— 命令与文档承诺的行为不一致。
+        final boolean belowMin = count < minSamples;
         // ⚠️ 提交失败必须把 training 复位：执行器已 shutdown（关服 / 插件停用）时
         // execute 会抛 RejectedExecutionException，而 trainAndAdopt 的 finally 永不执行 ——
         // training 就此卡在 true，此后**所有**训练请求（含自动触发）都被"already in progress"挡掉，
         // 字典机制静默失效。这类"标志位只在成功路径复位"的缺陷不会报错，只会让功能悄悄死掉。
         try {
-            te.execute(this::trainAndAdopt);
+            te.execute(() -> trainAndAdopt(belowMin));
         } catch (RejectedExecutionException e) {
             training.set(false);
             LOGGER.debug("[Zstd] {} training not submitted (executor shut down)", name);
@@ -328,12 +356,15 @@ public class ZstdSampleTrainer {
             if (pktLen <= 0 || cursor[0] + (long) pktLen > length) {
                 break;
             }
-            byte[] sample = new byte[pktLen];
-            System.arraycopy(raw, cursor[0], sample, 0, pktLen);
+            int start = cursor[0];
             cursor[0] += pktLen;
-            if (!shouldKeep(sample)) {
+            // ⚠️ 先判定、后复制：绝大多数包（KeepAlive、短状态包）会被过滤掉，
+            // 先 copy 再判定等于在网络线程上为它们白分配一次数组。
+            if (!mikumc.zstd.protocol.ZstdSampleFilter.shouldKeep(raw, start, pktLen, pruneMinPayload)) {
                 continue;
             }
+            byte[] sample = new byte[pktLen];
+            System.arraycopy(raw, start, sample, 0, pktLen);
             if (batch == null) {
                 batch = new ArrayList<>(16);
             }
@@ -352,8 +383,9 @@ public class ZstdSampleTrainer {
                 // 而真实流量平均包长有几 KB —— 1MB 只装得下 200~300 个样本，
                 // 于是每轮都在"样本数远低于门槛"的状态下训练，字典质量长期偏低，
                 // 且每次只训几百个样本就重来一遍（CPU 与日志都被白白消耗）。
-                // 样本数不足时让环继续长，由 max_samples 兜住内存上限。
-                if (sampleBytes >= sampleSize && sampleRing.size() >= minSamples) {
+                // 样本数不足时让环继续长，由 max_samples 与 hardSampleBytes 兜住内存上限。
+                if ((sampleBytes >= sampleSize && sampleRing.size() >= minSamples)
+                        || sampleBytes >= hardSampleBytes) {
                     budgetExhausted = true;
                     ringFull = true; // 封环：此后每批走早退路径，不再白拷贝
                     break;
@@ -382,7 +414,8 @@ public class ZstdSampleTrainer {
             if (count == 0) return;
             long now = System.currentTimeMillis();
             // 门槛口径必须与 addBatch 的封环条件一致：字节预算只在对样本数够时才算"满"。
-            boolean full = (sampleBytes >= sampleSize && count >= minSamples) || count >= maxSamples;
+            boolean full = (sampleBytes >= sampleSize && count >= minSamples)
+                    || count >= maxSamples || sampleBytes >= hardSampleBytes;
             if (count < minSamples && !full) return;
             // ⚠️ 冷却是**所有**路径共用的闸门。曾经只在"定时/满环"路径上判，跳过它会让
             // 清空样本环后新样本很快又攒满 → 再训练 → 无限循环，CPU 全耗在训练与评估上。
@@ -406,11 +439,6 @@ public class ZstdSampleTrainer {
         } catch (RejectedExecutionException e) {
             training.set(false);
         }
-    }
-
-    /** 训练 + 评估 + 采纳 + 归档 + 清空样本环（训练线程调用）。 */
-    private void trainAndAdopt() {
-        trainAndAdopt(false);
     }
 
     /**
@@ -519,9 +547,21 @@ public class ZstdSampleTrainer {
 
     private byte[] train(List<byte[]> samples) {
         try {
-            ZstdDictTrainer trainer = new ZstdDictTrainer(sampleSize, dictSize);
+            // ⚠️ ZstdDictTrainer 的第一个参数是<b>训练样本缓冲的容量</b>，不是"目标样本量"。
+            // 曾经这里传的是 sample_target_bytes（1MB）：一旦样本环超过 1MB（现在会为了
+            // 满足 min_samples 而继续增长），addSample 就开始返回 false、下面的 break
+            // 会把<b>剩余样本全部静默丢掉</b>——字典始终只由最前面那 1MB 训练。
+            // 这里按实际样本总字节分配（并设上限防止极端配置把训练线程的内存打爆）。
+            long total = 0;
             for (byte[] s : samples) {
-                if (!trainer.addSample(s)) break;
+                total += s.length;
+            }
+            int capacity = (int) Math.min(Math.max(total, 1), MAX_TRAIN_SAMPLE_BYTES);
+            ZstdDictTrainer trainer = new ZstdDictTrainer(capacity, dictSize);
+            for (byte[] s : samples) {
+                if (!trainer.addSample(s)) {
+                    break; // 达到 capacity 上限（仅可能发生在样本总量超过上限时）
+                }
             }
             return trainer.trainSamples();
         } catch (Exception e) {
@@ -592,17 +632,6 @@ public class ZstdSampleTrainer {
             if (oldDictObj != null) oldDictObj.close();
             if (newDictObj != null) newDictObj.close();
         }
-    }
-
-
-    /**
-     * 该包是否值得作为字典样本——规则已抽到共享模块，两端共用同一份实现。
-     *
-     * <p>（原来两端各抄一份逐行相同的判定，属于最容易悄悄漂移的代码：
-     * 改了一端不会报错，只会让字典质量悄悄变差。）</p>
-     */
-    private boolean shouldKeep(byte[] packetBytes) {
-        return mikumc.zstd.protocol.ZstdSampleFilter.shouldKeep(packetBytes, pruneMinPayload);
     }
 
     /** 归档字典（可选）与未入库样本（训练线程调用，与训练串行）。 */
@@ -725,20 +754,32 @@ public class ZstdSampleTrainer {
         Path samplesFile = dictDir.resolve(name + "_samples.zst");
         if (!Files.exists(samplesFile)) return new ArrayList<>();
         byte[] compressed = Files.readAllBytes(samplesFile);
-        Long sizeHint = Zstd.getFrameContentSize(compressed);
-        if (sizeHint == null || sizeHint <= 0 || sizeHint > 256L * 1024 * 1024) return new ArrayList<>();
-        byte[] data = Zstd.decompress(compressed, sizeHint.intValue());
+        // ⚠️ 这里必须连 RuntimeException 一起兜住：文件被截断/手改/磁盘损坏时，
+        // Zstd.getFrameContentSize / decompress 抛的是 ZstdException（RuntimeException），
+        // 而调用方（init → loadFromDisk）只声明了 IOException —— 一个坏文件会直接
+        // 让插件初始化失败，表现为「装了这个插件服务器起不来」。
+        // 归档只是优化手段，读不出来就当没有历史，绝不该阻断启动。
+        try {
+            Long sizeHint = Zstd.getFrameContentSize(compressed);
+            if (sizeHint == null || sizeHint <= 0 || sizeHint > 256L * 1024 * 1024) {
+                return new ArrayList<>();
+            }
+            byte[] data = Zstd.decompress(compressed, sizeHint.intValue());
 
-        List<byte[]> result = new ArrayList<>();
-        ByteBuffer buf = ByteBuffer.wrap(data);
-        while (buf.remaining() >= 4) {
-            int len = buf.getInt();
-            if (len <= 0 || len > buf.remaining()) break;
-            byte[] sample = new byte[len];
-            buf.get(sample);
-            result.add(sample);
+            List<byte[]> result = new ArrayList<>();
+            ByteBuffer buf = ByteBuffer.wrap(data);
+            while (buf.remaining() >= 4) {
+                int len = buf.getInt();
+                if (len <= 0 || len > buf.remaining()) break;
+                byte[] sample = new byte[len];
+                buf.get(sample);
+                result.add(sample);
+            }
+            return result;
+        } catch (RuntimeException e) {
+            LOGGER.warn("[Zstd] {} 历史样本文件损坏，已忽略（{}）", name, e.toString());
+            return new ArrayList<>();
         }
-        return result;
     }
 
     private void writeSamples(List<byte[]> samples) throws IOException {

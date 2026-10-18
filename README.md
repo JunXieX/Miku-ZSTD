@@ -286,9 +286,9 @@ The config file is written once on first run and never overwritten. Delete it to
 ### When does the dictionary take effect?
 **字典什么时候会生效？**
 
-The dictionary needs enough samples to train: 2000 samples by default, or a forced round after the 10-minute fallback timeout. Until then compression still works, just without the dictionary gain. Once it trains, the log shows that a new dictionary was adopted.
+The dictionary needs enough samples to train: 2000 samples by default. The byte budget (`sample_target_bytes`) does not close the ring until that sample count is reached, so a low-traffic server still eventually trains a usable dictionary instead of repeatedly training on a few hundred samples. Once it trains, the log shows that a new dictionary was adopted.
 
-字典需要累积样本才能训练出来：默认 2000 个样本，或 10 分钟兜底强制触发一轮。在此之前压缩照常工作，只是没有字典增益。训练成功后日志会出现「采纳新字典」。
+字典需要累积足够样本才能训练：默认 2000 个。字节预算（`sample_target_bytes`）在样本数达标之前不会封环——否则低流量服务器会一直拿几百个样本反复训练，字典质量长期偏低。训练成功后日志会出现「采纳新字典」。
 
 Use `/mikuzstd status` to check the current sample count and dictionary id.
 

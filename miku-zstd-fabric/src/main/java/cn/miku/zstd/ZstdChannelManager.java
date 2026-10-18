@@ -40,9 +40,15 @@ public class ZstdChannelManager {
     /** 协商协议版本（三端必须一致）。帧长度上限见 {@link ZstdVarInts#DEFAULT_MAX_VALUE}。 */
     public static final int PROTOCOL_VERSION = 4;
 
-    private final ZstdCompressCtx compressCtx;
-    private final ZstdDecompressCtx decompressCtx;
-
+    /**
+     * 压缩/解压上下文。
+     *
+     * <p>⚠️ 非 final：{@link #resetDicts()} 需要用新上下文来"卸载字典"
+     * （zstd 没有卸载接口）。所有读写都必须在 {@code compressLock} 内完成 —— 池线程
+     * 通过该锁取用，因此替换上下文与压缩执行互斥，不会拿到已 close 的实例。</p>
+     */
+    private ZstdCompressCtx compressCtx;
+    private ZstdDecompressCtx decompressCtx;
     /** 已取用的共享字典条目，连接关闭时归还引用 */
     private ZstdDictRegistry.Entry encoderDictEntry;
     private ZstdDictRegistry.Entry decoderDictEntry;
@@ -106,6 +112,10 @@ public class ZstdChannelManager {
         return compressLock;
     }
 
+    /**
+     * 当前压缩上下文。<b>调用方必须已持有 {@link #compressLock()}</b>：
+     * {@link #resetDicts()} 会在锁内替换实例，锁外读取可能拿到已被 close 的旧实例。
+     */
     public ZstdCompressCtx getCompressCtx() {
         return compressCtx;
     }
@@ -118,8 +128,48 @@ public class ZstdChannelManager {
         return decoderDictEntry != null;
     }
 
+    /**
+     * 当前解压上下文。解压只在 event loop 上发生，而 {@link #resetDicts()} 也只在
+     * event loop（协商回调）上调用，两者天然串行。
+     */
     public ZstdDecompressCtx getDecompressCtx() {
         return decompressCtx;
+    }
+
+    /**
+     * 清空两个方向已装载的字典，让上下文回到"无字典"状态。
+     *
+     * <p>⚠️ 必须有这一步：{@code ZstdChannelManager} 的生命周期挂在 <b>Channel</b> 上，
+     * 而同一条 Channel 可能被重放登录流程（ViaFabricPlus 协议切换、或重连到另一台
+     * 服务器）。若新服务端的某个方向 dictId=0（还没训练出字典），协商结果会直接是
+     * READY，而上下文里仍装着<b>上一轮</b>的字典 —— 于是本端带字典压缩、对端无字典
+     * 解压（或反向），必然断连。这类问题只在"之前连过带字典的服务器"时出现，
+     * 单机测试完全复现不到。</p>
+     *
+     * <p>zstd 的 {@code loadDict} 没有"卸载字典"接口，只能用新建上下文来清空。</p>
+     *
+     * <p>⚠️ 与压缩任务共用同一把锁：压缩跑在池线程上，若这里直接 close 上下文，
+     * 在途压缩就会写到已释放的原生内存（SIGSEGV）。解压侧只在 event loop 上跑，
+     * 而本方法在登录回调（也在 event loop）上执行，天然串行。</p>
+     */
+    public void resetDicts() {
+        synchronized (compressLock) {
+            if (compressLock.isClosed()) return;
+            releaseQuietly(encoderDictEntry);
+            encoderDictEntry = null;
+            releaseQuietly(decoderDictEntry);
+            decoderDictEntry = null;
+            // 清空装载状态：直接覆盖为无字典的新上下文（旧上下文在本锁内释放）
+            compressCtx.close();
+            decompressCtx.close();
+            ZstdConfig cfg = ZstdConfig.INSTANCE;
+            compressCtx = new ZstdCompressCtx();
+            compressCtx.setLevel(cfg.level);
+            compressCtx.setWindowLog(cfg.windowLog);
+            compressCtx.setLong(1);
+            decompressCtx = new ZstdDecompressCtx();
+            applySlimFrameFormat();
+        }
     }
 
     /**
