@@ -100,7 +100,8 @@ public final class ZstdPaperDictRegistry {
         if (current != null && current.id == id && current.level == level) return current;
         Entry fresh = new Entry(id, level, dictBytes, new ZstdDictCompress(dictBytes, level), null);
         swap(true, fresh);
-        LOGGER.info("[Zstd] 压缩字典条目重建: id={} level={} size={}B", id, level, dictBytes.length);
+        // DEBUG：采纳那条 INFO 已经带了 id/size；这里每轮训练都会来一次，INFO 会刷屏
+        LOGGER.debug("[Zstd] 压缩字典条目重建: id={} level={} size={}B", id, level, dictBytes.length);
         return fresh;
     }
 
@@ -113,7 +114,7 @@ public final class ZstdPaperDictRegistry {
         if (current != null && current.id == id) return current;
         Entry fresh = new Entry(id, 0, dictBytes, null, new ZstdDictDecompress(dictBytes));
         swap(false, fresh);
-        LOGGER.info("[Zstd] 解压字典条目重建: id={} size={}B", id, dictBytes.length);
+        LOGGER.debug("[Zstd] 解压字典条目重建: id={} size={}B", id, dictBytes.length);
         return fresh;
     }
 

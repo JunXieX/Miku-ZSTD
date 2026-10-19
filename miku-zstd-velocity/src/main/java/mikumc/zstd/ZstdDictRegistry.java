@@ -147,7 +147,8 @@ public final class ZstdDictRegistry {
         }
         Entry fresh = new Entry(id, level, dictBytes, new ZstdDictCompress(dictBytes, level), null);
         swap(true, fresh);
-        LOGGER.info("[Zstd] Encoder dict entry rebuilt: id={} level={} size={}B",
+        // DEBUG：采纳那条 INFO 已经带了 id/size；这里每轮训练都会来一次，INFO 会刷屏
+        LOGGER.debug("[Zstd] Encoder dict entry rebuilt: id={} level={} size={}B",
                 id, level, dictBytes.length);
         return fresh;
     }
@@ -166,7 +167,7 @@ public final class ZstdDictRegistry {
         }
         Entry fresh = new Entry(id, 0, dictBytes, null, new ZstdDictDecompress(dictBytes));
         swap(false, fresh);
-        LOGGER.info("[Zstd] Decoder dict entry rebuilt: id={} size={}B", id, dictBytes.length);
+        LOGGER.debug("[Zstd] Decoder dict entry rebuilt: id={} size={}B", id, dictBytes.length);
         return fresh;
     }
 

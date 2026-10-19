@@ -468,7 +468,8 @@ public class ZstdSampleTrainer {
             }
             if (snapshot.size() < minSamples) {
                 if (!allowBelowMin) {
-                    LOGGER.info("[Zstd] {} not enough samples to train ({} < {})",
+                    // DEBUG：周期任务每轮都会走到这里，INFO 会把控制台刷满
+                    LOGGER.debug("[Zstd] {} not enough samples to train ({} < {})",
                             name, snapshot.size(), minSamples);
                     return;
                 }
@@ -482,8 +483,11 @@ public class ZstdSampleTrainer {
                         name, snapshot.size(), minSamples);
             }
 
-            LOGGER.info("[Zstd] {} starting training with {} samples ({} bytes)",
-                    name, snapshot.size(), snapshot.stream().mapToInt(s -> s.length).sum());
+            // ⚠️ 周期训练每 5 分钟一轮、两个方向各一轮：只有"字典被采纳"这一条留 INFO
+            // （它意味着线路上的字典真的换了），其余步骤一律 DEBUG。
+            // 曾经的 4 行/轮（开始 / 重建 / 采纳 / 结束）会把控制台刷满。
+            int totalBytes = snapshot.stream().mapToInt(s -> s.length).sum();
+            LOGGER.debug("[Zstd] {} training with {} samples ({} bytes)", name, snapshot.size(), totalBytes);
 
             byte[] newDict = train(snapshot);
             boolean adopted = false;
@@ -494,7 +498,7 @@ public class ZstdSampleTrainer {
                 long dictId = ZstdDictId.of(newDict);
 
                 if (currentDict != null && currentDictId == dictId) {
-                    LOGGER.info("[Zstd] {} dict unchanged, skipping", name);
+                    LOGGER.debug("[Zstd] {} dict unchanged, skipping", name);
                 } else {
                     EvalResult ev = evaluate(snapshot, newDict);
                     // ⚠️ 首部字典与替换字典的判定标准必须不同：
@@ -506,7 +510,7 @@ public class ZstdSampleTrainer {
                     boolean firstDict = (currentDict == null);
                     boolean accept = shouldAdoptDict(firstDict, ev.overall, adoptRatioImprovement);
                     if (!accept) {
-                        LOGGER.info("[Zstd] {} dict insufficient improvement: {} (阈值 {}，分档：{})",
+                        LOGGER.debug("[Zstd] {} dict insufficient improvement: {} (阈值 {}，分档：{})",
                                 name, pct(ev.overall), firstDict ? "首部字典需>0" : pct(adoptRatioImprovement),
                                 ev.bandSummary());
                     } else {
@@ -516,9 +520,10 @@ public class ZstdSampleTrainer {
                         }
                         publishToRegistry();
                         adopted = true;
-                        LOGGER.info("[Zstd] {} new dict adopted: id={} size={} improvement={}{} 分档：{}",
+                        LOGGER.info("[Zstd] {} dict adopted: id={} size={}B improvement={}{} samples={}（{}B）分档：{}",
                                 name, dictId, newDict.length, pct(ev.overall),
-                                firstDict ? "（首部字典，只要不劣化即采纳）" : "", ev.bandSummary());
+                                firstDict ? "（首部字典，只要不劣化即采纳）" : "",
+                                snapshot.size(), totalBytes, ev.bandSummary());
                     }
                 }
             }
@@ -532,7 +537,6 @@ public class ZstdSampleTrainer {
                 nextTrainCheckMs = 0;
                 savedCount = 0;
             }
-            LOGGER.info("[Zstd] {} training round finished (adopted={}), sample ring refreshed", name, adopted);
         } catch (Exception e) {
             LOGGER.error("[Zstd] {} train task failed", name, e);
         } finally {

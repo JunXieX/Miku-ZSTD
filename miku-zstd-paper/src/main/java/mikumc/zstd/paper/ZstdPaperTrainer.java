@@ -360,8 +360,10 @@ public final class ZstdPaperTrainer {
                         name, snapshot.size(), minSamples);
             }
 
-            LOGGER.info("[Zstd] {} 开始训练: {} 个样本 ({} 字节)", name, snapshot.size(),
-                    snapshot.stream().mapToInt(s -> s.length).sum());
+            // ⚠️ 周期训练每 5 分钟一轮、两个方向各一轮：只有"字典被采纳"这一条留 INFO，
+            // 其余步骤一律 DEBUG —— 否则每轮 4 行 INFO 会把控制台刷满。
+            int totalBytes = snapshot.stream().mapToInt(s -> s.length).sum();
+            LOGGER.debug("[Zstd] {} 开始训练: {} 个样本 ({} 字节)", name, snapshot.size(), totalBytes);
             byte[] newDict = train(snapshot);
             boolean adopted = false;
 
@@ -371,7 +373,7 @@ public final class ZstdPaperTrainer {
                 long dictId = mikumc.zstd.protocol.ZstdDictId.of(newDict);
 
                 if (currentDict != null && currentDictId == dictId) {
-                    LOGGER.info("[Zstd] {} 字典未变化，跳过", name);
+                    LOGGER.debug("[Zstd] {} 字典未变化，跳过", name);
                 } else {
                     EvalResult ev = evaluate(snapshot, newDict);
                     // 判定抽到共享模块（ZstdDictAdoption）——它是"字典会不会被启用"的唯一开关，
@@ -379,7 +381,7 @@ public final class ZstdPaperTrainer {
                     boolean firstDict = currentDict == null;
                     boolean accept = shouldAdoptDict(firstDict, ev.overall, adoptThreshold);
                     if (!accept) {
-                        LOGGER.info("[Zstd] {} 改进不足: {}（阈值 {}，分档：{}）", name, pct(ev.overall),
+                        LOGGER.debug("[Zstd] {} 改进不足: {}（阈值 {}，分档：{}）", name, pct(ev.overall),
                                 firstDict ? "首部字典需>0" : pct(adoptThreshold), ev.bandSummary());
                     } else {
                         synchronized (this) {
@@ -388,9 +390,10 @@ public final class ZstdPaperTrainer {
                         }
                         publishToRegistry();
                         adopted = true;
-                        LOGGER.info("[Zstd] {} 采纳新字典 id={} size={}B 改进={}{} 分档：{}",
+                        LOGGER.info("[Zstd] {} 采纳新字典 id={} size={}B 改进={}{} 样本={}（{}B）分档：{}",
                                 name, dictId, newDict.length, pct(ev.overall),
-                                firstDict ? "（首部字典）" : "", ev.bandSummary());
+                                firstDict ? "（首部字典）" : "",
+                                snapshot.size(), totalBytes, ev.bandSummary());
                     }
                 }
             }
@@ -403,7 +406,6 @@ public final class ZstdPaperTrainer {
                 nextTrainCheckMs = 0;
                 savedCount = 0;
             }
-            LOGGER.info("[Zstd] {} 本轮结束(adopted={})，样本环已刷新", name, adopted);
         } catch (Exception e) {
             LOGGER.error("[Zstd] {} 训练任务失败", name, e);
         } finally {
