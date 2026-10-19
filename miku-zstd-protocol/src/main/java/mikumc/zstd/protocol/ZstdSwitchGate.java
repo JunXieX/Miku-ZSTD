@@ -1,5 +1,6 @@
 package mikumc.zstd.protocol;
 
+import io.netty.channel.Channel;
 import io.netty.channel.ChannelDuplexHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelPromise;
@@ -187,12 +188,20 @@ public final class ZstdSwitchGate extends ChannelDuplexHandler {
                 try {
                     r.run();
                 } catch (Throwable t) {
-                    LOGGER.warn("[Zstd] rollback action failed", t);
+                    // 回滚是"尽力而为"的收尾：失败只记 debug，绝不冒泡成日志噪音
+                    LOGGER.debug("[Zstd] rollback action failed: {}", t.toString());
                 }
             }
         }
-        if (ctx != null && ctx.pipeline().context(this) != null) {
-            ctx.pipeline().remove(this);
+        if (ctx != null) {
+            try {
+                if (ctx.pipeline().context(this) != null) {
+                    ctx.pipeline().remove(this);
+                }
+            } catch (Throwable t) {
+                // 管线正在被拆除时移除会失败：忽略即可（本处理器终将被 netty 自己清掉）
+                LOGGER.debug("[Zstd] gate self-removal skipped: {}", t.toString());
+            }
         }
     }
 
@@ -263,13 +272,25 @@ public final class ZstdSwitchGate extends ChannelDuplexHandler {
             }
             ChannelHandlerContext c = selfCtx != null ? selfCtx : ctx;
             flushHeld(c);
+            // ⚠️ 只有在"连接仍然注册且活跃"时才回滚。
+            //
+            // 玩家断线 / 服务端关闭时，pipeline 会走 destroyDown→destroyUp 拆除，本方法
+            // 正是在那条链上被调用的（栈顶是 channelUnregistered）。此刻：
+            //   · 通道已注销 —— isRegistered() 为 false；
+            //   · 已注销的 pipeline 不允许再 replace/add/remove，且被移除的处理器会被
+            //     标记为"不可复用"，于是 Netty 抛
+            //     ChannelPipelineException（... is not a @Sharable handler）。
+            // 连接都死了，回滚毫无意义，只会在日志里刷一条吓人的堆栈。
+            Channel ch = ctx.channel();
+            boolean alive = ch.isRegistered() && ch.isActive();
             Runnable r = rollback;
             rollback = null;
-            if (r != null) {
+            if (alive && r != null) {
                 try {
                     r.run();
                 } catch (Throwable t) {
-                    LOGGER.warn("[Zstd] rollback action failed", t);
+                    // 管线拆除竞态下仍可能失败：只记 debug，绝不让它冒泡成日志噪音
+                    LOGGER.debug("[Zstd] rollback action skipped: {}", t.toString());
                 }
             }
             return;

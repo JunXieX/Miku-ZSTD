@@ -51,6 +51,51 @@ class ZstdSwitchGateTest {
     }
 
     @Test
+    @DisplayName("闸门：连接已关闭时，销毁收尾绝不得改动管线（否则会抛 ChannelPipelineException）")
+    void noRollbackOnChannelClosed() {
+        ZstdSwitchGate gate = ZstdSwitchGate.create();
+        java.util.concurrent.atomic.AtomicBoolean rolledBack =
+                new java.util.concurrent.atomic.AtomicBoolean();
+        gate.setRollback(() -> rolledBack.set(true));
+        EmbeddedChannel ch = new EmbeddedChannel(gate);
+
+        // ⚠️ 用 voidPromise：EmbeddedChannel 会对"普通 promise 失败"记录异常并在后续调用时
+        // 重放出来（那是测试框架的行为，不是缺陷）。voidPromise 不参与记录，
+        // 因此这里能干净地验证"销毁时不得回滚"。
+        ch.writeOneOutbound(new FakeMinecraftPacket(11), ch.voidPromise());
+        assertEquals(1, gate.heldCount(), "确认前必须扣住");
+
+        // 关闭 = 连接不可用。EmbeddedChannel 在 close 时会走 pipeline destroy 路径，
+        // 与线上"玩家断线→channelUnregistered→destroy"完全同型。
+        // 此时绝不得触发回滚：已注销的 pipeline 不接受任何 add/replace/remove，
+        // 原版压缩处理器又是非 @Sharable，重复插入必然抛 ChannelPipelineException。
+        ch.close();
+
+        assertNull(ch.pipeline().get(ZstdSwitchGate.class), "关闭后闸门应已从管线摘除");
+        assertFalse(rolledBack.get(), "连接已关闭：不得回滚（回滚只会抛 ChannelPipelineException）");
+        assertFalse(gate.isConfirmed(), "未确认");
+        ch.finishAndReleaseAll();
+    }
+
+    @Test
+    @DisplayName("闸门：回滚动作自身抛异常时不得冒泡（只记 debug）")
+    void rollbackFailureIsSwallowed() {
+        ZstdSwitchGate gate = ZstdSwitchGate.create();
+        gate.setRollback(() -> {
+            throw new IllegalStateException("boom");
+        });
+        EmbeddedChannel ch = new EmbeddedChannel(gate);
+
+        ch.writeOutbound(new FakeMinecraftPacket(12));
+        // 主动 abort（等价于客户端拒绝 / 安装失败）：不得让回滚异常逃逸
+        gate.abort();
+
+        assertNull(ch.pipeline().get(ZstdSwitchGate.class), "abort 后必须自移除");
+        assertEquals(12, ((FakeMinecraftPacket) ch.readOutbound()).id, "扣住的包必须补发");
+        ch.finishAndReleaseAll();
+    }
+
+    @Test
     @DisplayName("闸门：Netty 控制消息必须透传（扣住会卡死连接建立且无日志）")
     void doesNotHoldControlMessages() {
         ZstdSwitchGate gate = ZstdSwitchGate.create();

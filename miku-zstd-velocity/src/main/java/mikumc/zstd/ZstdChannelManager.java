@@ -477,6 +477,14 @@ public class ZstdChannelManager {
         try {
             var p = pipelineRef;
             if (p == null) return;
+            // ⚠️ 只有在连接仍然注册且活跃时才允许改动管线：
+            // 通道注销后 pipeline 正在被拆除，此时 replace 会抛 ChannelPipelineException
+            // （被移除的处理器被标记为不可复用）。那种情况下回滚既无意义也做不到。
+            var ch = (p == null) ? null : p.channel();
+            if (ch == null || !ch.isRegistered() || !ch.isActive()) {
+                LOGGER.debug("[Zstd] rollback skipped — channel already gone");
+                return;
+            }
             var dec = vanillaDecoder;
             if (dec != null && p.get("zstd_decoder") != null) {
                 p.replace("zstd_decoder", vanillaDecoderName, dec);
@@ -489,7 +497,9 @@ public class ZstdChannelManager {
             }
             LOGGER.info("[Zstd] rolled back to vanilla codecs (switch not confirmed)");
         } catch (Throwable t) {
-            LOGGER.warn("[Zstd] rollback to vanilla failed", t);
+            // 任何失败都只是日志噪音：连接要么已经死了，要么即将被替换回原版，
+            // 绝不能让它冒泡成 WARN + 长堆栈吓人。
+            LOGGER.debug("[Zstd] rollback to vanilla skipped: {}", t.toString());
         }
     }
 
