@@ -407,40 +407,89 @@ class FrameLayoutTest {
     }
 
     /**
-     * 切换窗口内的原版帧兼容（服务端专用）。
+     * 切换未确认时的行为（服务端专用）。
      *
-     * <p>背景：没有字典时，服务端收到 negotiate 应答就会激活，而客户端此时可能还没处理到
-     * SetCompression，仍在发原版帧。原版未压缩帧 {@code [0][裸包]} 与 zstd 直存帧同形，
-     * 不加区分会切出垃圾、让 Minecraft 解码器抛 {@code A packet frame decoder failed}。</p>
+     * <p>这不是"启发式猜测"：{@link ZstdSwitchGate} 保证确认之前客户端仍在用原版帧，
+     * 因此窗口内解码器<b>只</b>按原版规则解释。</p>
      */
     @Test
-    @DisplayName("切换窗口：原版未压缩帧（[0][裸包]）必须按原版解释，而不是当成 zstd 直存帧切包")
-    void legacyUncompressedFrameAcceptedDuringSwitchWindow() {
-        TestDecoder decoder = new TestDecoder(decompressCtx, true);
+    @DisplayName("握手窗口：切换未确认时，原版未压缩帧（[0][裸包]）必须整包按原版下传")
+    void legacyUncompressedFrameAcceptedWhenUnconfirmed() {
+        TestDecoder decoder = new TestDecoder(decompressCtx, true, false);
         EmbeddedChannel in = new EmbeddedChannel(decoder);
 
-        byte[] packet = fullPacket(ascii("legacy-login-ack"));
+        // 线上典型的小包：[0x00][0x08][0x70 0x10 0x00 0x01]——原版包 id 0x08、包体 4 字节。
+        byte[] packet = {0x08, 0x70, 0x10, 0x00, 0x01};
         ByteBuf frame = Unpooled.buffer();
-        ZstdVarInts.write(frame, 0);        // dataLength = 0 → 未压缩
+        // ⚠️ 必须带原版外层的 dataLength=0：EmbeddedChannel 没有前置 frame-decoder，
+        // 这条 0 在本解码器看来与 zstd 的 rawSize=0 相同，正是线上遇到的同形场景。
+        ZstdVarInts.write(frame, 0);
         frame.writeBytes(packet);
         in.writeInbound(frame);
 
         List<byte[]> got = drainInbound(in);
         assertEquals(1, got.size(), "必须还原成 1 个包");
         assertArrayEquals(packet, got.get(0), "内容必须与原版包完全一致");
-        assertTrue(in.isOpen(), "切换窗口内的原版帧不得关闭连接");
+        assertTrue(in.isOpen(), "原版帧不得关闭连接");
         in.finishAndReleaseAll();
     }
 
     @Test
-    @DisplayName("切换窗口：原版 zlib 压缩帧（[rawLen][deflate]）必须能用 zlib 解开")
-    void legacyZlibFrameAcceptedDuringSwitchWindow() {
-        TestDecoder decoder = new TestDecoder(decompressCtx, true);
+    @DisplayName("握手窗口：同一个原版帧在确认之后必须被拒绝（严格 zstd 模式）")
+    void legacyFrameRejectedWhenConfirmed() {
+        TestDecoder decoder = new TestDecoder(decompressCtx, true, true);
         EmbeddedChannel in = new EmbeddedChannel(decoder);
 
-        // 帧体 = [rawLen][raw deflate(payload)] 之后再紧跟一个原版未压缩帧的 [0]。
+        byte[] packet = {0x08, 0x70, 0x10, 0x00, 0x01};
+        ByteBuf frame = Unpooled.buffer();
+        ZstdVarInts.write(frame, 0);
+        frame.writeBytes(packet);
+        in.writeInbound(frame);
+        in.runPendingTasks();
+
+        // 已确认 = 协议保证对端在发 zstd 帧：内层长度 8 与实际 4 字节不符 → fail-fast
+        assertNull(in.readInbound(), "严格模式下不得把它当成原版帧放行");
+        assertFalse(in.isOpen(), "严格模式下畸形帧必须关闭连接");
+        in.finishAndReleaseAll();
+    }
+
+    @Test
+    @DisplayName("握手窗口：确认到达后，同一连接立即转为严格模式（不会把 zstd 帧误当原版）")
+    void strictModeTakesEffectImmediatelyAfterConfirm() {
+        TestDecoder decoder = new TestDecoder(decompressCtx, true, false);
+        EmbeddedChannel in = new EmbeddedChannel(decoder);
+
+        // 窗口内：原版裸包整包下传
+        byte[] vanilla = {0x2A, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08};
+        ByteBuf vf = Unpooled.buffer();
+        ZstdVarInts.write(vf, 0);
+        vf.writeBytes(vanilla);
+        in.writeInbound(vf);
+        assertArrayEquals(vanilla, drainInbound(in).get(0), "窗口内必须当作原版帧");
+
+        // 客户端确认后：同样的字节必须按 zstd 直存帧切包
+        decoder.confirm();
+        ByteBuf zf = Unpooled.buffer();
+        ZstdVarInts.write(zf, 0);
+        ZstdVarInts.write(zf, vanilla.length);
+        zf.writeBytes(vanilla);
+        in.writeInbound(zf);
+        List<byte[]> got = drainInbound(in);
+        assertEquals(1, got.size(), "确认后必须按 zstd 帧解析");
+        assertArrayEquals(vanilla, got.get(0), "切包后内容必须一致");
+        assertTrue(in.isOpen(), "合法 zstd 帧不得关闭连接");
+        in.finishAndReleaseAll();
+    }
+
+    @Test
+    @DisplayName("握手窗口：原版 zlib 压缩帧（[rawLen][deflate]）必须能用 zlib 解开，且混批的多余字节按原版丢弃")
+    void legacyZlibFrameAcceptedWhenUnconfirmed() {
+        TestDecoder decoder = new TestDecoder(decompressCtx, true, false);
+        EmbeddedChannel in = new EmbeddedChannel(decoder);
+
+        // 帧体 = [rawLen][raw deflate(packet)] 之后再紧跟一个原版未压缩帧的 [0]。
         // 这正是真实管线里的"混批"形态：前置 frame-decoder 只按外层长度切帧，
-        // 下一帧的裸包会被一起带进本帧的帧体。
+        // 下一帧的裸包会被一起带进本帧的帧体（原版解码器同样忽略这些多余字节）。
         byte[] packet = fullPacket(repetitive(300));
         byte[] deflated = rawDeflate(packet);
 
@@ -458,9 +507,81 @@ class FrameLayoutTest {
     }
 
     @Test
-    @DisplayName("切换窗口：真·原版压缩帧（rawLen 即解压长度）必须整包还原，不得切包")
-    void legacyFullZlibFrameAcceptedDuringSwitchWindow() {
-        TestDecoder decoder = new TestDecoder(decompressCtx, true);
+    @DisplayName("握手窗口：内层长度恰好自洽的原版裸包（id=长度）也整包下传——不做任何形状猜测")
+    void ambiguousVanillaPacketTreatedAsVanilla() {
+        TestDecoder decoder = new TestDecoder(decompressCtx, true, false);
+        EmbeddedChannel in = new EmbeddedChannel(decoder);
+
+        // 包 id = 0x2D = 45，包体共 46 字节 → "id 数值恰好等于剩余字节数"，
+        // 只看内层长度自洽性会被误当成 zstd 直存帧。窗口内一律按原版处理。
+        byte[] packet = new byte[46];
+        packet[0] = 0x2D;
+        packet[1] = (byte) 0xAA;
+        ByteBuf frame = Unpooled.buffer();
+        ZstdVarInts.write(frame, 0);
+        frame.writeBytes(packet);
+        in.writeInbound(frame);
+
+        List<byte[]> got = drainInbound(in);
+        assertEquals(1, got.size(), "必须还原成 1 个包");
+        assertArrayEquals(packet, got.get(0), "必须整包原样下传（含包 id）");
+        assertTrue(in.isOpen(), "不得关闭连接");
+        in.finishAndReleaseAll();
+    }
+
+    @Test
+    @DisplayName("严格模式（已确认）：合法的 zstd 直存帧（单包 / 多包 / 大包长前缀）按 zstd 切包")
+    void realZstdStoredFramesStillRecognized() {
+        TestDecoder decoder = new TestDecoder(decompressCtx, true, true);
+        EmbeddedChannel in = new EmbeddedChannel(decoder);
+
+        // 单包直存：[0][pktLen=20][0x2A …]（pktLen 之后是包 id 0x2A，落在 0~2 之外）。
+        // ⚠️ 这里必须直接 writeInbound（不进 feed()）：feed() 会把形如
+        // [0][7] 的帧误当成 [bodyLen][...] 剥掉首字节。
+        // ⚠️ 包 id 取 0x2A：包 id 为 0/1/2 的样本在切换窗口内与原版裸包无法区分。
+        byte[] packet = fullPacket(ascii("stored-payload-1234"));
+        ByteBuf single = Unpooled.buffer();
+        ZstdVarInts.write(single, 0);
+        ZstdVarInts.write(single, packet.length);
+        single.writeBytes(packet);
+        in.writeInbound(single);
+        List<byte[]> got = drainInbound(in);
+        assertEquals(1, got.size(), "单包直存帧应还原出 1 个包");
+        assertArrayEquals(packet, got.get(0), "包内容必须与写入一致");
+
+        // 多包直存：pktLen 9（首发字节 0x09，第二字节 0x2A 是包 id）
+        ByteBuf multi = Unpooled.buffer();
+        ZstdVarInts.write(multi, 0);
+        ZstdVarInts.write(multi, 9);
+        multi.writeBytes(new byte[]{0x2A, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08});
+        ZstdVarInts.write(multi, 3);
+        multi.writeBytes(new byte[]{0x2B, 0x21, 0x22});
+        in.writeInbound(multi);
+        List<byte[]> got2 = drainInbound(in);
+        assertEquals(2, got2.size(), "多包直存帧应还原出 2 个包");
+        assertEquals(9, got2.get(0).length, "第 1 个包长度");
+        assertEquals(0x2A, got2.get(0)[0] & 0xFF, "第 1 个包 id");
+        assertArrayEquals(new byte[]{0x2B, 0x21, 0x22}, got2.get(1), "第 2 个包内容");
+
+        // 大包长前缀（≥128 → 首字节带续位，第二字节为续位字节 ≥0x80）
+        byte[] big = new byte[200];
+        big[0] = 0x2C;
+        ByteBuf bigFrame = Unpooled.buffer();
+        ZstdVarInts.write(bigFrame, 0);
+        ZstdVarInts.write(bigFrame, big.length);
+        bigFrame.writeBytes(big);
+        in.writeInbound(bigFrame);
+        List<byte[]> got3 = drainInbound(in);
+        assertEquals(1, got3.size(), "大包长前缀的直存帧应还原出 1 个包");
+        assertArrayEquals(big, got3.get(0), "大包内容必须一致");
+        assertTrue(in.isOpen(), "合法 zstd 帧不得关闭连接");
+        in.finishAndReleaseAll();
+    }
+
+    @Test
+    @DisplayName("降级：真·原版压缩帧（rawLen 即解压长度）必须整包还原，不得切包")
+    void legacyFullZlibFrameAcceptedWhenUnconfirmed() {
+        TestDecoder decoder = new TestDecoder(decompressCtx, true, false);
         EmbeddedChannel in = new EmbeddedChannel(decoder);
 
         byte[] packet = fullPacket(repetitive(600));
@@ -479,13 +600,13 @@ class FrameLayoutTest {
     }
 
     @Test
-    @DisplayName("切换窗口：一旦见过合法 zstd 帧，畸形帧仍必须被严格拒绝")
-    void legacyFallbackStopsAfterFirstZstdFrame() {
-        TestDecoder decoder = new TestDecoder(decompressCtx, true);
+    @DisplayName("严格模式：见过合法 zstd 帧之后，畸形帧仍必须被拒绝")
+    void malformedFrameRejectedAfterValidZstdFrame() {
+        TestDecoder decoder = new TestDecoder(decompressCtx, true, true);
         EmbeddedChannel in = new EmbeddedChannel(decoder);
 
-        // 先来一个合法 zstd 直存帧
-        byte[] packet = fullPacket(ascii("zstd-packet"));
+        // 先来一个合法 zstd 直存帧：[0][pktLen=9][0x2A …]（pktLen 之后是包 id 0x2A）。
+        byte[] packet = {0x2A, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08};
         ByteBuf ok = Unpooled.buffer();
         ZstdVarInts.write(ok, 0);
         ZstdVarInts.write(ok, packet.length);
@@ -493,11 +614,13 @@ class FrameLayoutTest {
         in.writeInbound(ok);
         assertEquals(1, drainInbound(in).size(), "首个合法 zstd 帧应正常还原");
 
-        // 再来一个内层长度越界的畸形帧：不得被当成"原版帧"放行
+        // 再来一个内层长度越界的畸形帧：不得被当成"原版帧"放行。
+        // 形态：[0][pktLen=0x8C 0x02=268][0x2A …]——pktLen 是两字节 varint（0x8C 带续位），
+        // 属于明确的 zstd 帧形状，但内层声明 268 字节而实际只有 4 字节，必须 fail-fast。
         ByteBuf bad = Unpooled.buffer();
         ZstdVarInts.write(bad, 0);
-        ZstdVarInts.write(bad, 999);
-        bad.writeBytes(ascii("short"));
+        ZstdVarInts.write(bad, 268);
+        bad.writeBytes(new byte[]{0x2A, 0x01, 0x02, 0x03});
         in.writeInbound(bad);
         in.runPendingTasks();
         assertNull(in.readInbound(), "见过 zstd 帧后不得再回退");
@@ -834,13 +957,13 @@ class FrameLayoutTest {
     }
 
     /**
-     * 用 <b>raw deflate</b>（{@code nowrap = true}）压缩：与 Minecraft 原版
-     * {@code new Deflater(level, true)} / {@code new Inflater(true)} 一致。
+     * 用 <b>zlib 包装</b>（{@code new Deflater()}）压缩：与 Minecraft 原版
+     * {@code CompressionEncoder} / {@code new Inflater()} 一致（线上带 zlib 头/尾）。
      */
     private static byte[] rawDeflate(byte[] data) {
         java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
         java.util.zip.Deflater deflater = new java.util.zip.Deflater(
-                java.util.zip.Deflater.DEFAULT_COMPRESSION, true);
+                java.util.zip.Deflater.DEFAULT_COMPRESSION);
         try {
             deflater.setInput(data);
             deflater.finish();
@@ -933,19 +1056,39 @@ class FrameLayoutTest {
         Throwable lastError;
 
         private final boolean legacy;
+        /** 切换是否已确认（可变：用于验证"确认之后立即转严格模式"） */
+        private volatile boolean confirmed;
 
         TestDecoder(ZstdDecompressCtx ctx) {
-            this(ctx, false);
+            this(ctx, false, true);
         }
 
         TestDecoder(ZstdDecompressCtx ctx, boolean legacy) {
+            this(ctx, legacy, true);
+        }
+
+        /**
+         * @param legacy    是否允许在切换未确认时按原版规则解释入站帧（服务端为 true）
+         * @param confirmed 切换是否已被客户端确认（true = 严格模式）
+         */
+        TestDecoder(ZstdDecompressCtx ctx, boolean legacy, boolean confirmed) {
             this.ctx = ctx;
             this.legacy = legacy;
+            this.confirmed = confirmed;
+        }
+
+        void confirm() {
+            confirmed = true;
         }
 
         @Override
         protected boolean acceptsLegacyFrames() {
             return legacy;
+        }
+
+        @Override
+        protected boolean switchConfirmed() {
+            return confirmed;
         }
 
         @Override

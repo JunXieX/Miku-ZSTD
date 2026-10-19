@@ -95,16 +95,24 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
 
         // 2) 包层拦截协商应答（需在 packet_handler 之前消费，否则原版会当成"意外应答"断连）
         // ⚠️ 这里<b>不能</b>用 `!mgr.isResponseReceived()` 做前置门控：
-        //   该标志在收到 negotiate 应答时就已置 true，而协议 v4 的 zstd:dict 应答
-        //   是<b>之后</b>才到的第二条应答。加上这个门控的后果是——字典应答既不被消费、
-        //   也不解析，`confirmed` 永远为 false，激活前的硬门控判定"客户端请求了字典但未确认"
-        //   并回落原版：<b>凡是需要字典的客户端在 Paper 端永远用不上 zstd</b>。
-        //   真正的去重判据是下面的 txId 匹配（dictTxId 未设置时为 -1，不会误命中）；
-        //   激活成功后协商器会自移除，也不会留下长期开销。
+        //    该标志在收到 negotiate 应答时就已置 true，而协议 v4 的 zstd:dict 应答
+        //    是<b>之后</b>才到的第二条应答。加上这个门控的后果是——字典应答既不被消费、
+        //    也不解析，`confirmed` 永远为 false，激活前的硬门控判定"客户端请求了字典但未确认"
+        //    并回落原版：<b>凡是需要字典的客户端在 Paper 端永远用不上 zstd</b>。
+        //    真正的去重判据是下面的 txId 匹配（dictTxId 未设置时为 -1，不会误命中）；
+        //    激活成功后协商器会自移除，也不会留下长期开销。
         // ⚠️ 但必须保留「尚未发起协商就整段跳过」：否则回落原版的连接上，
-        //   本处理器会对**每一个**入站包做 getSimpleName + 字段反射读取，
-        //   是每条原版连接都要永久支付的税（negotiateTxId 为 -1 时不可能命中任何应答）。
+        //    本处理器会对**每一个**入站包做 getSimpleName + 字段反射读取，
+        //    是每条原版连接都要永久支付的税（negotiateTxId 为 -1 时不可能命中任何应答）。
         if (mgr != null && msg != null && mgr.getNegotiateTxId() != -1) {
+            // 0) 切换确认（客户端发来的 zstd:switch）：必须在通用应答解析之前拦下
+            if (isSwitchConfirmation(msg)) {
+                io.netty.util.ReferenceCountUtil.release(msg);
+                if (mgr.isReplaced()) {
+                    mgr.markSwitchConfirmed();
+                }
+                return;
+            }
             String cn = msg.getClass().getSimpleName();
             if (cn.contains("Query") || cn.contains("Plugin")) {
                 int tx = readInt(msg, "transactionId", "id", "transactionID");
@@ -347,6 +355,7 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
         if (!channel.isActive()) return;
 
         if (!mgr.hasEncoderAnchor(channel) || !mgr.hasDecoderAnchor(channel)) {
+            // 原版 compress/decompress 是在 SetCompression 写出之后才装的，首轮必然缺失。
             if (installAttempt < MAX_RETRIES) {
                 channel.eventLoop().schedule(() -> installHandlers(ctx, mgr, installAttempt + 1),
                         RETRY_MS, TimeUnit.MILLISECONDS);
@@ -357,21 +366,41 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
             finishVanilla(ctx);
             return;
         }
-        if (!mgr.installEncoder(channel) || !mgr.installDecoder(channel)) {
-            // 锚点已齐备却仍装不上：属异常（例如处理器正被其它插件动态移除）。
-            // 同样按重试 / 最终回落处理，绝不留半装管道。
+
+        // ⚠️ 闸门必须先于编码器就位（包层），且必须先于解码器——解码器靠它的状态判断
+        // "当前入站是否还可能是原版帧"。
+        mgr.installSwitchGate(channel);
+
+        if (!mgr.installEncoder(channel)) {
             if (installAttempt < MAX_RETRIES) {
                 channel.eventLoop().schedule(() -> installHandlers(ctx, mgr, installAttempt + 1),
                         RETRY_MS, TimeUnit.MILLISECONDS);
                 return;
             }
-            LOGGER.warn("[Zstd] zstd 编解码器安装失败（锚点在位却替换失败）— 回落原版; pipeline={}",
+            LOGGER.warn("[Zstd] zstd 编码器安装失败（锚点在位却替换失败）— 回落原版; pipeline={}",
+                    channel.pipeline().names());
+            finishVanilla(ctx);
+            return;
+        }
+        if (!mgr.installDecoder(channel)) {
+            // 解码器安装失败：立即回滚已装的编码器，避免半装管道。
+            if (installAttempt < MAX_RETRIES) {
+                channel.eventLoop().schedule(() -> installHandlers(ctx, mgr, installAttempt + 1),
+                        RETRY_MS, TimeUnit.MILLISECONDS);
+                return;
+            }
+            LOGGER.warn("[Zstd] zstd 解码器安装失败（锚点在位却替换失败）— 回落原版; pipeline={}",
                     channel.pipeline().names());
             finishVanilla(ctx);
             return;
         }
         mgr.setReplaced(true); // 计数已内聚在 setReplaced 内（幂等，避免重复 +1）
         LOGGER.info("[Zstd] zstd transport activated on Paper");
+
+        // ⚠️ 闸门此刻正扣着登录期的大帧（例如 LoginSuccess 压缩帧）。客户端在收到它之前
+        // 不可能完成登录，也就没有任何东西会触发它的切换 —— 必须主动补一条"服务端已就绪"。
+        sendSwitchRequest(channel);
+
         releaseHeld(ctx);
         // 激活后本处理器已无用：留在管线里会让**每个**出站包多一次 attr 查询、
         // 每个入站包多一次 getSimpleName().contains(...) 判定，是永久税。
@@ -459,6 +488,60 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
             }
             heldPromises.clear();
         }
+    }
+
+    /**
+     * 发送"服务端已切换，请切换并发确认"（{@code zstd:switch}，4 字节魔数）。
+     *
+     * <p>⚠️ 经 {@code zstd_encoder} 的 context 写出：此刻原版压缩编码器已被替换，
+     * 外层长度由 prepender 负责，对端（已切换的解码器）按 zstd 直存帧读出裸包。</p>
+     */
+    private static void sendSwitchRequest(Channel channel) {
+        // ⚠️ 从 zstd_encoder 的 ctx 写出，并自己编码成 zstd 直存帧：
+        //   · ctx.write 会跳过 zstd_encoder 本身，所以不能再让它编码一次；
+        //   · 闸门位于压缩编码器之前，从它之后写出不会被自己扣住；
+        //   · 外层长度由 prepender 负责（Paper 有独立 prepender）。
+        io.netty.channel.ChannelHandlerContext writeCtx = channel.pipeline().context("zstd_encoder");
+        if (writeCtx == null) {
+            LOGGER.debug("[Zstd] cannot send switch request — zstd_encoder anchor missing");
+            return;
+        }
+        ByteBuf packet = writeCtx.alloc().buffer();
+        ByteBuf frame = writeCtx.alloc().buffer();
+        try {
+            mikumc.zstd.protocol.ZstdStepFrames.writeQuery(packet,
+                    ThreadLocalRandom.current().nextInt(1, Integer.MAX_VALUE),
+                    mikumc.zstd.protocol.ZstdSwitchGate.CHANNEL);
+            int pktLen = packet.readableBytes();
+            ZstdVarInts.write(frame, 0);
+            ZstdVarInts.write(frame, pktLen);
+            frame.writeBytes(packet);
+            writeCtx.writeAndFlush(frame);
+            LOGGER.debug("[Zstd] switch request sent");
+        } catch (Throwable t) {
+            if (packet.refCnt() > 0) packet.release();
+            if (frame.refCnt() > 0) frame.release();
+            LOGGER.debug("[Zstd] failed to send switch request: {}", t.toString());
+        } finally {
+            if (packet.refCnt() > 0) packet.release();
+        }
+    }
+
+    /**
+     * 客户端发回的切换确认。
+     *
+     * <p>Paper 端在<b>包层</b>就能看到它（Velocity 端则在帧层——两端管线不同，这是有意的）：
+     * 包体是 {@code [varint txId][varint len][channel][int magic]}，只要尾部 4 字节是魔数即可。</p>
+     */
+    private static boolean isSwitchConfirmation(Object msg) {
+        if (msg == null) return false;
+        String cn = msg.getClass().getSimpleName();
+        if (!cn.contains("Query") && !cn.contains("Plugin")) return false;
+        byte[] payload = readBytes(msg, "data", "payload", "contents");
+        if (payload == null || payload.length < 4) return false;
+        byte[] magic = new byte[4];
+        System.arraycopy(payload, payload.length - 4, magic, 0, 4);
+        return mikumc.zstd.protocol.ZstdStepFrames.matchesMagic(magic);
     }
 
     /**

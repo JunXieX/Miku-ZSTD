@@ -87,6 +87,9 @@ public class ZstdChannelManager {
     private volatile boolean replaced;
     private volatile boolean negotiationSent;
 
+    /** 本连接的切换闸门（未安装时为 null，此时按"未确认"处理）。 */
+    private volatile mikumc.zstd.protocol.ZstdSwitchGate switchGate;
+
     /** 已从注册表取用的字典条目，连接关闭时归还引用 */
     private ZstdDictRegistry.Entry encoderDictEntry;
     private ZstdDictRegistry.Entry decoderDictEntry;
@@ -283,6 +286,17 @@ public class ZstdChannelManager {
         return protocolMismatch;
     }
 
+    /**
+     * 标记"本连接不参与 zstd"（客户端据此回落原版）。
+     *
+     * <p>用途：本端在 SetCompression 写出之前就已放弃 zstd（协商超时 / 锚点缺失），
+     * 而后到的那条 SetCompression 会让客户端照常切到 zstd。必须把它判成协议不匹配，
+     * 否则形成"服务端原版 / 客户端 zstd"。幂等。</p>
+     */
+    public void setProtocolMismatch() {
+        this.protocolMismatch = true;
+    }
+
     public boolean isReplaced() {
         return replaced;
     }
@@ -340,11 +354,114 @@ public class ZstdChannelManager {
     }
 
     /**
-     * 用 zstd 解码器替换原版压缩解码器。
+     * 安装切换闸门（幂等）。
+     *
+     * <p>⚠️ <b>必须挂在 {@code compression-encoder} 之前</b>，即放在 MC 原始包层：</p>
+     * <ul>
+     *   <li>扣住的是 <b>MC 包对象</b>，包类型可直接辨认（不必去翻最终帧的字节）；</li>
+     *   <li>被扣的包在放行时走的是"当时的"编码器 —— 激活后就是 zstd 编码器，
+     *       因此客户端收到的一定是 zstd 帧（而确认之前客户端收到的都是原版帧）。</li>
+     * </ul>
+     * <p>挂在更靠后的位置（已编码的字节层）则必须先有外层长度、且放行时的编码形态已经固定，
+     * 无法满足"放行时按新编码器编码"这一要求。</p>
+     */
+    /**
+     * 安装切换闸门（幂等）：挂在原版压缩编码器<b>之后</b>（出站方向更靠 head），即 MC 包层。
+     *
+     * <p>⚠️ 位置必须是 {@code addAfter(compress)}：</p>
+     * <ul>
+     *   <li><b>包层</b>才能按包类型判定该不该扣；</li>
+     *   <li>扣住的包在放行时才交给下游编码器 —— 此刻 {@code compress} 已被 {@code zstd_encoder}
+     *       替换，因此放行出去的一定是 zstd 帧；</li>
+     *   <li>切换请求由服务端经 {@code zstd_encoder} 的 ctx 写出，那是本闸门的<b>下游</b>，
+     *       不会回头经过它（{@code addBefore} 则会把请求自己扣住，握手必然超时）。</li>
+     * </ul>
+     *
+     * @return 闸门是否已就位（{@code false} = 锚点缺失，调用方应中止激活）
+     */
+    private boolean installSwitchGate(Channel channel) {
+        io.netty.channel.ChannelPipeline p = channel.pipeline();
+        if (switchGate != null) return true;
+        String installed = null;
+        for (String anchor : new String[]{"compression-encoder", "compress"}) {
+            if (p.get(anchor) != null) {
+                switchGate = mikumc.zstd.protocol.ZstdSwitchGate.create();
+                // ⚠️ 必须在编码器<b>之前</b>（出站方向更靠近 tail）：此时拿到的是 MC 包对象，
+                // 才能按包类型判定；而且放行时才会真正交给编码器（那时它已是 zstd_encoder）。
+                // 服务端自己的切换请求因此改为"手工编码的 zstd 直存帧、从编码器之后写出"，
+                // 既不会回头被本闸门扣住，也不需要编码器再处理一次。
+                p.addBefore(anchor, "zstd_switch_gate", switchGate);
+                installed = anchor;
+                break;
+            }
+        }
+        if (installed == null) {
+            LOGGER.warn("[Zstd] switch gate not installed — compression encoder anchor missing; "
+                    + "pipeline={}", p.names());
+            return false;
+        }
+        // 确认嗅探器挂在压缩解码器之前（帧层）：确认包可能被原版压缩或直存
+        if (p.get("zstd_switch_confirm") == null) {
+            // ⚠️ 也要认 zstd_decoder：解码器可能已经被替换，原名字已不存在。
+            for (String anchor : new String[]{"compression-decoder", "decompress", "zstd_decoder"}) {
+                if (p.get(anchor) != null) {
+                    p.addBefore(anchor, "zstd_switch_confirm", new ZstdSwitchConfirmSniffer());
+                    break;
+                }
+            }
+        }
+        return true;
+    }
+
+    /**
+     * 确认已收到但闸门已不在管线里（例如已超时自移除）。
+     *
+     * <p>闸门的超时语义是"视为已确认并保持双向 zstd"（见 {@code ZstdSwitchGate} 的注释），
+     * 因此这里只需记日志；解码器按 {@code isSwitchConfirmed()} 判断即可。</p>
+     */
+    public void markSwitchConfirmed() {
+        LOGGER.debug("[Zstd] switch confirmation received after the gate was already released");
+    }
+
+    /**
+     * 本连接是否已由客户端确认切换（供解码器决定是否启用握手窗口模式）。
+     *
+     * <p>闸门尚未安装（zstd 还未激活）时按"未确认"返回：此时解码器本身也不在管线里，
+     * 语义上就是"切换尚未发生"。</p>
+     */
+    public boolean isSwitchConfirmed() {
+        var gate = switchGate;
+        return gate != null && gate.isConfirmed();
+    }
+
+    /**
+     * 安装编解码器（先装闸门，再装编码器，最后装解码器）。
+     *
+     * <p>⚠️ 顺序不可调换：</p>
+     * <ol>
+     *   <li>闸门必须先于 {@code zstd_encoder} 插入——否则激活之后到确认之前，
+     *       出站帧会以 zstd 形态直接发给还没切换的客户端；而它同时必须先于
+     *       {@code zstd_decoder} 就位：解码器在确认之前只按原版规则解释；</li>
+     *   <li>{@code zstd_encoder} 的 {@code handlerAdded} 会立即解析压缩上下文，
+     *       因此必须在字典装载之后插入。</li>
+     * </ol>
      *
      * @return 是否确实安装成功
      */
-    public boolean installDecoder(Channel channel) {
+    public boolean installHandlers(Channel channel) {
+        installSwitchGate(channel);
+        if (!installEncoder(channel)) return false;
+        return installDecoder(channel);
+    }
+
+    /**
+     * 用 zstd 解码器替换原版压缩解码器。
+     *
+     * <p>⚠️ 调用前 {@link #installSwitchGate} 必须已执行（见 {@link #installHandlers}）。</p>
+     *
+     * @return 是否确实安装成功
+     */
+    private boolean installDecoder(Channel channel) {
         if (channel == null) return false;
         var p = channel.pipeline();
         if (p.get("zstd_decoder") != null) return true;

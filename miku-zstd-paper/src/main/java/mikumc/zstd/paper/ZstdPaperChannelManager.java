@@ -230,6 +230,9 @@ public class ZstdPaperChannelManager {
         }
     }
 
+    /** 本连接的切换闸门（未安装时为 null，此时按"未确认"处理）。 */
+    private volatile mikumc.zstd.protocol.ZstdSwitchGate switchGate;
+
     public boolean installEncoder(Channel channel) {
         var p = channel.pipeline();
         if (p.get("zstd_encoder") != null) return true;
@@ -282,6 +285,69 @@ public class ZstdPaperChannelManager {
         }
         // 同上：绝不提前插入，只替换原版装好的 decompress
         return false;
+    }
+
+    /**
+     * 安装切换闸门（幂等）：挂在 {@code compress} 之前，即 <b>MC 包层</b>。
+     *
+     * <p>⚠️ 必须先在包层扣住，激活后才能改用 zstd 编码器；挂在字节层则放行时用的仍是
+     * 扣下那一刻的编码形态。详见共享层 {@code ZstdSwitchGate} 的类注释。</p>
+     */
+    public void installSwitchGate(Channel channel) {
+        if (switchGate != null) return;
+        var p = channel.pipeline();
+        if (p.get("zstd_switch_gate") != null) return;
+        for (String anchor : new String[]{"compress", "compression-encoder"}) {
+            if (p.get(anchor) != null) {
+                switchGate = mikumc.zstd.protocol.ZstdSwitchGate.create();
+                // ⚠️ 必须在编码器<b>之前</b>：此时拿到的是 MC 包对象（才能按包类型判定），
+                // 且放行时才会交给编码器（那时它已是 zstd_encoder）。
+                // 服务端自己的切换请求因此改为"手工编码的 zstd 直存帧、从编码器之后写出"。
+                p.addBefore(anchor, "zstd_switch_gate", switchGate);
+                installConfirmSniffer(p);
+                return;
+            }
+        }
+        LOGGER.debug("[Zstd] 切换闸门未能安装（compress 锚点缺失）; pipeline={}", p.names());
+    }
+
+    /**
+     * 在压缩解码器之前安装确认嗅探器（帧层）。
+     *
+     * <p>⚠️ 必须在帧层：包层看到它时已经被原版解码器按"未知包 id"处理掉了。</p>
+     */
+    private void installConfirmSniffer(io.netty.channel.ChannelPipeline p) {
+        if (p.get(ZstdPaperSwitchConfirmSniffer.NAME) != null) return;
+        // ⚠️ 必须同时认 zstd_decoder：如果解码器已经被替换，原来的 decompress 名字就不存在了。
+        for (String anchor : new String[]{"decompress", "compression-decoder", "zstd_decoder"}) {
+            if (p.get(anchor) != null) {
+                p.addBefore(anchor, ZstdPaperSwitchConfirmSniffer.NAME,
+                        new ZstdPaperSwitchConfirmSniffer());
+                return;
+            }
+        }
+        LOGGER.debug("[Zstd] 确认嗅探器未能安装（压缩解码器锚点缺失）; pipeline={}", p.names());
+    }
+
+    /** 本连接是否已由客户端确认切换（供解码器决定是否启用握手窗口模式）。 */
+    public boolean isSwitchConfirmed() {
+        var gate = switchGate;
+        return gate != null && gate.isConfirmed();
+    }
+
+    /**
+     * 收到客户端的切换确认：放行扣住的包，并把本连接切换为严格 zstd 入站。
+     *
+     * <p>⚠️ 必须真正调用 {@code gate.confirm()}：只改一个标志位的话，闸门会一直扣到
+     * 2 秒超时，玩家在这段时间里收不到 LoginSuccess（表现为卡在登录界面）。</p>
+     */
+    public void markSwitchConfirmed() {
+        var gate = switchGate;
+        if (gate != null) {
+            gate.confirm();
+        } else {
+            LOGGER.debug("[Zstd] switch confirmation received after the gate was already released");
+        }
     }
 
     public void close() {

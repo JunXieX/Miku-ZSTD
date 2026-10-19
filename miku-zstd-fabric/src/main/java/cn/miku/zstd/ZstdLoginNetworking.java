@@ -86,6 +86,11 @@ public final class ZstdLoginNetworking {
             }
             final ZstdChannelManager mgr = existing;
 
+            // ⚠️ 这里<b>不</b>安装切换嗅探器：此刻压缩处理器还没装，唯一的锚点会是
+            // packet_handler —— 那里收到的是已解码的 Packet 对象，帧层识别根本不会执行，
+            // 而且之后再也不会被挪到正确位置（安装幂等）。正确时机在
+            // ZstdClientActivation.activateInEventLoop 替换出 zstd_decoder 之后。
+
             // 每个方向：READY = 已就绪（无需字典或本地已缓存），NEED_DICT = 需要服务端推送
             byte encoderStatus = resolve(mgr, encoderDictId, true);
             byte decoderStatus = resolve(mgr, decoderDictId, false);
