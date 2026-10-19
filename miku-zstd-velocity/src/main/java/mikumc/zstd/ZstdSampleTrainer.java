@@ -285,17 +285,21 @@ public class ZstdSampleTrainer {
                     name, samples, minSamples);
             return false;
         }
-        forceTrain();
-        return true;
+        return forceTrain();
     }
 
-    /** 强制触发训练（{@code /mikuzstd train force}），绕过采样门槛与冷却。 */
-    public void forceTrain() {
+    /**
+     * 强制触发训练（{@code /mikuzstd train force}），绕过采样门槛与冷却。
+     *
+     * @return 是否<b>确实</b>提交了训练任务：执行器已关闭（关服 / 插件停用）或已有训练在跑时
+     *         返回 {@code false} —— 调用方据此给出诚实的提示，而不是一律回"已触发"。
+     */
+    public boolean forceTrain() {
         ExecutorService te = trainExecutor;
-        if (te == null) return;
+        if (te == null) return false;
         if (!training.compareAndSet(false, true)) {
             LOGGER.info("[Zstd] {} training already in progress", name);
-            return;
+            return false;
         }
         int count;
         synchronized (this) {
@@ -313,9 +317,11 @@ public class ZstdSampleTrainer {
         // 字典机制静默失效。这类"标志位只在成功路径复位"的缺陷不会报错，只会让功能悄悄死掉。
         try {
             te.execute(() -> trainAndAdopt(belowMin));
+            return true;
         } catch (RejectedExecutionException e) {
             training.set(false);
             LOGGER.debug("[Zstd] {} training not submitted (executor shut down)", name);
+            return false;
         }
     }
 
