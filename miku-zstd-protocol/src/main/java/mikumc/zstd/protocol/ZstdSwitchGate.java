@@ -13,8 +13,19 @@ import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 /**
- * 切换闸门：服务端在激活 zstd 之前插入（<b>MC 包层</b>，即原版/新版压缩编码器之前），
- * 在客户端确认切换之前<b>扣住登录期的出站包</b>。
+ * 切换闸门：服务端在激活 zstd 之前插入（<b>MC 包层</b>，在客户端确认切换之前
+ * <b>扣住登录期的出站包</b>）。
+ *
+ * <h2>⚠️ 安装位置必须落在"包层编码器之后、压缩编码器之前"</h2>
+ * <p>Netty 出站事件<b>从 tail 走向 head</b>，所以"闸门能看见 MC 包对象"的充要条件是：
+ * 闸门在管线里的位置比<b>把 Packet 变成 ByteBuf 的那个处理器</b>（Velocity 的
+ * {@code minecraft-encoder} / Paper 的 {@code encoder}）更靠 tail。</p>
+ *
+ * <p>⚠️ 不能拿<b>压缩编码器</b>当锚点：它消费的是 ByteBuf，而且在管线里位于包层编码器的
+ * <b>head 侧</b>（例如 Paper/原版用 {@code addBefore("encoder", "compress")} 插入它）。
+ * 把闸门插在压缩编码器旁边，出站仍会先经过包层编码器 —— 消息已是 ByteBuf，
+ * {@link #mustHold} 对其返回 {@code false}，闸门将<b>一个包都扣不住</b>，
+ * 本类承诺的协议保证会静默失效（客户端还没切换就收到 zstd 压缩帧 → 断连）。</p>
  *
  * <h2>它解决什么</h2>
  * <p>没有闸门时：服务端一收到协商应答就换掉入站解码器，而客户端可能还没处理到

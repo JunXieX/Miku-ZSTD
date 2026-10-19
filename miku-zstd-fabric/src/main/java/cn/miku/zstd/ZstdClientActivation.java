@@ -114,6 +114,51 @@ public final class ZstdClientActivation {
     }
 
     /**
+     * 本轮登录明确判定"不参与 zstd"（版本不匹配 / 载荷异常 / 客户端无法加载字典）：请激活层
+     * 拆掉上一轮可能残留的 zstd 处理器。
+     *
+     * <p>⚠️ 同一个 {@code Channel} 可能被<b>重放登录</b>（ViaFabricPlus 协议切换、或同一条连接
+     * 重新协商）。上一轮若已激活 zstd，本端会一直以 zstd 发帧、并按 zstd 解帧；而这一轮对端
+     * 是原版（或旧版插件）—— 形成"单侧 zstd"，对端发来的原版压缩帧会被本端 zstd 解码器拒绝，
+     * 玩家<b>进不去服务器</b>。见 {@code ZstdLoginNetworking#markDeclined} 的调用点。</p>
+     *
+     * <p>从任意线程调用都安全（内部切到 eventLoop）。</p>
+     */
+    public static void onRoundDeclined(Channel channel) {
+        if (channel == null) return;
+        channel.eventLoop().execute(() -> deactivateIfStale(channel));
+    }
+
+    /**
+     * 若状态已被判定为 {@code PLAIN}，则把管线里残留的 zstd 处理器拆掉、清除激活标志。
+     *
+     * <p>⚠️ <b>必须在动原版处理器之前调用</b>（见 {@link #activateInEventLoop} 的开头）：
+     * 一旦先跑 {@code removeStaleVanillaHandlers}，本轮登录刚装好的原版
+     * {@code compress}/{@code decompress} 就会被删掉，这条连接再也回不到原版。</p>
+     *
+     * @return 是否确实处于"本轮不参与 zstd"状态（调用方据此提前返回）
+     */
+    private static boolean deactivateIfStale(Channel channel) {
+        if (channel.attr(ZstdChannelManager.ZSTD_STATE).get()
+                != ZstdChannelManager.TransportState.PLAIN) {
+            return false;
+        }
+        ChannelPipeline p = channel.pipeline();
+        boolean changed = false;
+        for (String name : new String[]{"zstd_encoder", "zstd_decoder", "zstd_switch_sniffer"}) {
+            if (p.get(name) != null) {
+                p.remove(name);
+                changed = true;
+            }
+        }
+        if (changed) {
+            channel.attr(ACTIVATED).set(Boolean.FALSE);
+            LOGGER.info("[Zstd] 本轮登录判定为不参与 zstd —— 已拆除上一轮残留的 zstd 处理器，保持原版");
+        }
+        return true;
+    }
+
+    /**
      * 发送切换应答。
      *
      * <p>⚠️ 必须从 {@code zstd_encoder} 的 ctx 写出<b>手工拼好的完整帧</b>，不能走
@@ -167,6 +212,13 @@ public final class ZstdClientActivation {
     private static void activateInEventLoop(Channel channel, boolean quiet, int confirmTxId) {
         if (!channel.isActive()) return;
         ChannelPipeline p = channel.pipeline();
+
+        // ⚠️ 顺序：必须先判"本轮明确不参与 zstd"（状态被置为 PLAIN），再动原版处理器。
+        // 否则本轮登录刚装好的 compress/decompress 会先被下面的清理删掉，这条连接就再也
+        // 回不到原版了（详见 deactivateIfStale 的说明）。
+        if (deactivateIfStale(channel)) {
+            return;
+        }
 
         // 幂等清理：zstd 已在位时，原版 SetCompression 可能再次被处理而装回
         // compress/decompress（ViaFabricPlus 协议切换会重放登录流程），与 zstd 处理器

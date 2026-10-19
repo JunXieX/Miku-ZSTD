@@ -287,27 +287,30 @@ public class ZstdPaperChannelManager {
     }
 
     /**
-     * 安装切换闸门（幂等）：挂在 {@code compress} 之前，即 <b>MC 包层</b>。
+     * 安装切换闸门（幂等）：挂在<b>包层编码器</b>（{@code encoder}，MC Packet → ByteBuf）
+     * <b>之后</b>，即出站方向上比它更靠 tail 的一侧。
      *
-     * <p>⚠️ 必须先在包层扣住，激活后才能改用 zstd 编码器；挂在字节层则放行时用的仍是
-     * 扣下那一刻的编码形态。详见共享层 {@code ZstdSwitchGate} 的类注释。</p>
+     * <p>⚠️ 锚点<b>不能</b>是 {@code compress}：原版是用 {@code addBefore("encoder", "compress")}
+     * 插入压缩编码器的，它在管线里位于 {@code encoder} 的 head 侧；把闸门 {@code addAfter(compress)}
+     * 等于插在两者之间 —— 出站先经过 {@code encoder}（Packet 已变成 ByteBuf）再到闸门，而
+     * {@code ZstdSwitchGate.mustHold} 对 ByteBuf 返回 false，闸门于是<b>一个包都扣不住</b>，
+     * "确认之前不发出登录期大包"这条协议保证实际失效。挂在 {@code encoder} 之后，出站才会
+     * 先经过闸门（拿到 Packet）、放行时才交给（此刻已是 zstd 的）编码器。</p>
+     *
+     * @return 闸门是否已就位（{@code false} = 锚点缺失，调用方应中止激活）
      */
-    public void installSwitchGate(Channel channel) {
-        if (switchGate != null) return;
+    public boolean installSwitchGate(Channel channel) {
+        if (switchGate != null) return true;
         var p = channel.pipeline();
-        if (p.get("zstd_switch_gate") != null) return;
-        for (String anchor : new String[]{"compress", "compression-encoder"}) {
-            if (p.get(anchor) != null) {
-                switchGate = mikumc.zstd.protocol.ZstdSwitchGate.create();
-                // ⚠️ 必须是 addAfter：Netty 出站事件从 tail 走向 head（索引递减），
-                // addBefore 会把闸门放到编码器<b>之后</b>，那时包已是 ByteBuf，无法按包类型判断。
-                // addAfter 让出站先经过闸门（拿到 Packet），放行时才交给编码器。
-                p.addAfter(anchor, "zstd_switch_gate", switchGate);
-                installConfirmSniffer(p);
-                return;
-            }
+        if (p.get("zstd_switch_gate") != null) return true;
+        if (p.get("encoder") == null) {
+            LOGGER.debug("[Zstd] 切换闸门无法安装（encoder 锚点缺失）; pipeline={}", p.names());
+            return false;
         }
-        LOGGER.debug("[Zstd] 切换闸门未能安装（compress 锚点缺失）; pipeline={}", p.names());
+        switchGate = mikumc.zstd.protocol.ZstdSwitchGate.create();
+        p.addAfter("encoder", "zstd_switch_gate", switchGate);
+        installConfirmSniffer(p);
+        return true;
     }
 
     /**

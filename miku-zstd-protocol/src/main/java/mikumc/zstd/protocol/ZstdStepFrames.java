@@ -32,8 +32,17 @@ public final class ZstdStepFrames {
     /** serverbound CustomQueryAnswer（客户端 → 服务端确认）。 */
     public static final int PACKET_ID_QUERY_ANSWER = 0x02;
 
-    /** 解压上限：询问 / 确认都是几十字节，超过这个尺寸的一定不是它。 */
-    private static final int MAX_BARE_BYTES = 512;
+    /**
+     * 解压上限：询问 / 确认都是几十字节（{@code [id][varint txId][len]["zstd:switch" 11B][magic 4B]}
+     * ≈ 23B），超过这个尺寸的一定不是它。
+     *
+     * <p>⚠️ 这个上限同时扮演<b>热路径开关</b>：服务端两侧的确认嗅探器常驻整条连接
+     * （确认到达后仍留在管线里等极晚到达的重传），会对<b>每个</b>入站帧调用本方法。
+     * 放宽到几百字节，就意味着每个"被原版压缩过的入站帧"（原始 ≥ 压缩阈值的包）
+     * 都要走一次 {@code new Inflater()} 解压尝试 —— 那是原生分配 + 解压，纯属白花。
+     * 64 已远超握手包的真实尺寸。</p>
+     */
+    private static final int MAX_BARE_BYTES = 64;
 
     private ZstdStepFrames() {
     }
@@ -80,7 +89,14 @@ public final class ZstdStepFrames {
         int first = in.getByte(start) & 0xFF;
 
         // ① 直存：[0][packet] —— 跳过"未压缩"标记，再去掉包 id
+        // ⚠️ 先按包 id 做<b>零拷贝预筛</b>：本方法只服务于切换握手（询问 0x04 / 确认 0x02），
+        // 其余包 id 一律直接返回 null —— 避免给每个入站小帧都白分配一次数组。
         if (first == 0x00) {
+            if (len < 3) return null;
+            int packetId = in.getByte(start + 1) & 0xFF;
+            if (packetId != PACKET_ID_LOGIN_PLUGIN && packetId != PACKET_ID_QUERY_ANSWER) {
+                return null;
+            }
             byte[] out = new byte[len - 2];
             in.getBytes(start + 2, out, 0, out.length);
             return out;

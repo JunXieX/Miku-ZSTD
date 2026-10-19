@@ -64,10 +64,16 @@ public class ZstdChannelManager {
     private final ZstdDecompressCtx decompressCtx;
 
     // ── 协商状态 ──
-    /** negotiate 的 txId，用于在 Hijacker 中匹配应答 */
-    private int negotiateTxId = -1;
-    /** zstd:dict 查询的 txId（协议 v4 按需推送字典时使用） */
-    private int dictTxId = -1;
+    /**
+     * negotiate 的 txId，用于在 Hijacker 中匹配应答。
+     *
+     * <p>volatile：发送侧（{@code sendNegotiateNow} / {@code sendDictQuery}）可能跑在出站写路径上，
+     * 而读取侧是帧层嗅探器（event loop）——写入若不可见，嗅探器就匹配不上应答，
+     * 表现为"协商静默超时、回落原版"。</p>
+     */
+    private volatile int negotiateTxId = -1;
+    /** zstd:dict 查询的 txId（协议 v4 按需推送字典时使用）；volatile 理由同 {@link #negotiateTxId}。 */
+    private volatile int dictTxId = -1;
     /** 已收到 negotiate 应答 */
     private volatile boolean dictResponseReceived;
     /** 客户端确认双向字典就绪（encStatus==0 && decStatus==0） */
@@ -86,6 +92,7 @@ public class ZstdChannelManager {
             new java.util.concurrent.atomic.AtomicBoolean();
 
     private volatile boolean replaced;
+    /** volatile：写入侧在出站路径上（可能非 event loop），读取侧在出站路径上做"只发一次"判定。 */
     private volatile boolean negotiationSent;
 
     /** 本连接的切换闸门（未安装时为 null，此时按"未确认"处理）。 */
@@ -355,53 +362,52 @@ public class ZstdChannelManager {
     }
 
     /**
-     * 安装切换闸门（幂等）。
+     * 安装切换闸门（幂等）：挂在<b>包层编码器</b>（{@code minecraft-encoder}，MC Packet → ByteBuf）
+     * <b>之后</b>，也就是出站方向上比它更靠 tail 的一侧。
      *
-     * <p>⚠️ <b>必须挂在 {@code compression-encoder} 之前</b>，即放在 MC 原始包层：</p>
+     * <p>为什么是这个位置：</p>
      * <ul>
-     *   <li>扣住的是 <b>MC 包对象</b>，包类型可直接辨认（不必去翻最终帧的字节）；</li>
+     *   <li>扣住的是 <b>MC 包对象</b>，包类型可直接辨认（不必去翻最终帧的字节）；
+     *       Netty 出站事件从 tail 走向 head，所以闸门必须位于 {@code minecraft-encoder}
+     *       的 tail 侧，出站才会"先经过闸门（拿到 Packet）、再到编码器"；</li>
      *   <li>被扣的包在放行时走的是"当时的"编码器 —— 激活后就是 zstd 编码器，
-     *       因此客户端收到的一定是 zstd 帧（而确认之前客户端收到的都是原版帧）。</li>
+     *       因此客户端收到的一定是 zstd 帧（而确认之前客户端收到的都是原版帧）；</li>
+     *   <li>切换请求由服务端经 {@code zstd_encoder} 的 ctx 写出，那是本闸门<b>更靠 head</b>
+     *       的一侧，不会回头经过它，握手不会自扣留。</li>
      * </ul>
-     * <p>挂在更靠后的位置（已编码的字节层）则必须先有外层长度、且放行时的编码形态已经固定，
-     * 无法满足"放行时按新编码器编码"这一要求。</p>
-     */
-    /**
-     * 安装切换闸门（幂等）：挂在原版压缩编码器<b>之后</b>（出站方向更靠 head），即 MC 包层。
      *
-     * <p>⚠️ 位置必须是 {@code addAfter(compress)}：</p>
-     * <ul>
-     *   <li><b>包层</b>才能按包类型判定该不该扣；</li>
-     *   <li>扣住的包在放行时才交给下游编码器 —— 此刻 {@code compress} 已被 {@code zstd_encoder}
-     *       替换，因此放行出去的一定是 zstd 帧；</li>
-     *   <li>切换请求由服务端经 {@code zstd_encoder} 的 ctx 写出，那是本闸门的<b>下游</b>，
-     *       不会回头经过它（{@code addBefore} 则会把请求自己扣住，握手必然超时）。</li>
-     * </ul>
+     * <p>⚠️ 锚点<b>不能</b>是压缩编码器（{@code compression-encoder}）：它消费的是 ByteBuf，
+     * 且在管线里位于 {@code minecraft-encoder} 的 head 侧，闸门挂在它旁边仍会落在
+     * 包层编码器之后 —— 那时消息已经是 ByteBuf，闸门一个包都扣不住（详见方法内注释）。</p>
      *
      * @return 闸门是否已就位（{@code false} = 锚点缺失，调用方应中止激活）
      */
     private boolean installSwitchGate(Channel channel) {
         io.netty.channel.ChannelPipeline p = channel.pipeline();
         if (switchGate != null) return true;
-        String installed = null;
-        for (String anchor : new String[]{"compression-encoder", "compress"}) {
-            if (p.get(anchor) != null) {
-                switchGate = mikumc.zstd.protocol.ZstdSwitchGate.create();
-                // ⚠️ 必须是 addAfter：Netty 出站事件从 tail 走向 head（索引递减），
-                // addBefore 会把闸门放在锚点<b>之后</b>的出站路径上 —— 那时包已经被编码成
-                // ByteBuf，根本无法按包类型判断（实测确认过）。
-                // addAfter 让闸门位于编码器"更靠 tail"的一侧：出站先经过闸门（拿到 Packet），
-                // 放行时才交给编码器（此刻已是 zstd_encoder）。
-                p.addAfter(anchor, "zstd_switch_gate", switchGate);
-                installed = anchor;
-                break;
-            }
-        }
-        if (installed == null) {
-            LOGGER.warn("[Zstd] switch gate not installed — compression encoder anchor missing; "
-                    + "pipeline={}", p.names());
+        if (p.get("zstd_switch_gate") != null) return true;
+        // ⚠️ 锚点必须是<b>包层编码器</b>（minecraft-encoder：MC Packet → ByteBuf），
+        // <b>不能</b>是压缩编码器（compression-encoder：它消费 ByteBuf）。
+        //
+        // 闸门要按"包对象类型"判定该不该扣，所以它只能是出站路径上**先于**
+        // minecraft-encoder 的那一个 —— Netty 出站事件从 tail 走向 head（索引递减），
+        // 因此闸门在管线里的位置必须比 minecraft-encoder 更靠 tail。
+        //
+        // Velocity 是用 addBefore("minecraft-encoder", "compression-encoder") 插入压缩编码器的
+        // （已用 javap 核对 velocity-proxy 的 MinecraftConnection.setupOutboundProtocol），
+        // 所以 compression-encoder 在管线里位于 minecraft-encoder 的 head 侧：
+        // 旧实现 addAfter(compression-encoder) 把闸门夹进了两者之间，出站先经过
+        // minecraft-encoder（Packet 已变 ByteBuf）再到闸门 —— 而
+        // {@link mikumc.zstd.protocol.ZstdSwitchGate#mustHold} 对 ByteBuf 返回 false，
+        // 于是闸门<b>一个包都扣不住</b>，"确认之前不发出登录期大包"这条协议保证实际失效
+        //（表现为"切换确认没到的那一瞬间，压缩帧抢先发出 → 客户端还没切换就收到 zstd 帧 → 断连"）。
+        if (p.get("minecraft-encoder") == null) {
+            LOGGER.warn("[Zstd] 切换闸门无法安装（minecraft-encoder 锚点缺失）— 放弃激活; pipeline={}", p.names());
             return false;
         }
+        switchGate = mikumc.zstd.protocol.ZstdSwitchGate.create();
+        p.addAfter("minecraft-encoder", "zstd_switch_gate", switchGate);
+
         // 确认嗅探器挂在压缩解码器之前（帧层）：确认包可能被原版压缩或直存
         if (p.get("zstd_switch_confirm") == null) {
             // ⚠️ 也要认 zstd_decoder：解码器可能已经被替换，原名字已不存在。
@@ -477,10 +483,20 @@ public class ZstdChannelManager {
      *       因此必须在字典装载之后插入。</li>
      * </ol>
      *
+     * <p>⚠️ <b>闸门装不上就必须整体放弃激活</b>：闸门的锚点集合与编码器完全相同
+     * （{@code compression-encoder} / {@code compress}），所以正常不该出现"闸门失败、
+     * 编码器成功"。真出现时后果极严重——没有闸门就没有"确认"这个信号，
+     * {@code isSwitchConfirmed()} 恒为 false，解码器会<b>永久停在"原版兼容窗口"</b>：
+     * 客户端切换后发来的 zstd 压缩帧会被当作原版 deflate 帧解压 → 失败 → 断连。
+     * 宁可回落原版。</p>
+     *
      * @return 是否确实安装成功
      */
     public boolean installHandlers(Channel channel) {
-        installSwitchGate(channel);
+        if (!installSwitchGate(channel)) {
+            LOGGER.warn("[Zstd] 切换闸门安装失败（锚点缺失）— 放弃本次激活，回落原版 zlib");
+            return false;
+        }
         if (!installEncoder(channel)) return false;
         return installDecoder(channel);
     }

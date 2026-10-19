@@ -371,7 +371,19 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
 
         // ⚠️ 闸门必须先于编码器就位（包层），且必须先于解码器——解码器靠它的状态判断
         // "当前入站是否还可能是原版帧"。
-        mgr.installSwitchGate(channel);
+        // ⚠️ 装不上就不能继续激活：没有闸门就没有"确认"这个信号，解码器会永久停在原版
+        // 兼容窗口（客户端切换后的 zstd 压缩帧会被当作原版 deflate 帧解压失败 → 断连）。
+        if (!mgr.installSwitchGate(channel)) {
+            if (installAttempt < MAX_RETRIES) {
+                channel.eventLoop().schedule(() -> installHandlers(ctx, mgr, installAttempt + 1),
+                        RETRY_MS, TimeUnit.MILLISECONDS);
+                return;
+            }
+            LOGGER.warn("[Zstd] 切换闸门安装失败（encoder 锚点缺失）— 回落原版; pipeline={}",
+                    channel.pipeline().names());
+            finishVanilla(ctx);
+            return;
+        }
 
         if (!mgr.installEncoder(channel)) {
             if (installAttempt < MAX_RETRIES) {

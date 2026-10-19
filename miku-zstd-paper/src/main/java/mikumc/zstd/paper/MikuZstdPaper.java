@@ -95,6 +95,12 @@ public class MikuZstdPaper extends JavaPlugin {
      *
      * <p>这样插件被重载时不会残留：已建立的连接立即回到原版路径（不再协商），
      * 新连接也不会再被注入，被替换的字段不再持有本插件的类加载器。</p>
+     *
+     * <p>⚠️ <b>已经激活 zstd 的连接不能"拆回原版"</b>：激活时原版 {@code compress}/{@code decompress}
+     * 实例是被 {@code pipeline.replace} <b>移除</b>过的，而 Netty 对非 {@code @Sharable} handler 的
+     * {@code added} 标志永不复位——同一个实例再也放不回管线。所以这里只摘协商器，
+     * 让那条连接继续用"它自己那套"zstd 处理器跑完生命周期（持有旧类加载器的时间以该连接关闭为界）。
+     * 强行移除 zstd 处理器只会得到"管线里既没有原版压缩、也没有 zstd"的必断连状态。</p>
      */
     private void uninstallHook() {
         for (HookedField hook : hookedFields) {
