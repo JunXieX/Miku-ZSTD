@@ -3,6 +3,7 @@ package mikumc.zstd.protocol;
 import com.github.luben.zstd.ZstdCompressCtx;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelDuplexHandler;
+import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelPromise;
 import io.netty.util.ReferenceCountUtil;
@@ -16,20 +17,31 @@ import java.util.concurrent.TimeUnit;
 import java.nio.channels.ClosedChannelException;
 
 /**
- * Miku-ZSTD 出站编码器基类（帧格式 <b>v3</b>，协商版本 v4）——三端共享实现。
+ * Miku-ZSTD 出站编码器基类（帧格式 <b>v4</b>，协商版本 v5）——三端共享实现。
  *
- * <h2>帧格式（v3）</h2>
+ * <h2>帧格式（v4）</h2>
  * <pre>
- *   [varint bodyLen?][varint rawSize][zstd(payload) | payload]
- *   payload = [varint pktLen][pkt] [varint pktLen][pkt] ...
+ *   [varint bodyLen?][varint rawSize][zstd(payload) | packet]
+ *   payload = [varint pktLen][pkt] [varint pktLen][pkt] ...   // 仅 rawSize > 0
  * </pre>
- * <p>{@code rawSize == 0} 表示未压缩直存。{@code bodyLen} 只由 <b>服务端</b>写
- * （Velocity 管线无独立 frame-encoder）；客户端侧由 prepender 负责外层长度，
- * 子类通过 {@link #writeBodyLen()} 声明。</p>
+ * <p>{@code rawSize == 0} 表示未压缩直存：此时帧体<b>恰好是一个包</b>（{@code [0][packet]}），
+ * 与原版未压缩帧<b>逐字节同形</b>。</p>
+ *
+ * <p>⚠️ <b>直存帧必须一帧一包，且不能带任何内层长度前缀</b>。原版 {@code CompressionDecoder}
+ * 及其后的包解码器会把 dataLength 之后的<b>全部</b>字节当成<b>一个</b>包；在 0 之后多写一层
+ * {@code [varint pktLen]}，包解码器读到的"包 id"就是那个长度值 —— 直接 {@code Unknown packet}
+ * 断连（2026-10-19 生产事故：玩家完全进不去服务器）。Velocity-CTD 的 frame-decoder 还会在
+ * LOGIN 阶段校验 serverbound 包 id（compressionEnabled 且 dataLength==0 时把下一个 varint
+ * 当包 id 查注册表），判据与上者相同。逐字节同形后，任何一层（本插件解码器 / 原版解码器 /
+ * 包解码器 / Velocity 的校验器）都能正确解释，<b>不存在任何字节级启发式</b>。</p>
+ *
+ * <p>{@code bodyLen} 只由 <b>服务端</b>写（Velocity 管线无独立 frame-encoder）；客户端侧由
+ * prepender 负责外层长度，子类通过 {@link #writeBodyLen()} 声明。</p>
  *
  * <h2>批处理</h2>
- * <p>把时间窗（各端配置项决定，默认 1ms）内发出的多个包合成一帧。实测每包单独成帧时，帧头与
- * 熵表重复发送几乎吃掉小包的全部收益（小包甚至膨胀到 105%，只能直存）。</p>
+ * <p>把时间窗（各端配置项决定，默认 1ms）内发出的多个包合成一帧 —— <b>只对压缩帧有效</b>：实测
+ * 每包单独压缩成帧时，帧头与熵表重复发送几乎吃掉小包的全部收益（小包甚至膨胀到 105%，只能
+ * 直存）；而直存帧按定义本就是"小到不值得压缩"的包，一帧一包多摊的 2~3 字节帧头可以忽略。</p>
  * <p>为不破坏批处理，窗口等待期间的 {@code flush()} 被<b>吞掉</b>（数据由窗口
  * 到期后的统一 flush 送出）；无待发包时 flush 照常透传。</p>
  *
@@ -154,7 +166,7 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
     /**
      * 一帧产出后的统计回调。
      *
-     * @param rawBytes   原始字节口径（{@code 1 + 批内原始总量}）
+     * @param rawBytes   原始字节口径（{@code 1 + 本帧原始总量}；直存帧一帧一包，故按包计）
      * @param wireBytes  实际写出的帧字节数
      * @param compressed 该帧是否走了压缩路径
      */
@@ -349,9 +361,11 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
         // ── 小包直存 ──
         // 实测：无字典时 ≤32B 压缩后膨胀到 102~113%，48B 起才有收益；
         // 有字典时 24B 起才有收益。低于阈值直接直存，省一次 zstd 调用且线路字节更少。
+        // ⚠️ 直存帧一帧一包、不带内层长度前缀（见类注释的"帧格式"一节），所以这里
+        // 不能把上面那份带长度前缀的拼接缓冲直接当一个帧发出去。
         if (rawTotal < skipCompressThreshold(hasCompressDict())) {
             try {
-                writeFrame(ctx, buildStoredFrame(ctx, raw, rawTotal, withBodyLen), promises);
+                writeStoredFrames(ctx, raw, rawTotal, withBodyLen, promises);
             } catch (Throwable t) {
                 failAll(promises, t);
                 LOGGER.error("[Zstd] encoder stored-frame build failed", t);
@@ -433,10 +447,18 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
             } else {
                 try {
                     boolean compressed = produced > 0 && produced < rawTotal;
-                    writeFrame(ctx, buildCompressedFrame(ctx, dst, raw, rawTotal, produced, compressed, withBodyLen), promises);
+                    if (compressed) {
+                        writeFrame(ctx, buildCompressedFrame(ctx, dst, produced, rawTotal, withBodyLen), promises);
+                    } else {
+                        // ⚠️ 压缩无收益（压不动、或压缩后反而更大）：退回直存。这里<b>必须</b>
+                        // 走与直存路径完全相同的一帧一包写法——旧实现在这种情况下写出的是
+                        // {@code [0][varint pktLen][pkt]...}，那条内层长度前缀会被对面包解码器
+                        // 当成包 id（Unknown packet → 断连），与 2026-10-19 的线上事故同型。
+                        writeStoredFrames(ctx, raw, rawTotal, withBodyLen, promises);
+                    }
                 } catch (Throwable t) {
                     failAll(promises, t);
-                    LOGGER.error("[Zstd] encoder compressed-frame build failed", t);
+                    LOGGER.error("[Zstd] encoder frame build failed", t);
                 }
             }
 
@@ -537,45 +559,96 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
         }
     }
 
-    /** 直存帧：{@code [bodyLen?][0][payload]}。 */
-    private ByteBuf buildStoredFrame(ChannelHandlerContext ctx, byte[] raw, int rawTotal, boolean withBodyLen) {
-        ByteBuf frame;
-        if (withBodyLen) {
-            int bodyLen = 1 + rawTotal; // rawSize=0（1 字节 varint）+ payload
-            frame = ctx.alloc().directBuffer(ZstdVarInts.length(bodyLen) + bodyLen);
-            ZstdVarInts.write(frame, bodyLen);
-        } else {
-            frame = ctx.alloc().directBuffer(ZstdVarInts.length(0) + rawTotal);
+    /**
+     * 直存帧写出：<b>一帧一包</b>，每帧帧体为 {@code [0][packet]}。
+     *
+     * <p>输入的 {@code raw} 是 {@link #concatPending} 拼好的批缓冲，格式为
+     * {@code [varint pktLen][pkt]...}（该格式只用于<b>采样</b>与压缩路径；压缩帧的负载
+     * 保持它不变）。这里把它按内层长度前缀重新切开，<b>丢掉</b>前缀、逐个成帧。</p>
+     *
+     * <p>⚠️ 先把整批校验完再动手写：写了一半才失败，会让"已经写出去的帧"与"被失败化的
+     * promise"对不上——上游以为没发出去，其实数据已经在路上。</p>
+     */
+    private void writeStoredFrames(ChannelHandlerContext ctx, byte[] raw, int rawTotal,
+                                   boolean withBodyLen, List<ChannelPromise> promises) {
+        final int bodyLimit = ZstdVarInts.MC_MAX_FRAME_BYTES - (withBodyLen ? 5 : 0);
+
+        int[] cursor = {0};
+        while (cursor[0] < rawTotal) {
+            int start = cursor[0];
+            int pktLen = ZstdVarInts.readOr(raw, cursor, ZstdVarInts.INVALID);
+            if (pktLen <= 0 || cursor[0] + (long) pktLen > rawTotal) {
+                throw new IllegalStateException("corrupt batch layout at offset " + start
+                        + " (pktLen=" + pktLen + ", total=" + rawTotal + ")");
+            }
+            if (1 + pktLen > bodyLimit) {
+                throw new IllegalArgumentException("stored frame " + (1 + pktLen)
+                        + "B exceeds MC 21-bit frame limit " + ZstdVarInts.MC_MAX_FRAME_BYTES + "B");
+            }
+            cursor[0] += pktLen;
         }
-        ZstdVarInts.write(frame, 0);
-        frame.writeBytes(raw, 0, rawTotal);
-        ensureFrameFitsMcLimit(frame, rawTotal);
-        onFrame(1 + rawTotal, frame.readableBytes(), false);
-        return frame;
+
+        cursor[0] = 0;
+        ChannelFuture lastWrite = null;
+        while (cursor[0] < rawTotal) {
+            int pktLen = ZstdVarInts.readOr(raw, cursor, ZstdVarInts.INVALID);
+            int bodyOff = cursor[0];
+            int bodyLen = 1 /* rawSize=0 */ + pktLen;
+
+            ByteBuf frame;
+            if (withBodyLen) {
+                frame = ctx.alloc().directBuffer(ZstdVarInts.length(bodyLen) + bodyLen);
+                ZstdVarInts.write(frame, bodyLen);
+            } else {
+                frame = ctx.alloc().directBuffer(bodyLen);
+            }
+            ZstdVarInts.write(frame, 0);
+            frame.writeBytes(raw, bodyOff, pktLen);
+            onFrame(1 + pktLen, frame.readableBytes(), false);
+            lastWrite = ctx.write(frame);
+            cursor[0] = bodyOff + pktLen;
+        }
+        // 一批对应多个帧：所有帧写完只 flush 一次（不会因此多出 TCP 段）。
+        ctx.flush();
+
+        // ⚠️ promise 只能挂在<b>最后一次 write</b> 的 future 上（{@code ctx.flush()} 返回的是
+        // {@code ChannelHandlerContext} 本身，没有 future 可挂）。写出顺序是确定的，
+        // 最后一次 write 完成时，本批此前的每一帧都已写出 —— 与 writeFrame 同一套语义。
+        if (lastWrite == null) {
+            for (ChannelPromise p : promises) {
+                p.trySuccess();
+            }
+            return;
+        }
+        lastWrite.addListener(f -> {
+            for (ChannelPromise p : promises) {
+                if (f.isSuccess()) {
+                    p.trySuccess();
+                } else {
+                    p.tryFailure(f.cause());
+                }
+            }
+        });
     }
 
-    /** 压缩帧（或压缩无收益时的直存）：{@code [bodyLen?][rawSize][payload]}。 */
-    private ByteBuf buildCompressedFrame(ChannelHandlerContext ctx, byte[] dst, byte[] raw,
-                                         int rawTotal, int outLen, boolean compressed, boolean withBodyLen) {
-        int rawSizeField = compressed ? rawTotal : 0;
-        int payloadLen = compressed ? outLen : rawTotal;
-
+    /**
+     * 压缩帧：{@code [bodyLen?][rawSize>0][zstd(payload)]}，
+     * {@code payload} 保持批格式 {@code [varint pktLen][pkt]...}（多包合批只发生在这里）。
+     */
+    private ByteBuf buildCompressedFrame(ChannelHandlerContext ctx, byte[] dst,
+                                         int outLen, int rawTotal, boolean withBodyLen) {
         ByteBuf frame;
         if (withBodyLen) {
-            int bodyLen = ZstdVarInts.length(rawSizeField) + payloadLen;
+            int bodyLen = ZstdVarInts.length(rawTotal) + outLen;
             frame = ctx.alloc().directBuffer(ZstdVarInts.length(bodyLen) + bodyLen);
             ZstdVarInts.write(frame, bodyLen);
         } else {
-            frame = ctx.alloc().directBuffer(ZstdVarInts.length(rawSizeField) + payloadLen);
+            frame = ctx.alloc().directBuffer(ZstdVarInts.length(rawTotal) + outLen);
         }
-        ZstdVarInts.write(frame, rawSizeField);
-        if (compressed) {
-            frame.writeBytes(dst, 0, outLen);
-        } else {
-            frame.writeBytes(raw, 0, rawTotal);
-        }
+        ZstdVarInts.write(frame, rawTotal);
+        frame.writeBytes(dst, 0, outLen);
         ensureFrameFitsMcLimit(frame, rawTotal);
-        onFrame(1 + rawTotal, frame.readableBytes(), compressed);
+        onFrame(1 + rawTotal, frame.readableBytes(), true);
         return frame;
     }
 

@@ -12,10 +12,11 @@ import org.slf4j.LoggerFactory;
 /**
  * 每连接上下文：zstd 压缩/解压上下文、字典加载、传输状态。
  *
- * <p><b>协商版本 v4</b>（{@link #PROTOCOL_VERSION}），<b>帧格式 v3</b>：
- * 客户端→服务端 {@code [rawSize][zstd(packet)|packet]}（prepender 负责外层长度）；
- * 服务端→客户端 {@code [bodyLen][rawSize][zstd(packet)|packet]}
- * （bodyLen 由服务端编码器自带，已被 frame-decoder 剥离）。</p>
+ * <p><b>协商版本 v5</b>（{@link #PROTOCOL_VERSION}），<b>帧格式 v4</b>：
+ * 客户端→服务端 {@code [rawSize][zstd(payload)|packet]}（prepender 负责外层长度）；
+ * 服务端→客户端 {@code [bodyLen][rawSize][zstd(payload)|packet]}
+ * （bodyLen 由服务端编码器自带，已被 frame-decoder 剥离）。{@code rawSize == 0} 表示直存：
+ * 帧体恰好是一个包（{@code [0][packet]}），与原版未压缩帧逐字节同形。</p>
  *
  * <p>⚠️ 注意与 Velocity 端的语义差异——客户端的 "encoder" 字典用于<b>解压</b>
  * 服务端发来的数据，"decoder" 字典用于<b>压缩</b>发往服务端的数据。
@@ -37,8 +38,8 @@ public class ZstdChannelManager {
     public static final AttributeKey<TransportState> ZSTD_STATE = AttributeKey.valueOf("zstd:state");
     public static final AttributeKey<ZstdChannelManager> KEY = AttributeKey.valueOf("zstd:manager");
 
-    /** 协商协议版本（三端必须一致）。帧长度上限见 {@link ZstdVarInts#DEFAULT_MAX_VALUE}。 */
-    public static final int PROTOCOL_VERSION = 4;
+    /** 协商协议版本（三端必须一致）。版本不一致时本端会干净回落原版，不会出现半 zstd。 */
+    public static final int PROTOCOL_VERSION = 5;
 
     /**
      * 压缩/解压上下文。

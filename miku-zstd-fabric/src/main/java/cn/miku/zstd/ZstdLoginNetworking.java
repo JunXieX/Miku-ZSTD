@@ -21,9 +21,12 @@ import mikumc.zstd.protocol.ZstdNegotiateStatus;
 /**
  * 登录协商：{@code zstd:negotiate}（轻量握手）+ {@code zstd:dict}（按需推送字典）。
  *
- * <h2>协商版本 v4：两段式（相对 v3 的变化，帧格式未变）</h2>
- * <p>v3 把字典字节直接内联进 negotiate——所有连接都要吃这几百 KB，无论客户端支不支持
- * zstd、也不管本地是否已缓存。v4 拆成两段：</p>
+ * <h2>协商版本 v5；v4 起字典改为两段式</h2>
+ * <p>v5 只是跟着<b>帧格式 v4</b> 一起前进：帧格式一旦变化，两端就必须用同一版本，
+ * 否则会出现"一端发 zstd 帧、另一端按旧格式解析"的静默错乱。版本不一致时本端直接回落原版
+ * （见 {@link ZstdChannelManager#PROTOCOL_VERSION}）。</p>
+ * <p>v4 把字典字节从 negotiate 里拆出来，原因是 v3 内联字典——所有连接都要吃这几百 KB，
+ * 无论客户端支不支持 zstd、也不管本地是否已缓存。v4 拆成两段：</p>
  * <ol>
  *   <li><b>negotiate</b>：只带协议版本与两个 dictId（几十字节）。客户端按本地缓存情况
  *       回 {@code 0 = 就绪} / {@code 1 = 需要字典}；</li>

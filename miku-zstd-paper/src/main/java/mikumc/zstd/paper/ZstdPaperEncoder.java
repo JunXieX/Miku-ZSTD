@@ -6,7 +6,7 @@ import mikumc.zstd.protocol.ZstdBatchEncoderBase;
 import mikumc.zstd.protocol.ZstdCompressLock;
 
 /**
- * Miku-ZSTD 编码器（Paper → 客户端）帧格式 v3（协商版本 v4）。
+ * Miku-ZSTD 编码器（Paper → 客户端）帧格式 v4（协商版本 v5）。
  *
  * <p>⚠️ 与 Velocity 端唯一的协议差异：服务端管线<b>有 prepender</b>，外层长度由它负责，
  * 因此本编码器<b>不写</b> bodyLen（与 Fabric 客户端一致；Velocity 端才需要写）。</p>

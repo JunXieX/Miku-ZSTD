@@ -16,15 +16,18 @@ import io.netty.buffer.ByteBuf;
  *
  * <h2>术语：本项目里的 "v几" 有三个不同含义，不要混用</h2>
  * <ul>
- *   <li><b>协商版本</b>：三端 {@code PROTOCOL_VERSION = 4}，在登录期 negotiate 载荷里交换。
+ *   <li><b>协商版本</b>：三端 {@code PROTOCOL_VERSION = 5}，在登录期 negotiate 载荷里交换。
  *       三端必须一致，不一致即回落原版 zlib。v4 的改动是"字典改为按需推送"
  *      （v3 把字典内联在 negotiate 里，所有连接都要白吃这几百 KB）。</li>
- *   <li><b>帧格式 v3</b>：{@code [bodyLen?][rawSize][zstd payload | payload]}，
- *       {@code payload = [varint pktLen][pkt]...}。v3 做了帧头精简（magicless /
- *       无 contentSize / 无 dictID）与"一帧多包"批处理。<b>v4 没有再改帧格式。</b></li>
+ *   <li><b>帧格式 v4</b>：{@code [bodyLen?][rawSize][zstd payload | packet]}。
+ *       v3 做了帧头精简（magicless / 无 contentSize / 无 dictID）与"一帧多包"批处理；
+ *       v4 把<b>直存帧</b>改成"一帧一包、不带内层长度前缀"（{@code [0][packet]}），
+ *       使其与原版未压缩帧逐字节同形 —— 旧格式多写的一层 {@code [varint pktLen]} 会被
+ *       对面包解码器当成包 id（{@code Unknown packet}，玩家进不去）。压缩帧仍合批，
+ *       其 {@code payload = [varint pktLen][pkt]...} 保持不变。</li>
  *   <li><b>v1 / v2</b>：历史版本，只应出现在"我们为什么这么改"的说明里。</li>
  * </ul>
- * <p>所以"帧格式 v3"与"协商版本 v4"是两个维度的编号，同一份代码同时属于这两者。</p>
+ * <p>所以"帧格式 v4"与"协商版本 v5"是两个维度的编号，同一份代码同时属于这两者。</p>
  */
 public final class ZstdVarInts {
 

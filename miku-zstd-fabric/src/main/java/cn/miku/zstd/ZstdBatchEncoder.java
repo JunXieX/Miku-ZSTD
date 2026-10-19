@@ -6,7 +6,7 @@ import mikumc.zstd.protocol.ZstdBatchEncoderBase;
 import mikumc.zstd.protocol.ZstdCompressLock;
 
 /**
- * Miku-ZSTD 编码器（客户端 → Velocity）帧格式 <b>v3</b>（协商版本 v4）。
+ * Miku-ZSTD 编码器（客户端 → Velocity）帧格式 <b>v4</b>（协商版本 v5）。
  *
  * <p>批处理、建帧、promise 编排等全部逻辑在共享基类
  * {@link ZstdBatchEncoderBase} 中（两端同一份源码）；本类只声明客户端的

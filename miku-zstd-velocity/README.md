@@ -76,7 +76,7 @@ MikuMC 系列插件交流群：1105054380
 
 ## 工作原理
 
-协议版本 **v4**（Velocity / Paper / Fabric 三端的 `PROTOCOL_VERSION` 常量一致）。
+协议版本 **v5**（Velocity / Paper / Fabric 三端的 `PROTOCOL_VERSION` 常量一致；帧格式 **v4**）。
 
 ```
 客户端 ──握手(主机名末尾附 \0ZSTD\0 标记)──▶ 服务端
@@ -101,16 +101,21 @@ MikuMC 系列插件交流群：1105054380
 > **为什么字典改成按需推送（v3 → v4）**：v3 把字典字节内联进 negotiate，于是**所有连接都要吃这几百 KB**，
 > 无论客户端是否支持 zstd、本地是否已有缓存。拆成两段后，重连（缓存命中）与非 zstd 客户端都是零字典流量。
 
-### 帧格式（协议 v4）
+### 帧格式（v4）
 
 ```
-服务端 → 客户端   [varint bodyLen?][varint rawSize][zstd(payload) | payload]
-客户端 → 服务端   [varint rawSize][zstd(payload) | payload]
-payload = [varint pktLen][pkt] [varint pktLen][pkt] ...   ← 一个或多个包
+服务端 → 客户端   [varint bodyLen?][varint rawSize][zstd(payload) | packet]
+客户端 → 服务端   [varint rawSize][zstd(payload) | packet]
+压缩帧（rawSize > 0）  payload = [varint pktLen][pkt] [varint pktLen][pkt] ...   ← 一个或多个包
+直存帧（rawSize == 0） 帧体恰好是一个包 [0][packet]，与原版未压缩帧逐字节同形
 ```
 
-- **`rawSize == 0` 表示未压缩直存**，此时 payload 就是原始内容；否则是 magicless zstd 帧
-- **一帧多包**：批处理窗口内的包合帧，帧头与熵表开销被摊薄
+- **`rawSize == 0` 表示未压缩直存**，帧体**恰好是一个包**（`[0][packet]`），与原版未压缩帧
+  逐字节同形 —— 原版解码器（`CompressionDecoder`）与包解码器都能直接读懂。
+  **因此直存帧必须一帧一包、且不带任何内层长度前缀**：多写一层 `[varint pktLen]` 时，
+  包解码器读到的"包 id"就是那个长度值 → `Unknown packet` → 玩家进不去服务器
+- **一帧多包只发生在压缩帧**：批处理窗口内的包合成一帧压缩，帧头与熵表开销被摊薄；
+  直存帧按定义都是"小到不值得压缩"的包，一帧一包多摊的 2~3 字节可以忽略
 - **magicless zstd 帧**：省 4 字节 magic，且不写 contentSize / dictID
   （解压尺寸由 `rawSize` 提供，字典由双方显式加载，帧内不必重复写）
 - **`bodyLen` 只由 Velocity 写**（4.x 管线无独立 frame-encoder，编码器自带外层长度）；
@@ -156,7 +161,7 @@ compression:
   # （2^(windowLog-1) × 4B，指数增长）且是每连接一份：23 ≈ 16MB，20 ≈ 2MB。
   window_log: 20
 
-  # ── 协议 v4 批处理 ──
+  # ── 批处理（压缩帧）──
   # 把同一时间窗内发往同一玩家的多个包合成一帧。代价是等量延迟。
   batch_window_ms: 1
   batch_max_packets: 64
