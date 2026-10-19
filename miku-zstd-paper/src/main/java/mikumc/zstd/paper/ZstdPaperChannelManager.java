@@ -233,11 +233,21 @@ public class ZstdPaperChannelManager {
     /** 本连接的切换闸门（未安装时为 null，此时按"未确认"处理）。 */
     private volatile mikumc.zstd.protocol.ZstdSwitchGate switchGate;
 
+    /** 本连接的管线引用（回滚时需要）。 */
+    private volatile io.netty.channel.ChannelPipeline pipelineRef;
+    /** 被替换掉的原版压缩处理器实例与管线名（回滚时原样换回）。 */
+    private volatile io.netty.channel.ChannelHandler vanillaEncoder;
+    private volatile String vanillaEncoderName;
+    private volatile io.netty.channel.ChannelHandler vanillaDecoder;
+    private volatile String vanillaDecoderName;
+
     public boolean installEncoder(Channel channel) {
         var p = channel.pipeline();
         if (p.get("zstd_encoder") != null) return true;
         for (String anchor : new String[]{"compress", "compression-encoder"}) {
             if (p.get(anchor) != null) {
+                vanillaEncoder = p.get(anchor);
+                vanillaEncoderName = anchor;
                 p.replace(anchor, "zstd_encoder", new ZstdPaperEncoder());
                 return true;
             }
@@ -279,6 +289,8 @@ public class ZstdPaperChannelManager {
         if (p.get("zstd_decoder") != null) return true;
         for (String anchor : new String[]{"decompress", "compression-decoder"}) {
             if (p.get(anchor) != null) {
+                vanillaDecoder = p.get(anchor);
+                vanillaDecoderName = anchor;
                 p.replace(anchor, "zstd_decoder", new ZstdPaperDecoder());
                 return true;
             }
@@ -296,14 +308,17 @@ public class ZstdPaperChannelManager {
     public void installSwitchGate(Channel channel) {
         if (switchGate != null) return;
         var p = channel.pipeline();
+        pipelineRef = p;
         if (p.get("zstd_switch_gate") != null) return;
         for (String anchor : new String[]{"compress", "compression-encoder"}) {
             if (p.get(anchor) != null) {
                 switchGate = mikumc.zstd.protocol.ZstdSwitchGate.create();
-                // ⚠️ 必须在编码器<b>之前</b>：此时拿到的是 MC 包对象（才能按包类型判定），
-                // 且放行时才会交给编码器（那时它已是 zstd_encoder）。
-                // 服务端自己的切换请求因此改为"手工编码的 zstd 直存帧、从编码器之后写出"。
-                p.addBefore(anchor, "zstd_switch_gate", switchGate);
+                // 超时 / 客户端拒绝时把两个方向一起换回原版实例
+                switchGate.setRollback(this::rollbackToVanilla);
+                // ⚠️ 必须是 addAfter：Netty 出站事件从 tail 走向 head（索引递减），
+                // addBefore 会把闸门放到编码器<b>之后</b>，那时包已是 ByteBuf，无法按包类型判断。
+                // addAfter 让出站先经过闸门（拿到 Packet），放行时才交给编码器。
+                p.addAfter(anchor, "zstd_switch_gate", switchGate);
                 installConfirmSniffer(p);
                 return;
             }
@@ -336,17 +351,62 @@ public class ZstdPaperChannelManager {
     }
 
     /**
-     * 收到客户端的切换确认：放行扣住的包，并把本连接切换为严格 zstd 入站。
+     * 收到客户端的切换确认：校验 txId 后放行扣住的包。
      *
-     * <p>⚠️ 必须真正调用 {@code gate.confirm()}：只改一个标志位的话，闸门会一直扣到
-     * 2 秒超时，玩家在这段时间里收不到 LoginSuccess（表现为卡在登录界面）。</p>
+     * <p>⚠️ 必须校验 txId：任何尾部恰好是魔数的帧都不该让我们提前放行。</p>
+     *
+     * @return 是否接受
      */
-    public void markSwitchConfirmed() {
+    public boolean markSwitchConfirmed(int txId) {
         var gate = switchGate;
-        if (gate != null) {
-            gate.confirm();
-        } else {
+        if (gate == null) {
             LOGGER.debug("[Zstd] switch confirmation received after the gate was already released");
+            return false;
+        }
+        return gate.confirm(txId);
+    }
+
+    /** 记录本次切换询问的 txId（发送请求时调用）。 */
+    public void expectSwitchTxId(int txId) {
+        var gate = switchGate;
+        if (gate != null) gate.expectTxId(txId);
+    }
+
+    /**
+     * 客户端明确拒绝切换（无法切换到 zstd）：立即回滚到原版。
+     *
+     * @return 是否接受
+     */
+    public boolean rejectSwitch(int txId) {
+        var gate = switchGate;
+        if (gate == null) return false;
+        return gate.reject(txId);
+    }
+
+    /**
+     * 把 zstd 编解码器换回<b>原版实例</b>（超时 / 客户端拒绝时调用）。
+     *
+     * <p>⚠️ 必须换回同一个实例：原版压缩处理器在 Paper 上带连接级状态（阈值等），
+     * 重新构造既拿不到参数，也可能与连接状态不匹配。两个方向必须同时回滚。</p>
+     */
+    private void rollbackToVanilla() {
+        setReplaced(false);
+        try {
+            var p = pipelineRef;
+            if (p == null) return;
+            var dec = vanillaDecoder;
+            if (dec != null && p.get("zstd_decoder") != null) {
+                p.replace("zstd_decoder", vanillaDecoderName, dec);
+                vanillaDecoder = null;
+            }
+            var enc = vanillaEncoder;
+            if (enc != null && p.get("zstd_encoder") != null) {
+                p.replace("zstd_encoder", vanillaEncoderName, enc);
+                vanillaEncoder = null;
+            }
+            LOGGER.info("[Zstd] rolled back to vanilla codecs (switch not confirmed)");
+        } catch (Throwable t) {
+            LOGGER.warn("[Zstd] rollback to vanilla failed", t);
         }
     }
 

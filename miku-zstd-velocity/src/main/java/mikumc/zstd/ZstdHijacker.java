@@ -797,12 +797,19 @@ public class ZstdHijacker extends ChannelDuplexHandler {
             ByteBuf packet = writeCtx.alloc().buffer();
             ByteBuf frame = writeCtx.alloc().buffer();
             try {
-                mikumc.zstd.protocol.ZstdStepFrames.writeQuery(packet,
-                        ThreadLocalRandom.current().nextInt(1, Integer.MAX_VALUE),
+                int txId = ThreadLocalRandom.current().nextInt(1, Integer.MAX_VALUE);
+                ZstdChannelManager mgr = channel.attr(ZstdChannelManager.KEY).get();
+                if (mgr != null) mgr.expectSwitchTxId(txId);
+                mikumc.zstd.protocol.ZstdStepFrames.writeQuery(packet, txId,
                         mikumc.zstd.protocol.ZstdSwitchGate.CHANNEL);
 
-                // zstd 直存帧：[rawSize=0][varint pktLen][packet]
+                // Velocity 端没有独立 prepender：外层 bodyLen 只由 ZstdBatchEncoder 写。
+                // 我们从编码器之后写出（跳过它），所以必须自己把 bodyLen 补上，
+                // 否则客户端 frame-decoder 会把首字节 0x00 当成"帧长为 0"直接抛异常。
+                // 帧格式：[bodyLen][rawSize=0][varint pktLen][packet]
                 int pktLen = packet.readableBytes();
+                int bodyLen = 1 /*rawSize=0*/ + pktLen + varIntLen(pktLen);
+                mikumc.zstd.protocol.ZstdVarInts.write(frame, bodyLen);
                 mikumc.zstd.protocol.ZstdVarInts.write(frame, 0);
                 mikumc.zstd.protocol.ZstdVarInts.write(frame, pktLen);
                 frame.writeBytes(packet);
@@ -821,6 +828,16 @@ public class ZstdHijacker extends ChannelDuplexHandler {
             LOGGER.debug("[Zstd] failed to send switch request: {}", e.toString());
             return false;
         }
+    }
+
+    /** varint 的字节数（用于手工拼帧时计算 bodyLen）。 */
+    private static int varIntLen(int value) {
+        int n = 1;
+        while ((value & ~0x7F) != 0) {
+            value >>>= 7;
+            n++;
+        }
+        return n;
     }
 
     /**

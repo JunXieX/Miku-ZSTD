@@ -102,37 +102,66 @@ public final class ZstdClientActivation {
         if (channel == null) return;
         channel.eventLoop().execute(() -> {
             activateInEventLoop(channel, false, txId);
-            // ⚠️ 只有真的换成 zstd 才回确认：没切成就回确认会让服务端用 zstd 发帧，
-            // 而本端仍按原版解 → 必断连。此时不回，让服务端 2 秒超时后保持原版（可进服）。
-            if (Boolean.TRUE.equals(channel.attr(ACTIVATED).get())
-                    && channel.pipeline().get("zstd_decoder") != null) {
-                sendSwitchConfirm(channel, txId);
-            } else {
-                LOGGER.debug("[Zstd] refusing to confirm switch — client not on zstd; "
-                        + "server will fall back to vanilla");
-            }
+            boolean onZstd = Boolean.TRUE.equals(channel.attr(ACTIVATED).get())
+                    && channel.pipeline().get("zstd_decoder") != null;
+            // ⚠️ 无论能否切换，都必须回一条应答：
+            //   · 切成了 → success=true（服务端放行扣住的包并转严格 zstd）；
+            //   · 没切成就 → success=false（服务端<b>回滚到原版</b>）。
+            // 若不回，服务端只能等满超时再猜 —— 而任何猜测都有一半概率与客户端不一致，
+            // 结果就是"玩家进不去服务器"。
+            sendSwitchConfirm(channel, txId, onZstd);
         });
     }
 
-    private static void sendSwitchConfirm(Channel channel, int txId) {
-        io.netty.channel.ChannelHandlerContext writeCtx = channel.pipeline().context("encoder");
-        if (writeCtx == null) {
-            writeCtx = channel.pipeline().context("compress");
-        }
-        if (writeCtx == null) {
-            LOGGER.debug("[Zstd] cannot send switch confirmation — encoder anchor missing");
-            return;
-        }
-        io.netty.buffer.ByteBuf buf = writeCtx.alloc().buffer();
+    /**
+     * 发送切换应答。
+     *
+     * <p>⚠️ 必须从 {@code zstd_encoder} 的 ctx 写出<b>手工拼好的完整帧</b>，不能走
+     * {@code encoder} 再让编码器处理：编码器有 1ms 批处理窗口，确认包会被与后续任意包
+     * 合并成多包帧；而服务端帧层嗅探器只认"单包直存帧"，合帧后识别失败 →
+     * 确认丢失 → 服务端等满超时 → 双方各猜一半 → 进不去服务器。</p>
+     *
+     * <p>客户端管线有独立 prepender，所以手工帧只需 {@code [rawSize=0][pktLen][packet]}，
+     * 外层长度由它补齐。</p>
+     */
+    private static void sendSwitchConfirm(Channel channel, int txId, boolean accepted) {
+        io.netty.channel.ChannelHandlerContext zstdCtx = channel.pipeline().context("zstd_encoder");
+        io.netty.buffer.ByteBuf packet = channel.alloc().buffer();
         try {
             // ⚠️ 必须是 serverbound 的查询应答（0x02），而不是 clientbound 的询问（0x04）：
             // 服务端会把 0x04 解析成别的包并直接断连。
-            mikumc.zstd.protocol.ZstdStepFrames.writeConfirm(buf, txId);
-            writeCtx.writeAndFlush(buf);
-            LOGGER.debug("[Zstd] switch confirmation sent (txId={})", txId);
+            mikumc.zstd.protocol.ZstdStepFrames.writeConfirm(packet, txId, accepted);
+
+            if (zstdCtx != null) {
+                // 已切到 zstd：从编码器之后写出手工直存帧（避开 1ms 批处理窗口，
+                // 否则确认可能与其它包合帧，服务端帧层嗅探器只认单包帧）。
+                io.netty.buffer.ByteBuf frame = channel.alloc().buffer();
+                try {
+                    int pktLen = packet.readableBytes();
+                    mikumc.zstd.protocol.ZstdVarInts.write(frame, 0);
+                    mikumc.zstd.protocol.ZstdVarInts.write(frame, pktLen);
+                    frame.writeBytes(packet);
+                    zstdCtx.writeAndFlush(frame);
+                } catch (Throwable t) {
+                    if (frame.refCnt() > 0) frame.release();
+                    throw t;
+                }
+            } else {
+                // 未切到 zstd：仍由原版压缩编码器负责编码（它自己处理阈值与压缩）。
+                io.netty.channel.ChannelHandlerContext plain =
+                        channel.pipeline().context("compress");
+                if (plain == null) plain = channel.pipeline().context("encoder");
+                if (plain == null) {
+                    LOGGER.debug("[Zstd] cannot send switch response — no write anchor");
+                    return;
+                }
+                plain.writeAndFlush(packet.retain());
+            }
+            LOGGER.debug("[Zstd] switch {} sent (txId={})", accepted ? "confirmation" : "rejection", txId);
         } catch (Throwable t) {
-            if (buf.refCnt() > 0) buf.release();
-            LOGGER.debug("[Zstd] failed to send switch confirmation: {}", t.toString());
+            LOGGER.debug("[Zstd] failed to send switch response: {}", t.toString());
+        } finally {
+            if (packet.refCnt() > 0) packet.release();
         }
     }
 

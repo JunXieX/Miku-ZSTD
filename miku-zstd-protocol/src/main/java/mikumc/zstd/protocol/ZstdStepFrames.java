@@ -48,16 +48,17 @@ public final class ZstdStepFrames {
     }
 
     /**
-     * 写客户端确认包（含包 id）：{@code [0x02][txId][success=1][magic]}。
+     * 写客户端确认包（含包 id）：{@code [0x02][txId][success][payload]}。
      *
-     * <p>格式严格遵循原版 {@code ServerboundCustomQueryAnswerPacket}：txId 必须原样回发，
-     * 服务端据此把确认与询问配对。</p>
+     * @param accepted true = 已切换到 zstd；false = 客户端无法切换，请服务端保持原版
      */
-    public static ByteBuf writeConfirm(ByteBuf buf, int txId) {
+    public static ByteBuf writeConfirm(ByteBuf buf, int txId, boolean accepted) {
         ZstdVarInts.write(buf, PACKET_ID_QUERY_ANSWER);
         ZstdVarInts.write(buf, txId);
-        buf.writeBoolean(true);
-        buf.writeInt(ZstdSwitchGate.MAGIC);
+        buf.writeBoolean(accepted);
+        if (accepted) {
+            buf.writeInt(ZstdSwitchGate.MAGIC);
+        }
         return buf;
     }
 
@@ -159,6 +160,24 @@ public final class ZstdStepFrames {
         int[] cursor = {0};
         int txId = ZstdVarInts.readOr(bare, cursor, -1);
         return txId > 0 ? txId : -1;
+    }
+
+    /**
+     * 读出"客户端拒绝切换"的 txId：{@code [varint txId][false]}（裸包体，无魔数）。
+     *
+     * <p>必须单独识别：拒绝包里没有魔数，但它是"保持原版"的唯一确定性信号 ——
+     * 收不到它会逼服务端等满超时，而超时后无论怎么选都会有一半概率错配。</p>
+     *
+     * @return txId；不是拒绝包返回 {@code -1}
+     */
+    public static int readSwitchRejectTxId(byte[] bare) {
+        if (bare == null || bare.length < 2) return -1;
+        int[] cursor = {0};
+        int txId = ZstdVarInts.readOr(bare, cursor, -1);
+        if (txId <= 0) return -1;
+        // 后面必须恰好只剩一个 success=false 字节
+        if (bare.length != cursor[0] + 1) return -1;
+        return bare[cursor[0]] == 0 ? txId : -1;
     }
 
     /** 是否为一段完整的魔数：恰好 4 字节且等于 {@link ZstdSwitchGate#MAGIC}。 */

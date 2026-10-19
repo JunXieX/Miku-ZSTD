@@ -73,9 +73,56 @@ public final class ZstdSwitchGate extends ChannelDuplexHandler {
     /** 本处理器在管线中的上下文（handlerAdded 时记录）。 */
     private volatile ChannelHandlerContext selfCtx;
 
+    /** 本次询问的 txId（0 表示不校验）。 */
+    private volatile int expectedTxId;
+
+    /** 超时 / 客户端拒绝时的回滚动作（服务端用它把 zstd 编解码器换回原版）。 */
+    private volatile Runnable rollback;
+
     /** 连接级判定：切换是否已由客户端确认。 */
     public boolean isConfirmed() {
         return confirmed;
+    }
+
+    /** 记录本次询问的 txId（服务端在发送请求时调用）。 */
+    public void expectTxId(int txId) {
+        this.expectedTxId = txId;
+    }
+
+    /** 注册超时/拒绝时的回滚动作（服务端用它把 zstd 编解码器换回原版）。 */
+    public void setRollback(Runnable rollback) {
+        this.rollback = rollback;
+    }
+
+    /**
+     * 校验并接受客户端确认。
+     *
+     * @return 是否接受（txId 不符时拒绝，避免任何"尾部恰好是魔数"的帧误放行）
+     */
+    public boolean confirm(int txId) {
+        int expected = expectedTxId;
+        if (expected != 0 && txId != expected) {
+            LOGGER.debug("[Zstd] switch confirmation txId mismatch: got={}, expected={}", txId, expected);
+            return false;
+        }
+        release(true);
+        return true;
+    }
+
+    /**
+     * 客户端明确拒绝切换（无法切换到 zstd）：立即回滚到原版，两个方向都保持一致。
+     *
+     * @return 是否接受
+     */
+    public boolean reject(int txId) {
+        int expected = expectedTxId;
+        if (expected != 0 && txId != expected) {
+            LOGGER.debug("[Zstd] switch reject txId mismatch: got={}, expected={}", txId, expected);
+            return false;
+        }
+        LOGGER.debug("[Zstd] client refused zstd switch — rolling back to vanilla");
+        release(false);
+        return true;
     }
 
     /** 扣住的包数（诊断用）。 */
@@ -101,7 +148,7 @@ public final class ZstdSwitchGate extends ChannelDuplexHandler {
     }
 
     /**
-     * 由服务端在收到客户端确认时调用。
+     * 由服务端在收到客户端确认时调用（不校验 txId，仅供内部/测试使用）。
      *
      * <p>⚠️ 不接收调用方的 ctx：放行必须从<b>本闸门自己</b>的位置写出，否则会跳过
      * 闸门与调用方之间的出站处理器（加密、帧长度等）。</p>
@@ -118,25 +165,31 @@ public final class ZstdSwitchGate extends ChannelDuplexHandler {
     private void release(boolean ok) {
         if (released) return;
         released = true;
-        // ⚠️ 超时也视为"已确认"：能走到激活这一步，说明客户端<b>已经通过协商证明</b>
-        // 自己装了模组、且会在收到 SetCompression 后切换到 zstd（这是客户端自身的逻辑，
-        // 不依赖本握手）。超时通常只是确认包丢了 / 晚了，而客户端的切换早已完成。
-        // 若此时把服务端退回原版，反而形成"客户端 zstd / 服务端原版"的必断连组合。
-        // 因此两个方向都保持 zstd —— 时序上客户端一定早于本超时（2s）完成切换。
-        confirmed = true;
+        confirmed = ok;
         if (scheduled != null) {
             scheduled.cancel(false);
             scheduled = null;
         }
         ChannelHandlerContext ctx = selfCtx;
         if (!ok) {
-            LOGGER.debug("[Zstd] switch not confirmed within {}ms, held={} — releasing as zstd "
-                    + "(client has already switched on SetCompression)", RELEASE_TIMEOUT_MS, held.size());
+            LOGGER.warn("[Zstd] switch not confirmed (timeout or refused), held={} — "
+                    + "rolling back to vanilla on BOTH directions", held.size());
         }
         if (ctx != null) {
             flushHeld(ctx);
         } else {
             releaseAll();
+        }
+        if (!ok) {
+            Runnable r = rollback;
+            rollback = null;
+            if (r != null) {
+                try {
+                    r.run();
+                } catch (Throwable t) {
+                    LOGGER.warn("[Zstd] rollback action failed", t);
+                }
+            }
         }
         if (ctx != null && ctx.pipeline().context(this) != null) {
             ctx.pipeline().remove(this);
@@ -199,8 +252,28 @@ public final class ZstdSwitchGate extends ChannelDuplexHandler {
 
     @Override
     public void handlerRemoved(ChannelHandlerContext ctx) {
-        // 被外部摘除 / 连接关闭：必须收尾，否则扣住的包与 promise 无人处理。
-        released = true;
+        // 被外部摘除（插件卸载 / 管线重建）：与超时同语义 —— 未确认就回滚两个方向，
+        // 否则会留下"出站 zstd / 入站原版"的必断连组合。
+        // ⚠️ 若已确认（正常放行后自移除），released 已为 true，此处不会再做事。
+        if (!released) {
+            released = true;
+            if (scheduled != null) {
+                scheduled.cancel(false);
+                scheduled = null;
+            }
+            ChannelHandlerContext c = selfCtx != null ? selfCtx : ctx;
+            flushHeld(c);
+            Runnable r = rollback;
+            rollback = null;
+            if (r != null) {
+                try {
+                    r.run();
+                } catch (Throwable t) {
+                    LOGGER.warn("[Zstd] rollback action failed", t);
+                }
+            }
+            return;
+        }
         if (scheduled != null) {
             scheduled.cancel(false);
             scheduled = null;
@@ -211,16 +284,17 @@ public final class ZstdSwitchGate extends ChannelDuplexHandler {
     /**
      * 是否属于切换窗口内必须扣住的包。
      *
-     * <p>判据：是 MC 包对象（不是 Netty 自身的控制消息）。Netty 的控制消息（协议阶段切换
-     * 用的 {@code Runnable} 等）被扣住会卡死连接建立，且日志无异常。</p>
+     * <p>判据：是 MC 包对象（类名落在 {@code .protocol.} 命名空间），而不是已编码的
+     * {@code ByteBuf}、也不是 Netty 的控制消息（协议阶段切换用的 {@code Runnable} 等）。</p>
      *
-     * <p>本闸门位于包层，因此这里看到的是 {@code Packet} / {@code MinecraftPacket} 对象，
-     * 类名一定落在 {@code .protocol.} 命名空间内；反过来用"不在 java./io.netty./org.slf4j."
-     * 判断会把任何第三方对象误当数据包。</p>
+     * <p>⚠️ 放行 {@code ByteBuf} 是必需的：服务端自己的 {@code zstd:switch} 请求
+     * 是"已编码好的帧"，从编码器的 ctx 写出时会经过本闸门；若把 ByteBuf 也扣住，
+     * 请求永远发不出去，握手必然超时。</p>
      */
     private static boolean mustHold(Object msg) {
         if (msg == null) return false;
         if (msg instanceof Runnable) return false;
+        if (msg instanceof io.netty.buffer.ByteBuf) return false;
         String cn = msg.getClass().getName();
         return cn.contains(".protocol.");
     }

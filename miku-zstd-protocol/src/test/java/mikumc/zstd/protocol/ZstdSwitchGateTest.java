@@ -109,7 +109,7 @@ class ZstdSwitchGateTest {
     }
 
     @Test
-    @DisplayName("闸门：超时后无条件放行，并视为已确认（客户端在 SetCompression 时必然已切换）")
+    @DisplayName("闸门：超时后无条件放行并判定未确认（服务端据此双向回滚到原版）")
     void releasesOnTimeout() throws InterruptedException {
         ZstdSwitchGate gate = ZstdSwitchGate.create();
         EmbeddedChannel ch = new EmbeddedChannel(gate);
@@ -127,8 +127,7 @@ class ZstdSwitchGateTest {
         }
 
         assertNull(ch.pipeline().get(ZstdSwitchGate.class), "超时后必须自移除");
-        assertTrue(gate.isConfirmed(), "超时按已确认处理：客户端必然已随 SetCompression 切换，"
-                + "若判为未确认会让入站退回原版，与出站 zstd 形成混合模式");
+        assertFalse(gate.isConfirmed(), "超时 = 未确认：服务端必须双向回滚，绝不能留下一半 zstd 一半原版");
         assertEquals(7, ((FakeMinecraftPacket) ch.readOutbound()).id, "超时后扣住的包仍必须补发");
         ch.finishAndReleaseAll();
     }

@@ -39,21 +39,29 @@ public final class ZstdSwitchConfirmSniffer extends MessageToMessageDecoder<Byte
             out.add(in.retain());
             return;
         }
-        int txId = ZstdStepFrames.readSwitchTxId(ZstdStepFrames.asBarePacket(in));
+        byte[] bare = ZstdStepFrames.asBarePacket(in);
+        int txId = ZstdStepFrames.readSwitchTxId(bare);
+        boolean accepted = true;
+        if (txId <= 0) {
+            // 拒绝包（success=false，无魔数）：客户端无法切换，服务端必须回滚
+            txId = ZstdStepFrames.readSwitchRejectTxId(bare);
+            accepted = false;
+        }
         if (txId <= 0) {
             out.add(in.retain());
             return;
         }
 
-        // 命中：消费该帧（这不是原版协议里的包），放行闸门，自移除
-        LOGGER.debug("[Zstd] switch confirmation received (txId={}) — releasing gate", txId);
         ctx.pipeline().remove(this);
-        Object gate = ctx.pipeline().get(mikumc.zstd.protocol.ZstdSwitchGate.class);
-        if (gate instanceof mikumc.zstd.protocol.ZstdSwitchGate g) {
-            g.confirm();
-        } else {
-            ZstdChannelManager mgr = ctx.channel().attr(ZstdChannelManager.KEY).get();
-            if (mgr != null) mgr.markSwitchConfirmed();
+        ZstdChannelManager mgr = ctx.channel().attr(ZstdChannelManager.KEY).get();
+        if (mgr != null) {
+            if (accepted) {
+                LOGGER.debug("[Zstd] switch confirmation received (txId={}) — releasing gate", txId);
+                mgr.confirmSwitch(txId);
+            } else {
+                LOGGER.debug("[Zstd] switch REJECTED by client (txId={}) — rolling back", txId);
+                mgr.rejectSwitch(txId);
+            }
         }
     }
 }
