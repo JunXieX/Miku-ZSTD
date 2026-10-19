@@ -75,6 +75,7 @@ public final class ZstdLoginNetworking {
             if (protocolVersion != ZstdChannelManager.PROTOCOL_VERSION) {
                 LOGGER.error("[Zstd] Protocol version mismatch: server={}, client={} \u2014 staying vanilla",
                         protocolVersion, ZstdChannelManager.PROTOCOL_VERSION);
+                markDeclined(handler);
                 return CompletableFuture.completedFuture(unavailable());
             }
             long encoderDictId = data.readLong();
@@ -118,7 +119,32 @@ public final class ZstdLoginNetworking {
             return CompletableFuture.completedFuture(answer(encoderStatus, decoderStatus));
         } catch (Exception e) {
             LOGGER.error("[Zstd] Failed to process negotiate \u2014 staying vanilla", e);
+            markDeclined(handler);
             return CompletableFuture.completedFuture(unavailable());
+        }
+    }
+
+    /**
+     * 本轮登录明确判定"不参与 zstd"（版本不匹配 / 载荷异常）：把状态置为
+     * {@link ZstdChannelManager.TransportState#PLAIN}，并请激活层拆掉可能残留的 zstd 处理器。
+     *
+     * <p>⚠️ <b>为什么必须显式做这件事</b>：同一个 {@code Channel} 可能被<b>重放登录</b>
+     * （ViaFabricPlus 协议切换、或同一条连接重新协商）。上一轮若已激活 zstd，本端就会一直
+     * 以 zstd 发帧、并按 zstd 解帧；而这一轮的对端是原版（或旧版插件）——形成"单侧 zstd"，
+     * 对端发来的原版压缩帧会被本端 zstd 解码器拒绝，玩家<b>进不去服务器</b>。
+     * 只有状态被置为 PLAIN，激活层才知道该把上一轮的 zstd 处理器拆掉（见
+     * {@code ZstdClientActivation#onRoundDeclined}）。</p>
+     *
+     * <p>取不到 Channel 时静默跳过：这条路径只是"多一层保险"，失败不该影响登录。</p>
+     */
+    private static void markDeclined(ClientHandshakePacketListenerImpl handler) {
+        try {
+            Connection connection = ((ClientHandshakePacketListenerAccessor) handler).getConnection();
+            Channel channel = ((ConnectionAccessor) connection).getChannel();
+            channel.attr(ZstdChannelManager.ZSTD_STATE).set(ZstdChannelManager.TransportState.PLAIN);
+            ZstdClientActivation.onRoundDeclined(channel);
+        } catch (Throwable t) {
+            LOGGER.debug("[Zstd] markDeclined skipped: {}", t.toString());
         }
     }
 

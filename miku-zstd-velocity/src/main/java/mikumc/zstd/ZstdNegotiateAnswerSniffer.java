@@ -74,9 +74,10 @@ public class ZstdNegotiateAnswerSniffer extends MessageToMessageDecoder<ByteBuf>
      * ——区块帧动辄几百 KB，等于给这条连接的每个包都加一次同尺寸分配。</p>
      *
      * <p>取 4096 的依据：登录查询应答只有几字节（{@code [0x02][varint txId][bool][varint][varint]}），
-     * 即使被原版压缩帧或 zstd 直存帧包一层也只有十几字节；留出充足余量以兼容
-     * "客户端已切 zstd、应答与其它包合批在同一帧"的极端时序。而 play 阶段的区块/地图数据帧
-     * 远大于此值，会被这条判断直接挡在 {@code asRawPacket} 之外。</p>
+     * 即使被原版压缩帧或 zstd 帧包一层也只有十几字节，余量给得宽松一些。
+     * 而 play 阶段的区块/地图数据帧远大于此值，会被这条判断直接挡在 {@code asRawPacket} 之外。
+     * （帧格式 v4 起"带内层长度前缀的直存帧"已不存在——直存帧一帧一包；上面提到的
+     * 「应答与其它包合批」场景也随之消失，这里保留余量只是不想再为此改动阈值。）</p>
      */
     private static final int MAX_ANSWER_FRAME_BYTES = 4096;
 
@@ -228,7 +229,10 @@ public class ZstdNegotiateAnswerSniffer extends MessageToMessageDecoder<ByteBuf>
         }
 
         // 其余情况按压缩帧处理：先读声明长度，再解压。
-        // 长度上限刻意收紧到 64KB —— 登录查询应答不可能这么大，避免畸形帧逼出大分配。
+        // ⚠️ 声明长度上限必须收紧到 64：这里声明的就是"解压后的包长"，而我们的应答只有
+        // 几字节（两个 varint）。放宽到 64KB 会让**每一个**常规压缩入站帧（默认压缩阈值
+        // 256B 起就被压缩）都走一次 new Inflater() + 解压尝试 —— 那是原生分配，
+        // 而本嗅探器在"等待字典应答"期间是长期驻留的，等于给这条连接白加一份永久开销。
         try {
             int declared = -1;
             int idx = start;
@@ -243,7 +247,7 @@ public class ZstdNegotiateAnswerSniffer extends MessageToMessageDecoder<ByteBuf>
                 }
                 shift += 7;
             }
-            if (declared <= 0 || declared > 65536 || idx >= in.writerIndex()) return null;
+            if (declared <= 0 || declared > 64 || idx >= in.writerIndex()) return null;
 
             byte[] src = new byte[in.writerIndex() - idx];
             in.getBytes(idx, src, 0, src.length);

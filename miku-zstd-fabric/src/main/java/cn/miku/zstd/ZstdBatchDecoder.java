@@ -12,9 +12,8 @@ import mikumc.zstd.protocol.ZstdBatchDecoderBase;
  * 本类只声明解压上下文来源与 HUD 统计口径。</p>
  *
  * <h2>统计口径</h2>
- * <p>两个方向都按"帧体线下字节"与"解压后字节"记账，其中解压后口径额外
- * {@code +1} 以含入 rawSize 标记——这样小包直存时压缩率恰好显示 100%，
- * 不会把协议自身的帧头算成"膨胀"。</p>
+ * <p>两个方向都按"帧体线下字节"与"解压后字节"记账，且<b>两侧都计入 rawSize 标记</b>
+ * ——这样小包直存时压缩率恰好显示 100%，不会把协议自身的帧头算成"膨胀"。</p>
  */
 public class ZstdBatchDecoder extends ZstdBatchDecoderBase {
 
@@ -47,11 +46,14 @@ public class ZstdBatchDecoder extends ZstdBatchDecoderBase {
 
     @Override
     protected void onStoredFrame(int frameBodyBytes) {
-        ZstdStatsData.addRxBatch(frameBodyBytes, 1 + frameBodyBytes);
+        // ⚠️ 两侧口径必须一致（都含 rawSize 标记），否则直存帧会显示成 99.9% 而不是 100%
+        // —— 直存帧本来就没有解压步骤，把协议头算成"膨胀"是纯误导。
+        ZstdStatsData.addRxBatch(1 + frameBodyBytes, 1 + frameBodyBytes);
     }
 
     @Override
     protected void onCompressedFrame(int inBytes, int outBytes) {
-        ZstdStatsData.addRxBatch(inBytes, 1 + outBytes);
+        // 同上：线路侧补上 rawSize 标记（它同样在线上），解压侧也含入该标记。
+        ZstdStatsData.addRxBatch(1 + inBytes, 1 + outBytes);
     }
 }

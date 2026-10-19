@@ -35,8 +35,15 @@ public final class ZstdSwitchSniffer extends MessageToMessageDecoder<ByteBuf> {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(MikuZstd.LOGGER_NAME);
 
-    /** 单帧上限：询问包极小，超过这个尺寸的帧一律不可能是它。 */
-    private static final int MAX_FRAME_BYTES = 512;
+    /**
+     * 单帧上限：询问包是 {@code [0][0x04][varint txId][len]["zstd:switch"][magic]} ≈ 23B，
+     * 超过这个尺寸的帧一律不可能是它。
+     *
+     * <p>⚠️ 本嗅探器是<b>常驻</b>的（服务端的询问只发一次，但确认之前它必须一直在位），
+     * 所以这个上限同时是热路径开关：调大意味着更多入站帧要走
+     * {@link ZstdStepFrames#asBarePacket} 的解析（其中"被压缩过的帧"还要尝试一次 zlib 解压）。</p>
+     */
+    private static final int MAX_FRAME_BYTES = 64;
 
     @Override
     protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) {

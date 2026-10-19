@@ -30,8 +30,14 @@ public final class ZstdSwitchConfirmSniffer extends MessageToMessageDecoder<Byte
 
     private static final Logger LOGGER = LoggerFactory.getLogger("miku-zstd");
 
-    /** 单帧上限：确认包极小，超过这个尺寸的帧一律不可能是它。 */
-    private static final int MAX_FRAME_BYTES = 512;
+    /**
+     * 单帧上限：确认包是 {@code [0][0x02][varint txId][bool][magic]} ≈ 12B（被原版压缩过也只有二三十字节），
+     * 超过这个尺寸的帧一律不可能是它。
+     *
+     * <p>⚠️ 本嗅探器是<b>常驻</b>的（确认到达后仍要留在管线里等极晚到达的重传），所以这个上限
+     * 同时是热路径开关：调大意味着更多入站帧要走 {@link ZstdStepFrames#asBarePacket} 的解析。</p>
+     */
+    private static final int MAX_FRAME_BYTES = 64;
 
     @Override
     protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) {
@@ -54,17 +60,22 @@ public final class ZstdSwitchConfirmSniffer extends MessageToMessageDecoder<Byte
             return;
         }
 
-        ctx.pipeline().remove(this);
         ZstdChannelManager mgr = ctx.channel().attr(ZstdChannelManager.KEY).get();
-        if (mgr != null) {
-            if (accepted) {
-                LOGGER.debug("[Zstd] switch confirmation received (txId={}) — releasing gate", txId);
-                mgr.confirmSwitch(txId);
-            } else {
-                LOGGER.warn("[Zstd] switch NOT confirmed by client (txId={}) — releasing held packets anyway",
-                        txId);
-                mgr.releaseUnconfirmed(txId);
-            }
+        boolean handled = mgr != null
+                && (accepted ? mgr.confirmSwitch(txId) : mgr.releaseUnconfirmed(txId));
+        if (!handled) {
+            // ⚠️ txId 与本端询问不符：这不是本次询问的应答，多半只是"恰好长得像"的普通小包。
+            // 此时**绝不能摘掉自己** —— 摘掉之后真确认到达时就没人认了，服务端只能等满
+            // 5 秒超时再放行；而且原帧必须原样下传（它是正常协议流量，吞掉即协议错乱）。
+            out.add(in.retain());
+            return;
+        }
+        ctx.pipeline().remove(this);
+        if (accepted) {
+            LOGGER.debug("[Zstd] switch confirmation received (txId={}) — releasing gate", txId);
+        } else {
+            LOGGER.warn("[Zstd] switch NOT confirmed by client (txId={}) — releasing held packets anyway",
+                    txId);
         }
     }
 }

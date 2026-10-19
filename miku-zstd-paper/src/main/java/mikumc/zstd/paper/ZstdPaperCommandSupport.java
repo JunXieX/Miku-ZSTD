@@ -17,9 +17,20 @@ final class ZstdPaperCommandSupport {
             Object bukkit = org.bukkit.Bukkit.getServer();
             Object mcServer = bukkit.getClass().getMethod("getServer").invoke(bukkit);
             Object props = mcServer.getClass().getMethod("getProperties").invoke(mcServer);
-            java.lang.reflect.Field f = props.getClass().getDeclaredField("networkCompressionThreshold");
-            f.setAccessible(true);
-            return f.getInt(props);
+            // ⚠️ 必须沿父类链查找：这个字段声明在 DedicatedServerProperties 还是其父类
+            // ServerProperties，随版本变动；只查 getDeclaredField（不含父类）时一旦声明在父类上
+            // 就会抛 NoSuchField 并被下面的 catch 吞成 0 —— 于是 network-compression-threshold=-1
+            // （压缩关闭）时插件不会按文档停用 zstd，每条登录都要白等约 2 秒才回落。
+            for (Class<?> c = props.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
+                try {
+                    java.lang.reflect.Field f = c.getDeclaredField("networkCompressionThreshold");
+                    f.setAccessible(true);
+                    return f.getInt(props);
+                } catch (NoSuchFieldException ignored) {
+                    // 继续往父类找
+                }
+            }
+            return 0;
         } catch (Throwable t) {
             return 0;
         }
