@@ -3,6 +3,7 @@ package mikumc.zstd.protocol;
 import com.github.luben.zstd.ZstdCompressCtx;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelDuplexHandler;
+import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelPromise;
 import io.netty.util.ReferenceCountUtil;
@@ -588,6 +589,7 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
         }
 
         cursor[0] = 0;
+        ChannelFuture lastWrite = null;
         while (cursor[0] < rawTotal) {
             int pktLen = ZstdVarInts.readOr(raw, cursor, ZstdVarInts.INVALID);
             int bodyOff = cursor[0];
@@ -603,13 +605,22 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
             ZstdVarInts.write(frame, 0);
             frame.writeBytes(raw, bodyOff, pktLen);
             onFrame(1 + pktLen, frame.readableBytes(), false);
-            ctx.write(frame);
+            lastWrite = ctx.write(frame);
             cursor[0] = bodyOff + pktLen;
         }
+        // 一批对应多个帧：所有帧写完只 flush 一次（不会因此多出 TCP 段）。
+        ctx.flush();
 
-        // 一批可能对应多个帧：promise 挂在最后那次 flush 上（全部帧写完后统一 flush 一次，
-        // 不会因此多出 TCP 段）。
-        ctx.flush().addListener(f -> {
+        // ⚠️ promise 只能挂在<b>最后一次 write</b> 的 future 上（{@code ctx.flush()} 返回的是
+        // {@code ChannelHandlerContext} 本身，没有 future 可挂）。写出顺序是确定的，
+        // 最后一次 write 完成时，本批此前的每一帧都已写出 —— 与 writeFrame 同一套语义。
+        if (lastWrite == null) {
+            for (ChannelPromise p : promises) {
+                p.trySuccess();
+            }
+            return;
+        }
+        lastWrite.addListener(f -> {
             for (ChannelPromise p : promises) {
                 if (f.isSuccess()) {
                     p.trySuccess();
