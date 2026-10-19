@@ -162,7 +162,10 @@ public final class ZstdDictRegistry {
                         fresh.retire();
                         return raced;
                     }
-                    continue; // raced 也已被淘汰：重试
+                    // ⚠️ raced 也已被淘汰：本次构造的 fresh 同样必须回收 —— 它带着
+                    // 约 3MB 的原生预计算表，直接 continue 会让这份资源永远无人释放。
+                    fresh.retire();
+                    continue; // 重试
                 }
                 cache.put(key, fresh);
                 // 超出容量时淘汰最旧的一代（在用的条目靠引用计数延迟释放）

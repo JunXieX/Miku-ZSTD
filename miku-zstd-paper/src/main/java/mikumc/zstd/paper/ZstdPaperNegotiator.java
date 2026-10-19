@@ -385,15 +385,21 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
             return;
         }
         if (!mgr.installDecoder(channel)) {
-            // 解码器安装失败：立即回滚已装的编码器，避免半装管道。
+            // 解码器安装失败（锚点刚校验过却仍失败，多为竞态）：先按 100ms 重试；
+            // ⚠️ 这里<b>不能</b>"回滚已装的编码器"——原版处理器实例已被移除过一次，
+            // Netty 对非 @Sharable handler 的 added 标志永不重置，重新插入必抛
+            // ChannelPipelineException。重试耗尽时只能收尾（见下）。
             if (installAttempt < MAX_RETRIES) {
                 channel.eventLoop().schedule(() -> installHandlers(ctx, mgr, installAttempt + 1),
                         RETRY_MS, TimeUnit.MILLISECONDS);
                 return;
             }
-            LOGGER.warn("[Zstd] zstd 解码器安装失败（锚点在位却替换失败）— 回落原版; pipeline={}",
+            // ⚠️ 重试耗尽时<b>不能</b> finishVanilla：编码器已经被换成 zstd，管线停在
+            // "出站 zstd / 入站原版"的必断连状态，把扣住的包按原路径发出去等于对端解不开。
+            // 只能明确收尾（补发 promise 由闸门侧负责，这里直接关连接）。
+            LOGGER.error("[Zstd] zstd 解码器安装失败（锚点在位却替换失败）— 关闭连接; pipeline={}",
                     channel.pipeline().names());
-            finishVanilla(ctx);
+            channel.close();
             return;
         }
         mgr.setReplaced(true); // 计数已内聚在 setReplaced 内（幂等，避免重复 +1）
@@ -498,6 +504,11 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
      * <p>⚠️ 与帧层嗅探器同一判据（末尾 4 字节魔数），但这里拿不到帧的外层形态，
      * 只用于"嗅探器没装上的极端情况"。</p>
      *
+     * <p>⚠️ txId 必须取<b>包的字段</b>（{@code transactionId}），不能从载荷首字节读：
+     * 载荷的第一字节是 {@code success} 位，按 varint 读出来恒为 1（见
+     * {@code ZstdStepFrames.writeConfirm} 的线格式），于是 txId 校验必然不通过、
+     * 闸门永远等满超时才放行。</p>
+     *
      * @return txId；不是切换确认返回 {@code -1}
      */
     private static int readSwitchTxId(Object msg) {
@@ -509,8 +520,7 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
         byte[] magic = new byte[4];
         System.arraycopy(payload, payload.length - 4, magic, 0, 4);
         if (!mikumc.zstd.protocol.ZstdStepFrames.matchesMagic(magic)) return -1;
-        int[] cursor = {0};
-        int txId = ZstdVarInts.readOr(payload, cursor, -1);
+        int txId = readInt(msg, "transactionId", "id", "transactionID");
         return txId > 0 ? txId : -1;
     }
 

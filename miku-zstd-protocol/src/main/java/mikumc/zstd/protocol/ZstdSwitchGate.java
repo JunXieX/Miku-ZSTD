@@ -1,6 +1,5 @@
 package mikumc.zstd.protocol;
 
-import io.netty.channel.Channel;
 import io.netty.channel.ChannelDuplexHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelPromise;
@@ -38,10 +37,25 @@ import java.util.concurrent.TimeUnit;
  * <p>切换请求由服务端经 {@code zstd_encoder} 的 context 写出 —— 那是本闸门的<b>下游</b>，
  * 出站事件不会回到上游的本闸门。这是安装位置（编码器之前）带来的直接保证。</p>
  *
- * <h2>兜底：超时后<b>双向</b>回滚</h2>
- * <p>确认丢失时（客户端崩溃 / 模组缺失 / 丢包），{@link #RELEASE_TIMEOUT_MS} 后本闸门会
- * 调用 {@link #setRollback(Runnable)} 注册的回滚动作：服务端把 zstd 编解码器换回原版。
- * 绝不能让"出站 zstd / 入站原版"这种混合模式存在 —— 那是必然进不去服务器。</p>
+ * <h2>兜底：任何"停止扣包"的理由都按<b>已提交</b>处理</h2>
+ * <p>确认到达、超时（{@link #RELEASE_TIMEOUT_MS}）、客户端回了一条<b>不带魔数</b>的应答、
+ * 或本处理器被外部摘除 —— 这四种情形本闸门都只是"把扣住的包按当前管线放行"，并置位
+ * {@link #isConfirmed()}。理由：</p>
+ * <ul>
+ *   <li>服务端在<b>激活那一刻</b>就已经把编解码器换成了 zstd。客户端则在收到
+ *       SetCompression 时也切换了（客户端与 SetCompression 的处理顺序决定），
+ *       因此"退回原版"既<b>做不到</b>，也会制造"出站 zstd / 入站原版"的必断连组合；</li>
+ *   <li><b>"退回原版"做不到</b>：原版压缩处理器实例在激活时已被 {@code pipeline.replace}
+ *       移除过一次，而 Netty 对非 {@code @Sharable} handler 的 {@code added} 标志
+ *       <b>永不重置</b>（{@code DefaultChannelPipeline#checkMultiplicity} 只置真、从不清零），
+ *       把同一个实例重新放回管线必然抛 {@code ChannelPipelineException}。所以本闸门
+ *       不提供任何"回滚"动作；</li>
+ *   <li>客户端回的那条"不带魔数"的应答（{@code [0x02][varint txId][0]}）<b>无法区分</b>
+ *       "装了模组但没切换"与"旧版客户端（没有切换嗅探器，收到询问后按原版规则回了一个
+ *       空应答）"。而旧版客户端<b>其实是 zstd</b>（它同样在 SetCompression 时切换了），
+ *       把它当成拒绝去关连接等于把正常玩家挡在门外。所以这条应答只作"未确认"记录，
+ *       动作与超时一致：放行并提交。</li>
+ * </ul>
  */
 public final class ZstdSwitchGate extends ChannelDuplexHandler {
 
@@ -61,9 +75,14 @@ public final class ZstdSwitchGate extends ChannelDuplexHandler {
      * 就自行放行，握手形同虚设。</p>
      *
      * <p>超时后<b>仍按已确认处理</b>（见 {@link #release}）：客户端在收到 SetCompression
-     * 时就已经切换，超时通常只是确认包丢了。退回原版反而会制造混合模式。</p>
+     * 时就已经切换，超时通常只是确认包丢了。退回原版反而会制造混合模式，而且原版处理器
+     * 实例已无法重新插入管线（见类注释）。</p>
      */
     public static final long RELEASE_TIMEOUT_MS = 5000;
+
+    /** "客户端未确认切换"告警的只报一次标志（多发于旧版模组客户端，逐连接重复无价值）。 */
+    private static final java.util.concurrent.atomic.AtomicBoolean UNCONFIRMED_WARNED =
+            new java.util.concurrent.atomic.AtomicBoolean();
 
     private final List<Object> held = new ArrayList<>();
     private final List<ChannelPromise> heldPromises = new ArrayList<>();
@@ -77,10 +96,7 @@ public final class ZstdSwitchGate extends ChannelDuplexHandler {
     /** 本次询问的 txId（0 表示不校验）。 */
     private volatile int expectedTxId;
 
-    /** 超时 / 客户端拒绝时的回滚动作（服务端用它把 zstd 编解码器换回原版）。 */
-    private volatile Runnable rollback;
-
-    /** 连接级判定：切换是否已由客户端确认。 */
+    /** 连接级判定：切换窗口是否已结束（结束即视为"服务端已提交到 zstd"）。 */
     public boolean isConfirmed() {
         return confirmed;
     }
@@ -88,11 +104,6 @@ public final class ZstdSwitchGate extends ChannelDuplexHandler {
     /** 记录本次询问的 txId（服务端在发送请求时调用）。 */
     public void expectTxId(int txId) {
         this.expectedTxId = txId;
-    }
-
-    /** 注册超时/拒绝时的回滚动作（服务端用它把 zstd 编解码器换回原版）。 */
-    public void setRollback(Runnable rollback) {
-        this.rollback = rollback;
     }
 
     /**
@@ -106,23 +117,34 @@ public final class ZstdSwitchGate extends ChannelDuplexHandler {
             LOGGER.debug("[Zstd] switch confirmation txId mismatch: got={}, expected={}", txId, expected);
             return false;
         }
-        release(true);
+        release();
         return true;
     }
 
     /**
-     * 客户端明确拒绝切换（无法切换到 zstd）：立即回滚到原版，两个方向都保持一致。
+     * 客户端回了一条<b>不带魔数</b>的应答：它没能（或不会）确认切换。
      *
-     * @return 是否接受
+     * <p>⚠️ 这条应答<b>不能</b>当"客户端拒绝 zstd"来处理 —— 旧版客户端在收到切换询问后
+     * 会按原版规则回一个空应答，而它其实是 zstd（同样在 SetCompression 时切换了）。
+     * 若据此关闭连接，正常玩家就会被挡在门外。见类注释。</p>
+     *
+     * @return 是否接受（txId 不符时忽略，避免误放行）
      */
-    public boolean reject(int txId) {
+    public boolean releaseUnconfirmed(int txId) {
         int expected = expectedTxId;
         if (expected != 0 && txId != expected) {
-            LOGGER.debug("[Zstd] switch reject txId mismatch: got={}, expected={}", txId, expected);
+            LOGGER.debug("[Zstd] switch answer txId mismatch: got={}, expected={}", txId, expected);
             return false;
         }
-        LOGGER.debug("[Zstd] client refused zstd switch — rolling back to vanilla");
-        release(false);
+        LOGGER.debug("[Zstd] switch not confirmed by client (txId={}) — releasing held packets", txId);
+        // 只提示一次：这条应答最常见的原因就是"客户端模组版本较旧，没有切换嗅探器"，
+        // 它会命中该玩家的<b>每一次</b>登录；逐条 WARN 只会把日志刷满。
+        if (UNCONFIRMED_WARNED.compareAndSet(false, true)) {
+            LOGGER.warn("[Zstd] 客户端未确认 zstd 切换（收到不带魔数的应答）。若该玩家反复出现，"
+                    + "通常是其客户端模组版本较旧、不支持切换握手 —— 请让玩家更新到与插件同版本。"
+                    + "（本条只提示一次）");
+        }
+        release();
         return true;
     }
 
@@ -134,7 +156,10 @@ public final class ZstdSwitchGate extends ChannelDuplexHandler {
     @Override
     public void handlerAdded(ChannelHandlerContext ctx) {
         selfCtx = ctx;
-        scheduled = ctx.channel().eventLoop().schedule(() -> release(false),
+        // ⚠️ 超时按"已确认"处理：服务端在激活时就已经换成了 zstd 编码器，而客户端收到
+        // SetCompression 时必然也切换了（TCP 顺序），此时退回原版既做不到，也会制造
+        //"出站 zstd / 入站原版"的必断连组合。见 release / 类注释。
+        scheduled = ctx.channel().eventLoop().schedule(this::release,
                 RELEASE_TIMEOUT_MS, TimeUnit.MILLISECONDS);
     }
 
@@ -155,43 +180,29 @@ public final class ZstdSwitchGate extends ChannelDuplexHandler {
      * 闸门与调用方之间的出站处理器（加密、帧长度等）。</p>
      */
     public void confirm() {
-        release(true);
+        release();
     }
 
-    /** 由安装失败 / 主动放弃激活的路径调用：视为未确认，触发回滚。 */
-    public void abort() {
-        release(false);
-    }
-
-    private void release(boolean ok) {
+    /**
+     * 停止扣包：把扣住的包从<b>本闸门自己的位置</b>按当前（已经是 zstd 的）管道放行，
+     * 置位 {@link #isConfirmed()}，并自移除。
+     *
+     * <p>本方法是<b>唯一</b>的释放路径 —— 确认、超时、未确认应答、外部摘除都走它，
+     * 因为"服务端已提交到 zstd"是这四种情形的共同结论（详见类注释）。</p>
+     */
+    private void release() {
         if (released) return;
         released = true;
-        confirmed = ok;
+        confirmed = true;
         if (scheduled != null) {
             scheduled.cancel(false);
             scheduled = null;
         }
         ChannelHandlerContext ctx = selfCtx;
-        if (!ok) {
-            LOGGER.warn("[Zstd] switch not confirmed (timeout or refused), held={} — "
-                    + "rolling back to vanilla on BOTH directions", held.size());
-        }
         if (ctx != null) {
             flushHeld(ctx);
         } else {
             releaseAll();
-        }
-        if (!ok) {
-            Runnable r = rollback;
-            rollback = null;
-            if (r != null) {
-                try {
-                    r.run();
-                } catch (Throwable t) {
-                    // 回滚是"尽力而为"的收尾：失败只记 debug，绝不冒泡成日志噪音
-                    LOGGER.debug("[Zstd] rollback action failed: {}", t.toString());
-                }
-            }
         }
         if (ctx != null) {
             try {
@@ -261,38 +272,19 @@ public final class ZstdSwitchGate extends ChannelDuplexHandler {
 
     @Override
     public void handlerRemoved(ChannelHandlerContext ctx) {
-        // 被外部摘除（插件卸载 / 管线重建）：与超时同语义 —— 未确认就回滚两个方向，
-        // 否则会留下"出站 zstd / 入站原版"的必断连组合。
+        // 被外部摘除（插件卸载 / 管线重建）：与超时同语义 —— 服务端在这一刻已经是 zstd，
+        // 扣住的包按当前管道补发，并标记"已提交"。这里<b>绝不</b>改动管线（原版处理器
+        // 实例已无法重新插入，见类注释），否则只会抛一条吓人的 ChannelPipelineException。
+        //
         // ⚠️ 若已确认（正常放行后自移除），released 已为 true，此处不会再做事。
         if (!released) {
             released = true;
+            confirmed = true;
             if (scheduled != null) {
                 scheduled.cancel(false);
                 scheduled = null;
             }
-            ChannelHandlerContext c = selfCtx != null ? selfCtx : ctx;
-            flushHeld(c);
-            // ⚠️ 只有在"连接仍然注册且活跃"时才回滚。
-            //
-            // 玩家断线 / 服务端关闭时，pipeline 会走 destroyDown→destroyUp 拆除，本方法
-            // 正是在那条链上被调用的（栈顶是 channelUnregistered）。此刻：
-            //   · 通道已注销 —— isRegistered() 为 false；
-            //   · 已注销的 pipeline 不允许再 replace/add/remove，且被移除的处理器会被
-            //     标记为"不可复用"，于是 Netty 抛
-            //     ChannelPipelineException（... is not a @Sharable handler）。
-            // 连接都死了，回滚毫无意义，只会在日志里刷一条吓人的堆栈。
-            Channel ch = ctx.channel();
-            boolean alive = ch.isRegistered() && ch.isActive();
-            Runnable r = rollback;
-            rollback = null;
-            if (alive && r != null) {
-                try {
-                    r.run();
-                } catch (Throwable t) {
-                    // 管线拆除竞态下仍可能失败：只记 debug，绝不让它冒泡成日志噪音
-                    LOGGER.debug("[Zstd] rollback action skipped: {}", t.toString());
-                }
-            }
+            flushHeld(selfCtx != null ? selfCtx : ctx);
             return;
         }
         if (scheduled != null) {

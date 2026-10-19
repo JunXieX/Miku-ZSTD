@@ -584,7 +584,16 @@ public class ZstdHijacker extends ChannelDuplexHandler {
             }
             LOGGER.error("[Zstd] zstd handler installation failed after {} attempts; pipeline={}",
                     installAttempt, p.names());
-            releaseHeld(ctx); // 回落原版：把扣住的包按原路径补发
+            // ⚠️ 若编码器已经换上、解码器没有，管线停在"出站 zstd / 入站原版"的必断连状态：
+            // 此时把扣住的包按原路径发出去，对端一样解不开（它已经在 SetCompression 后切到
+            // zstd 了）。而且"换回原版实例"这条路不存在（原版处理器已被移除过一次，Netty 对
+            // 非 @Sharable handler 的 added 标志永不重置）。所以只能明确关闭连接。
+            if (p.get("zstd_encoder") != null && p.get("zstd_decoder") == null) {
+                LOGGER.error("[Zstd] 半装管线（仅编码器为 zstd）— 关闭连接，避免必断连");
+                channel.close();
+                return false;
+            }
+            releaseHeld(ctx); // 回落原版：把扣住的包按原路径补发（此时管线仍是完整原版）
             return false;
         }
 

@@ -233,21 +233,11 @@ public class ZstdPaperChannelManager {
     /** 本连接的切换闸门（未安装时为 null，此时按"未确认"处理）。 */
     private volatile mikumc.zstd.protocol.ZstdSwitchGate switchGate;
 
-    /** 本连接的管线引用（回滚时需要）。 */
-    private volatile io.netty.channel.ChannelPipeline pipelineRef;
-    /** 被替换掉的原版压缩处理器实例与管线名（回滚时原样换回）。 */
-    private volatile io.netty.channel.ChannelHandler vanillaEncoder;
-    private volatile String vanillaEncoderName;
-    private volatile io.netty.channel.ChannelHandler vanillaDecoder;
-    private volatile String vanillaDecoderName;
-
     public boolean installEncoder(Channel channel) {
         var p = channel.pipeline();
         if (p.get("zstd_encoder") != null) return true;
         for (String anchor : new String[]{"compress", "compression-encoder"}) {
             if (p.get(anchor) != null) {
-                vanillaEncoder = p.get(anchor);
-                vanillaEncoderName = anchor;
                 p.replace(anchor, "zstd_encoder", new ZstdPaperEncoder());
                 return true;
             }
@@ -289,8 +279,6 @@ public class ZstdPaperChannelManager {
         if (p.get("zstd_decoder") != null) return true;
         for (String anchor : new String[]{"decompress", "compression-decoder"}) {
             if (p.get(anchor) != null) {
-                vanillaDecoder = p.get(anchor);
-                vanillaDecoderName = anchor;
                 p.replace(anchor, "zstd_decoder", new ZstdPaperDecoder());
                 return true;
             }
@@ -308,13 +296,10 @@ public class ZstdPaperChannelManager {
     public void installSwitchGate(Channel channel) {
         if (switchGate != null) return;
         var p = channel.pipeline();
-        pipelineRef = p;
         if (p.get("zstd_switch_gate") != null) return;
         for (String anchor : new String[]{"compress", "compression-encoder"}) {
             if (p.get(anchor) != null) {
                 switchGate = mikumc.zstd.protocol.ZstdSwitchGate.create();
-                // 超时 / 客户端拒绝时把两个方向一起换回原版实例
-                switchGate.setRollback(this::rollbackToVanilla);
                 // ⚠️ 必须是 addAfter：Netty 出站事件从 tail 走向 head（索引递减），
                 // addBefore 会把闸门放到编码器<b>之后</b>，那时包已是 ByteBuf，无法按包类型判断。
                 // addAfter 让出站先经过闸门（拿到 Packet），放行时才交给编码器。
@@ -373,51 +358,18 @@ public class ZstdPaperChannelManager {
     }
 
     /**
-     * 客户端明确拒绝切换（无法切换到 zstd）：立即回滚到原版。
+     * 客户端回了一条<b>不带魔数</b>的应答（没能 / 不会确认切换）：放行扣住的包。
+     *
+     * <p>⚠️ 这条应答无法区分"装了模组但没切换"与"旧版客户端按原版规则回的空应答"，
+     * 而后者其实是 zstd —— 当成拒绝去关连接会把正常玩家挡在门外。见
+     * {@link mikumc.zstd.protocol.ZstdSwitchGate} 的类注释。</p>
      *
      * @return 是否接受
      */
-    public boolean rejectSwitch(int txId) {
+    public boolean releaseUnconfirmed(int txId) {
         var gate = switchGate;
         if (gate == null) return false;
-        return gate.reject(txId);
-    }
-
-    /**
-     * 把 zstd 编解码器换回<b>原版实例</b>（超时 / 客户端拒绝时调用）。
-     *
-     * <p>⚠️ 必须换回同一个实例：原版压缩处理器在 Paper 上带连接级状态（阈值等），
-     * 重新构造既拿不到参数，也可能与连接状态不匹配。两个方向必须同时回滚。</p>
-     */
-    private void rollbackToVanilla() {
-        setReplaced(false);
-        try {
-            var p = pipelineRef;
-            if (p == null) return;
-            // ⚠️ 只有在连接仍然注册且活跃时才允许改动管线：
-            // 通道注销后 pipeline 正在被 destroyDown/destroyUp 拆除，此时 replace 会抛
-            // ChannelPipelineException（被移除的处理器被标记为不可复用）。
-            // 那种情况下回滚既无意义也做不到，只会刷一条吓人的堆栈。
-            var ch = (p == null) ? null : p.channel();
-            if (ch == null || !ch.isRegistered() || !ch.isActive()) {
-                LOGGER.debug("[Zstd] rollback skipped — channel already gone");
-                return;
-            }
-            var dec = vanillaDecoder;
-            if (dec != null && p.get("zstd_decoder") != null) {
-                p.replace("zstd_decoder", vanillaDecoderName, dec);
-                vanillaDecoder = null;
-            }
-            var enc = vanillaEncoder;
-            if (enc != null && p.get("zstd_encoder") != null) {
-                p.replace("zstd_encoder", vanillaEncoderName, enc);
-                vanillaEncoder = null;
-            }
-            LOGGER.info("[Zstd] rolled back to vanilla codecs (switch not confirmed)");
-        } catch (Throwable t) {
-            // 失败只是日志噪音：连接要么已经死了，要么即将被替换回原版
-            LOGGER.debug("[Zstd] rollback to vanilla skipped: {}", t.toString());
-        }
+        return gate.releaseUnconfirmed(txId);
     }
 
     public void close() {

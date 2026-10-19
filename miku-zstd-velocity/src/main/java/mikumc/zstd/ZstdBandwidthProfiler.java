@@ -86,6 +86,9 @@ public final class ZstdBandwidthProfiler {
     }
 
     public static synchronized void shutdown() {
+        // ⚠️ 一并关掉热路径开关：shutdown 之后 {@link #record} 仍会被编码器调用，
+        // 不置假就等于"停了线程却还在每个包上累加"。
+        enabled = false;
         if (scheduler != null) {
             scheduler.shutdown();
             scheduler = null;

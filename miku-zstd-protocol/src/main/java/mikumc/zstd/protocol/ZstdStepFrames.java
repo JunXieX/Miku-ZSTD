@@ -163,12 +163,18 @@ public final class ZstdStepFrames {
     }
 
     /**
-     * 读出"客户端拒绝切换"的 txId：{@code [varint txId][false]}（裸包体，无魔数）。
+     * 读出"客户端答了、但没能确认切换"的 txId：{@code [varint txId][0]}（裸包体，无魔数）。
      *
-     * <p>必须单独识别：拒绝包里没有魔数，但它是"保持原版"的唯一确定性信号 ——
-     * 收不到它会逼服务端等满超时，而超时后无论怎么选都会有一半概率错配。</p>
+     * <p>必须单独识别：这条应答里没有魔数，但它能告诉服务端"不必再等" ——
+     * 收不到它，服务端只能等满 {@link ZstdSwitchGate#RELEASE_TIMEOUT_MS} 才放行扣住的包，
+     * 每次登录都白白多等 5 秒。</p>
      *
-     * @return txId；不是拒绝包返回 {@code -1}
+     * <p>⚠️ <b>它不能被当成"客户端拒绝 zstd"</b>：旧版客户端（没有切换嗅探器）在收到询问后
+     * 会按原版登录规则回一个<b>同样字节</b>的空应答，而它其实是 zstd（同样在 SetCompression
+     * 时切换了）。把它当拒绝去关连接，等于把正常玩家挡在门外。服务端因此只按
+     * "未确认但已提交"处理（见 {@link ZstdSwitchGate} 的类注释）。</p>
+     *
+     * @return txId；不是这种应答返回 {@code -1}
      */
     public static int readSwitchRejectTxId(byte[] bare) {
         if (bare == null || bare.length < 2) return -1;
