@@ -314,6 +314,17 @@ public class ZstdHijacker extends ChannelDuplexHandler {
             return;
         }
 
+        // 兜底：回落原版之后（本处理器已自移除）若 SetCompression 才被写出，
+        // 客户端已放弃 zstd、继续用原版帧 —— 而本端不会再有任何人切回 zstd。
+        if (C_SET_COMPRESSION != null && C_SET_COMPRESSION.isInstance(msg)) {
+            LOGGER.warn("[Zstd] SetCompression written after zstd was skipped — "
+                    + "dropping negotiation so both sides stay vanilla");
+            ZstdChannelManager m = ctx.channel().attr(ZstdChannelManager.KEY).get();
+            if (m != null) {
+                m.setProtocolMismatch();
+            }
+        }
+
         super.write(ctx, msg, promise);
     }
 
@@ -561,7 +572,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
         // 激活窗口内扣住的包与 promise 永挂 —— 客户端表现为**连接卡死**（不是断连），
         // 日志里只有一行 ERROR；③监控里的"使用人数"还被错误 +1 且永不回落。
         // Paper 端一直是"装完再置位"（见 ZstdPaperNegotiator），此处与它对齐。
-        if (!mgr.installEncoder(channel) || !mgr.installDecoder(channel)) {
+        if (!mgr.installHandlers(channel)) {
             // ⚠️ 两件事都必须做：
             // 1) 重试——原版压缩处理器是 SetCompression 之后才装的，可能尚未就绪；
             // 2) 重试用尽后必须 releaseHeld——否则 hold 期间扣下的包永不补发，
@@ -580,6 +591,11 @@ public class ZstdHijacker extends ChannelDuplexHandler {
         mgr.setReplaced(true); // 计数已内聚在 setReplaced 内（幂等）
 
         LOGGER.info("[Zstd] Zstd transport activated (dict={})", mgr.isDictConfirmed());
+
+        // ⚠️ 切换闸门此刻正扣着登录期的大帧（例如 LoginSuccess 压缩帧），
+        // 客户端在收到它之前不可能完成登录，也就没有任何东西会触发它的切换。
+        // 因此必须主动补一条"服务端已就绪、请切换"的通知 —— 客户端据此切换并发确认。
+        sendSwitchRequest(channel);
 
         // ⚠️ 顺序必须【先补发、后自移除】：handlerRemoved 会把"仍被扣住的包"当作销毁
         // 泄漏收尾（释放 + 失败化 promise）。若先移除，这些包就永远发不出去——登录阶段的
@@ -751,6 +767,60 @@ public class ZstdHijacker extends ChannelDuplexHandler {
         buf.writeInt(mikumc.zstd.protocol.ZstdDictId.wireChecksum(dict));
         buf.writeInt(dict.length);
         buf.writeBytes(dict);
+    }
+
+    /**
+     * 通知客户端"服务端已切换到 zstd，请切换并发确认"（{@code zstd:switch}，载荷 4 字节魔数）。
+     *
+     * <p>⚠️ <b>必须经 {@code zstd_encoder} 的 context 写出</b>：此刻原版压缩编码器
+     * 已被替换，外层长度也是由更早的处理器按 zstd 帧补齐的。它会被编码成一个 zstd 直存帧
+     * （几十字节，远低于压缩阈值），对端（已切换的解码器）按 zstd 直存帧读出裸包。</p>
+     *
+     * <p>⚠️ 接收方要看<b>包 id 之后</b>的魔数，而不是通道名：本端写的是完整登录查询包
+     * {@code [0x04][txId][channelName][magic]}，但客户端一侧的"裸包"只包含
+     * {@code [txId][channelName][magic]}（包 id 已被帧层吃掉）。</p>
+     *
+     * @return 是否确实发出
+     */
+    static boolean sendSwitchRequest(Channel channel) {
+        // ⚠️ 从 zstd_encoder 的 ctx 写出，并<b>自己把内容编码成 zstd 直存帧</b>：
+        //   · ctx.write 会跳过 zstd_encoder 本身，所以不能再让它编码一次；
+        //   · 闸门位于压缩编码器<b>之前</b>，从它之后写出不会被自己扣住；
+        //   · 外层 bodyLen 由管线里更靠 head 的 frame-encoder 补齐（Velocity 无独立 prepender）。
+        // 几十字节远低于压缩阈值，直存即可。
+        ChannelHandlerContext writeCtx = channel.pipeline().context("zstd_encoder");
+        if (writeCtx == null) {
+            LOGGER.debug("[Zstd] cannot send switch request — zstd_encoder anchor missing");
+            return false;
+        }
+        try {
+            ByteBuf packet = writeCtx.alloc().buffer();
+            ByteBuf frame = writeCtx.alloc().buffer();
+            try {
+                mikumc.zstd.protocol.ZstdStepFrames.writeQuery(packet,
+                        ThreadLocalRandom.current().nextInt(1, Integer.MAX_VALUE),
+                        mikumc.zstd.protocol.ZstdSwitchGate.CHANNEL);
+
+                // zstd 直存帧：[rawSize=0][varint pktLen][packet]
+                int pktLen = packet.readableBytes();
+                mikumc.zstd.protocol.ZstdVarInts.write(frame, 0);
+                mikumc.zstd.protocol.ZstdVarInts.write(frame, pktLen);
+                frame.writeBytes(packet);
+
+                writeCtx.writeAndFlush(frame);
+                LOGGER.debug("[Zstd] switch request sent");
+                return true;
+            } catch (Throwable t) {
+                if (packet.refCnt() > 0) packet.release();
+                if (frame.refCnt() > 0) frame.release();
+                throw t;
+            } finally {
+                if (packet.refCnt() > 0) packet.release();
+            }
+        } catch (Exception e) {
+            LOGGER.debug("[Zstd] failed to send switch request: {}", e.toString());
+            return false;
+        }
     }
 
     /**

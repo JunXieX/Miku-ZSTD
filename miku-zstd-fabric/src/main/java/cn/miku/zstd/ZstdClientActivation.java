@@ -57,7 +57,7 @@ public final class ZstdClientActivation {
      */
     public static void activate(Channel channel) {
         if (channel == null) return;
-        channel.eventLoop().execute(() -> activateInEventLoop(channel, false));
+        channel.eventLoop().execute(() -> activateInEventLoop(channel, false, 0));
     }
 
     /**
@@ -84,10 +84,59 @@ public final class ZstdClientActivation {
      */
     public static void activateAfterQueryResponseSent(Channel channel) {
         if (channel == null) return;
-        channel.eventLoop().execute(() -> activateInEventLoop(channel, true));
+        channel.eventLoop().execute(() -> activateInEventLoop(channel, true, 0));
     }
 
-    private static void activateInEventLoop(Channel channel, boolean quiet) {
+    /**
+     * 服务端发来 {@code zstd:switch} 后调用：<b>先</b>把入站解码器换成 zstd，<b>再</b>回发确认。
+     *
+     * <h2>为什么必须先换再确认</h2>
+     * <p>服务端在收到确认之前一个登录期大包都不会发（{@code ZstdSwitchGate} 扣着）。确认发出后
+     * 它会立刻按 zstd 编码放行 —— 若本端此刻还没换解码器，第一个收到的 zstd 帧就会被原版
+     * 解码器当成 {@code dataLength} 解析错乱，表现为<b>无法进入服务器</b>。这两件事的顺序
+     * 是协议保证的一部分，不能调换。</p>
+     *
+     * @param txId 服务端询问带来的 txId（原样回发，服务端据此配对）
+     */
+    public static void activateAndConfirm(Channel channel, int txId) {
+        if (channel == null) return;
+        channel.eventLoop().execute(() -> {
+            activateInEventLoop(channel, false, txId);
+            // ⚠️ 只有真的换成 zstd 才回确认：没切成就回确认会让服务端用 zstd 发帧，
+            // 而本端仍按原版解 → 必断连。此时不回，让服务端 2 秒超时后保持原版（可进服）。
+            if (Boolean.TRUE.equals(channel.attr(ACTIVATED).get())
+                    && channel.pipeline().get("zstd_decoder") != null) {
+                sendSwitchConfirm(channel, txId);
+            } else {
+                LOGGER.debug("[Zstd] refusing to confirm switch — client not on zstd; "
+                        + "server will fall back to vanilla");
+            }
+        });
+    }
+
+    private static void sendSwitchConfirm(Channel channel, int txId) {
+        io.netty.channel.ChannelHandlerContext writeCtx = channel.pipeline().context("encoder");
+        if (writeCtx == null) {
+            writeCtx = channel.pipeline().context("compress");
+        }
+        if (writeCtx == null) {
+            LOGGER.debug("[Zstd] cannot send switch confirmation — encoder anchor missing");
+            return;
+        }
+        io.netty.buffer.ByteBuf buf = writeCtx.alloc().buffer();
+        try {
+            // ⚠️ 必须是 serverbound 的查询应答（0x02），而不是 clientbound 的询问（0x04）：
+            // 服务端会把 0x04 解析成别的包并直接断连。
+            mikumc.zstd.protocol.ZstdStepFrames.writeConfirm(buf, txId);
+            writeCtx.writeAndFlush(buf);
+            LOGGER.debug("[Zstd] switch confirmation sent (txId={})", txId);
+        } catch (Throwable t) {
+            if (buf.refCnt() > 0) buf.release();
+            LOGGER.debug("[Zstd] failed to send switch confirmation: {}", t.toString());
+        }
+    }
+
+    private static void activateInEventLoop(Channel channel, boolean quiet, int confirmTxId) {
         if (!channel.isActive()) return;
         ChannelPipeline p = channel.pipeline();
 
@@ -160,10 +209,31 @@ public final class ZstdClientActivation {
             return;
         }
 
+        // 已切到 zstd：此时 decompress 已被替换成 zstd_decoder，锚点只剩它。
+        // 服务端的切换询问（zstd:switch）以裸帧到达，必须在 zstd_decoder 之前截获，
+        // 否则首个 varint（0x04）会被当成 rawSize 解析 → 直接断连。
+        installSwitchSniffer(p);
+
         channel.attr(ZstdChannelManager.ZSTD_STATE).set(ZstdChannelManager.TransportState.ZSTD_ACTIVE);
         channel.attr(ACTIVATED).set(Boolean.TRUE);
 
         LOGGER.info("[Zstd] Client zstd transport activated; pipeline={}", p.names());
+    }
+
+    /** 把切换询问嗅探器装到 {@code zstd_decoder} 之前（幂等）。 */
+    private static void installSwitchSniffer(ChannelPipeline p) {
+        if (p.get("zstd_switch_sniffer") != null) return;
+        if (p.get("zstd_decoder") != null) {
+            p.addBefore("zstd_decoder", "zstd_switch_sniffer",
+                    (ChannelHandler) new ZstdSwitchSniffer());
+            return;
+        }
+        if (p.get("decompress") != null) {
+            p.addBefore("decompress", "zstd_switch_sniffer",
+                    (ChannelHandler) new ZstdSwitchSniffer());
+            return;
+        }
+        LOGGER.debug("[Zstd] switch sniffer not installed (no anchor); pipeline={}", p.names());
     }
 
     /**

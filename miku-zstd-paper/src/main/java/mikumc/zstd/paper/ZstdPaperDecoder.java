@@ -11,9 +11,13 @@ import mikumc.zstd.protocol.ZstdBatchDecoderBase;
  */
 public class ZstdPaperDecoder extends ZstdBatchDecoderBase {
 
+    /** handlerAdded 时记录，供 {@link #switchConfirmed()} 读取闸门状态（volatile：跨线程可见）。 */
+    private volatile ZstdPaperChannelManager currentManager;
+
     @Override
     protected ZstdDecompressCtx resolveDecompressContext(ChannelHandlerContext ctx) {
         ZstdPaperChannelManager mgr = ctx.channel().attr(ZstdPaperChannelManager.KEY).get();
+        currentManager = mgr;
         if (mgr == null) {
             LOGGER.warn("[Zstd] decoder: channel manager not found");
             return null;
@@ -37,10 +41,23 @@ public class ZstdPaperDecoder extends ZstdBatchDecoderBase {
         return true;
     }
 
-    /** 与服务端另一端一致：兼容切换窗口内仍在路上的原版帧（见基类同名钩子）。 */
+    /**
+     * 服务端声明：切换确认之前，入站只可能是原版帧（由 {@link mikumc.zstd.protocol.ZstdSwitchGate}
+     * 保证）。确认之后立即转为严格 zstd 模式。
+     */
     @Override
     protected boolean acceptsLegacyFrames() {
         return true;
+    }
+
+    /**
+     * 读闸门的确认状态；闸门<b>尚未安装</b>时按"未确认"处理（宁可多按原版解释几帧，
+     * 也不能在切换窗口里把原版帧当 zstd 帧解析——那正是断连的成因）。
+     */
+    @Override
+    protected boolean switchConfirmed() {
+        ZstdPaperChannelManager mgr = currentManager;
+        return mgr != null && mgr.isSwitchConfirmed();
     }
 
     /** 直存帧采样：格式与解压帧相同，直接整帧批量提交。 */
