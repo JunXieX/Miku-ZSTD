@@ -40,17 +40,28 @@ public final class ZstdPaperSwitchConfirmSniffer extends MessageToMessageDecoder
             out.add(in.retain());
             return;
         }
-        int txId = ZstdStepFrames.readSwitchTxId(ZstdStepFrames.asBarePacket(in));
+        byte[] bare = ZstdStepFrames.asBarePacket(in);
+        int txId = ZstdStepFrames.readSwitchTxId(bare);
+        boolean accepted = true;
+        if (txId <= 0) {
+            txId = ZstdStepFrames.readSwitchRejectTxId(bare); // success=false，无魔数
+            accepted = false;
+        }
         if (txId <= 0) {
             out.add(in.retain());
             return;
         }
 
-        LOGGER.debug("[Zstd] switch confirmation received (txId={}) — releasing gate", txId);
         ctx.pipeline().remove(this);
         ZstdPaperChannelManager mgr = ctx.channel().attr(ZstdPaperChannelManager.KEY).get();
         if (mgr != null) {
-            mgr.markSwitchConfirmed();
+            if (accepted) {
+                LOGGER.debug("[Zstd] switch confirmation received (txId={}) — releasing gate", txId);
+                mgr.markSwitchConfirmed(txId);
+            } else {
+                LOGGER.debug("[Zstd] switch REJECTED by client (txId={}) — rolling back", txId);
+                mgr.rejectSwitch(txId);
+            }
         }
     }
 }

@@ -106,10 +106,12 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
         //    是每条原版连接都要永久支付的税（negotiateTxId 为 -1 时不可能命中任何应答）。
         if (mgr != null && msg != null && mgr.getNegotiateTxId() != -1) {
             // 0) 切换确认（客户端发来的 zstd:switch）：必须在通用应答解析之前拦下
-            if (isSwitchConfirmation(msg)) {
+            //    帧层嗅探器是主路径；这里只是包层兜底（嗅探器装不上时）。
+            int switchTx = readSwitchTxId(msg);
+            if (switchTx > 0) {
                 io.netty.util.ReferenceCountUtil.release(msg);
                 if (mgr.isReplaced()) {
-                    mgr.markSwitchConfirmed();
+                    mgr.markSwitchConfirmed(switchTx);
                 }
                 return;
             }
@@ -491,6 +493,28 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
     }
 
     /**
+     * 包层兜底：从查询/应答包里读出切换确认的 txId。
+     *
+     * <p>⚠️ 与帧层嗅探器同一判据（末尾 4 字节魔数），但这里拿不到帧的外层形态，
+     * 只用于"嗅探器没装上的极端情况"。</p>
+     *
+     * @return txId；不是切换确认返回 {@code -1}
+     */
+    private static int readSwitchTxId(Object msg) {
+        if (msg == null) return -1;
+        String cn = msg.getClass().getSimpleName();
+        if (!cn.contains("Query") && !cn.contains("Plugin")) return -1;
+        byte[] payload = readBytes(msg, "data", "payload", "contents");
+        if (payload == null || payload.length < 5) return -1;
+        byte[] magic = new byte[4];
+        System.arraycopy(payload, payload.length - 4, magic, 0, 4);
+        if (!mikumc.zstd.protocol.ZstdStepFrames.matchesMagic(magic)) return -1;
+        int[] cursor = {0};
+        int txId = ZstdVarInts.readOr(payload, cursor, -1);
+        return txId > 0 ? txId : -1;
+    }
+
+    /**
      * 发送"服务端已切换，请切换并发确认"（{@code zstd:switch}，4 字节魔数）。
      *
      * <p>⚠️ 经 {@code zstd_encoder} 的 context 写出：此刻原版压缩编码器已被替换，
@@ -509,8 +533,10 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
         ByteBuf packet = writeCtx.alloc().buffer();
         ByteBuf frame = writeCtx.alloc().buffer();
         try {
-            mikumc.zstd.protocol.ZstdStepFrames.writeQuery(packet,
-                    ThreadLocalRandom.current().nextInt(1, Integer.MAX_VALUE),
+            int txId = ThreadLocalRandom.current().nextInt(1, Integer.MAX_VALUE);
+            ZstdPaperChannelManager mgr = channel.attr(ZstdPaperChannelManager.KEY).get();
+            if (mgr != null) mgr.expectSwitchTxId(txId);
+            mikumc.zstd.protocol.ZstdStepFrames.writeQuery(packet, txId,
                     mikumc.zstd.protocol.ZstdSwitchGate.CHANNEL);
             int pktLen = packet.readableBytes();
             ZstdVarInts.write(frame, 0);
@@ -525,23 +551,6 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
         } finally {
             if (packet.refCnt() > 0) packet.release();
         }
-    }
-
-    /**
-     * 客户端发回的切换确认。
-     *
-     * <p>Paper 端在<b>包层</b>就能看到它（Velocity 端则在帧层——两端管线不同，这是有意的）：
-     * 包体是 {@code [varint txId][varint len][channel][int magic]}，只要尾部 4 字节是魔数即可。</p>
-     */
-    private static boolean isSwitchConfirmation(Object msg) {
-        if (msg == null) return false;
-        String cn = msg.getClass().getSimpleName();
-        if (!cn.contains("Query") && !cn.contains("Plugin")) return false;
-        byte[] payload = readBytes(msg, "data", "payload", "contents");
-        if (payload == null || payload.length < 4) return false;
-        byte[] magic = new byte[4];
-        System.arraycopy(payload, payload.length - 4, magic, 0, 4);
-        return mikumc.zstd.protocol.ZstdStepFrames.matchesMagic(magic);
     }
 
     /**

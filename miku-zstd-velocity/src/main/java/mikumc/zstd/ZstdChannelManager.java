@@ -90,6 +90,15 @@ public class ZstdChannelManager {
     /** 本连接的切换闸门（未安装时为 null，此时按"未确认"处理）。 */
     private volatile mikumc.zstd.protocol.ZstdSwitchGate switchGate;
 
+    /** 被替换掉的原版压缩编码器实例与它的管线名（回滚时原样换回）。 */
+    private volatile io.netty.channel.ChannelHandler vanillaEncoder;
+    private volatile String vanillaEncoderName;
+    /** 被替换掉的原版压缩解码器实例与它的管线名。 */
+    private volatile io.netty.channel.ChannelHandler vanillaDecoder;
+    private volatile String vanillaDecoderName;
+    /** 本连接的管线引用（回滚时需要，连接关闭后为 null）。 */
+    private volatile io.netty.channel.ChannelPipeline pipelineRef;
+
     /** 已从注册表取用的字典条目，连接关闭时归还引用 */
     private ZstdDictRegistry.Entry encoderDictEntry;
     private ZstdDictRegistry.Entry decoderDictEntry;
@@ -341,6 +350,9 @@ public class ZstdChannelManager {
         // Velocity 4.x 的原版压缩编码器可能叫 compression-encoder 或 compress
         for (String anchor : new String[]{"compression-encoder", "compress"}) {
             if (p.get(anchor) != null) {
+                // 保存原版实例：切换失败（超时 / 客户端拒绝）时要用它原样换回来。
+                vanillaEncoder = p.get(anchor);
+                vanillaEncoderName = anchor;
                 p.replace(anchor, "zstd_encoder", new ZstdBatchEncoder());
                 return true;
             }
@@ -381,16 +393,20 @@ public class ZstdChannelManager {
      */
     private boolean installSwitchGate(Channel channel) {
         io.netty.channel.ChannelPipeline p = channel.pipeline();
+        pipelineRef = p;
         if (switchGate != null) return true;
         String installed = null;
         for (String anchor : new String[]{"compression-encoder", "compress"}) {
             if (p.get(anchor) != null) {
                 switchGate = mikumc.zstd.protocol.ZstdSwitchGate.create();
-                // ⚠️ 必须在编码器<b>之前</b>（出站方向更靠近 tail）：此时拿到的是 MC 包对象，
-                // 才能按包类型判定；而且放行时才会真正交给编码器（那时它已是 zstd_encoder）。
-                // 服务端自己的切换请求因此改为"手工编码的 zstd 直存帧、从编码器之后写出"，
-                // 既不会回头被本闸门扣住，也不需要编码器再处理一次。
-                p.addBefore(anchor, "zstd_switch_gate", switchGate);
+                // 超时 / 客户端拒绝时，把两个方向一起换回原版实例
+                switchGate.setRollback(this::rollbackToVanilla);
+                // ⚠️ 必须是 addAfter：Netty 出站事件从 tail 走向 head（索引递减），
+                // addBefore 会把闸门放在锚点<b>之后</b>的出站路径上 —— 那时包已经被编码成
+                // ByteBuf，根本无法按包类型判断（实测确认过）。
+                // addAfter 让闸门位于编码器"更靠 tail"的一侧：出站先经过闸门（拿到 Packet），
+                // 放行时才交给编码器（此刻已是 zstd_encoder）。
+                p.addAfter(anchor, "zstd_switch_gate", switchGate);
                 installed = anchor;
                 break;
             }
@@ -414,13 +430,67 @@ public class ZstdChannelManager {
     }
 
     /**
-     * 确认已收到但闸门已不在管线里（例如已超时自移除）。
+     * 收到客户端的切换确认：放行扣住的包。
      *
-     * <p>闸门的超时语义是"视为已确认并保持双向 zstd"（见 {@code ZstdSwitchGate} 的注释），
-     * 因此这里只需记日志；解码器按 {@code isSwitchConfirmed()} 判断即可。</p>
+     * <p>⚠️ 必须校验 txId：任何尾部恰好是魔数的帧都不该让我们提前放行 ——
+     * 提前放行意味着服务端用 zstd 发帧，而对方可能还没切换。</p>
+     *
+     * @param txId 客户端回发的 txId
+     * @return 是否接受
      */
-    public void markSwitchConfirmed() {
-        LOGGER.debug("[Zstd] switch confirmation received after the gate was already released");
+    public boolean confirmSwitch(int txId) {
+        var gate = switchGate;
+        if (gate == null) {
+            LOGGER.debug("[Zstd] switch confirmation received after the gate was already released");
+            return false;
+        }
+        return gate.confirm(txId);
+    }
+
+    /** 记录本次切换询问的 txId（服务端发送请求时调用）。 */
+    public void expectSwitchTxId(int txId) {
+        var gate = switchGate;
+        if (gate != null) gate.expectTxId(txId);
+    }
+
+    /**
+     * 客户端明确拒绝切换（无法切换到 zstd）：立即回滚到原版。
+     *
+     * @return 是否接受
+     */
+    public boolean rejectSwitch(int txId) {
+        var gate = switchGate;
+        if (gate == null) return false;
+        return gate.reject(txId);
+    }
+
+    /**
+     * 把 zstd 编解码器换回<b>原版实例</b>（超时 / 客户端拒绝时调用）。
+     *
+     * <p>⚠️ 必须换回同一个实例，而不是新建一个：原版压缩处理器的构造参数（阈值等）
+     * 是 Velocity 内部实现，重新构造既拿不到参数，也可能与连接状态不匹配。
+     * 两个方向必须同时回滚，否则会形成"出站 zstd / 入站原版"的必断连组合。</p>
+     */
+    private void rollbackToVanilla() {
+        // 走 setReplaced(false) 归还监控计数（幂等）
+        setReplaced(false);
+        try {
+            var p = pipelineRef;
+            if (p == null) return;
+            var dec = vanillaDecoder;
+            if (dec != null && p.get("zstd_decoder") != null) {
+                p.replace("zstd_decoder", vanillaDecoderName, dec);
+                vanillaDecoder = null;
+            }
+            var enc = vanillaEncoder;
+            if (enc != null && p.get("zstd_encoder") != null) {
+                p.replace("zstd_encoder", vanillaEncoderName, enc);
+                vanillaEncoder = null;
+            }
+            LOGGER.info("[Zstd] rolled back to vanilla codecs (switch not confirmed)");
+        } catch (Throwable t) {
+            LOGGER.warn("[Zstd] rollback to vanilla failed", t);
+        }
     }
 
     /**
@@ -466,10 +536,14 @@ public class ZstdChannelManager {
         var p = channel.pipeline();
         if (p.get("zstd_decoder") != null) return true;
         if (p.get("compression-decoder") != null) {
+            vanillaDecoder = p.get("compression-decoder");
+            vanillaDecoderName = "compression-decoder";
             p.replace("compression-decoder", "zstd_decoder", new ZstdBatchDecoder());
             return true;
         }
         if (p.get("decompress") != null) {
+            vanillaDecoder = p.get("decompress");
+            vanillaDecoderName = "decompress";
             p.replace("decompress", "zstd_decoder", new ZstdBatchDecoder());
             return true;
         }
