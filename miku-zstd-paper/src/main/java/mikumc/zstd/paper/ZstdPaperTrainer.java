@@ -113,7 +113,8 @@ public final class ZstdPaperTrainer {
         decoderInstance = new ZstdPaperTrainer("decoder", Direction.INBOUND, dir, cfg);
         encoderInstance.loadFromDisk();
         decoderInstance.loadFromDisk();
-        LOGGER.info("[Zstd] Paper 字典训练器就绪: encoderDictId={} decoderDictId={}",
+        // DEBUG：训练子系统的正常状态一律不进控制台；要看状态用 /mikuzstd status
+        LOGGER.debug("[Zstd] Paper 字典训练器就绪: encoderDictId={} decoderDictId={}",
                 encoderInstance.currentDictId, decoderInstance.currentDictId);
         // 周期归档样本（投递到训练线程，与训练/落盘天然串行）
         archiveExecutor.scheduleWithFixedDelay(() -> {
@@ -390,7 +391,8 @@ public final class ZstdPaperTrainer {
                         }
                         publishToRegistry();
                         adopted = true;
-                        LOGGER.info("[Zstd] {} 采纳新字典 id={} size={}B 改进={}{} 样本={}（{}B）分档：{}",
+                        // DEBUG：字典换代是正常运转，不进控制台（要看状态用 /mikuzstd status）
+                        LOGGER.debug("[Zstd] {} 采纳新字典 id={} size={}B 改进={}{} 样本={}（{}B）分档：{}",
                                 name, dictId, newDict.length, pct(ev.overall),
                                 firstDict ? "（首部字典）" : "",
                                 snapshot.size(), totalBytes, ev.bandSummary());
@@ -559,7 +561,7 @@ public final class ZstdPaperTrainer {
             if (Files.exists(dictFile)) {
                 currentDict = Files.readAllBytes(dictFile);
                 currentDictId = mikumc.zstd.protocol.ZstdDictId.of(currentDict);
-                LOGGER.info("[Zstd] {} 已从磁盘加载字典 id={} size={}B", name, currentDictId, currentDict.length);
+                LOGGER.debug("[Zstd] {} 已从磁盘加载字典 id={} size={}B", name, currentDictId, currentDict.length);
             }
             List<byte[]> history = loadHistory();
             if (!history.isEmpty()) {
@@ -568,7 +570,7 @@ public final class ZstdPaperTrainer {
                     for (byte[] s : history) sampleBytes += s.length;
                     savedCount = ring.size();
                 }
-                LOGGER.info("[Zstd] {} 已加载 {} 个历史样本", name, history.size());
+                LOGGER.debug("[Zstd] {} 已加载 {} 个历史样本", name, history.size());
             }
             publishToRegistry();
         } catch (IOException e) {

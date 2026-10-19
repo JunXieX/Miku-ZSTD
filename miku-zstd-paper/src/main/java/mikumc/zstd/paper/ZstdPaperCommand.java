@@ -92,7 +92,7 @@ public final class ZstdPaperCommand implements BasicCommand {
         if (encId == 0) {
             sender.sendMessage("§8  提示：字典需累积 " + cfg.trainerMinSamples
                     + " 个样本或等 " + (cfg.trainerFallbackTimeoutMs / 60000) + " 分钟兜底触发首轮训练；"
-                    + "训练成功后日志会出现「采纳新字典」");
+                    + "训练本身不刷控制台日志（需要时把日志级别调到 DEBUG），用 /mikuzstd status 查看当前字典 id");
         }
     }
 

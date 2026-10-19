@@ -143,7 +143,9 @@ public class ZstdSampleTrainer {
         decoderInstance = new ZstdSampleTrainer("decoder", Direction.INBOUND, dir, cfg);
         encoderInstance.loadFromDisk();
         decoderInstance.loadFromDisk();
-        LOGGER.info("[Zstd] Trainers initialized. encoderDictId={} decoderDictId={}",
+        // DEBUG：训练子系统的正常状态一律不进控制台；要看当前状态请用 /mikuzstd status，
+        // 要看完整训练过程请把日志级别调到 DEBUG。
+        LOGGER.debug("[Zstd] Trainers initialized. encoderDictId={} decoderDictId={}",
                 encoderInstance.currentDictId, decoderInstance.currentDictId);
 
         autoSaveExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -244,7 +246,7 @@ public class ZstdSampleTrainer {
         this.adoptRatioImprovement = cfg.trainerAdoptionThreshold;
         this.pruneMinPayload = cfg.trainerPruneMinPayload;
         this.runtimeLevel = cfg.level;
-        LOGGER.info("[Zstd] {} 字典采纳策略：首部字典改进 > 0 即采纳（否则小包永远压不动）；"
+        LOGGER.debug("[Zstd] {} 字典采纳策略：首部字典改进 > 0 即采纳（否则小包永远压不动）；"
                         + "替换字典需 >= {}（trainer.adoption_threshold）",
                 name, pct(this.adoptRatioImprovement));
     }
@@ -520,7 +522,8 @@ public class ZstdSampleTrainer {
                         }
                         publishToRegistry();
                         adopted = true;
-                        LOGGER.info("[Zstd] {} dict adopted: id={} size={}B improvement={}{} samples={}（{}B）分档：{}",
+                        // DEBUG：字典换代是正常运转，不进控制台（要看状态用 /mikuzstd status）
+                        LOGGER.debug("[Zstd] {} dict adopted: id={} size={}B improvement={}{} samples={}（{}B）分档：{}",
                                 name, dictId, newDict.length, pct(ev.overall),
                                 firstDict ? "（首部字典，只要不劣化即采纳）" : "",
                                 snapshot.size(), totalBytes, ev.bandSummary());
@@ -716,7 +719,7 @@ public class ZstdSampleTrainer {
             if (Files.exists(dictFile)) {
                 currentDict = Files.readAllBytes(dictFile);
                 currentDictId = ZstdDictId.of(currentDict);
-                LOGGER.info("[Zstd] {} loaded dict from disk: id={} size={}", name, currentDictId, currentDict.length);
+                LOGGER.debug("[Zstd] {} loaded dict from disk: id={} size={}", name, currentDictId, currentDict.length);
             } else {
                 // 迁移：旧版 *_dict_<crc>.bin 文件按修改时间取最新
                 try (var stream = Files.list(dictDir)) {
@@ -728,7 +731,7 @@ public class ZstdSampleTrainer {
                         Path latest = legacy.get(legacy.size() - 1);
                         currentDict = Files.readAllBytes(latest);
                         currentDictId = ZstdDictId.of(currentDict);
-                        LOGGER.info("[Zstd] {} loaded legacy dict {} (by mtime): id={} size={}",
+                        LOGGER.debug("[Zstd] {} loaded legacy dict {} (by mtime): id={} size={}",
                                 name, latest.getFileName(), currentDictId, currentDict.length);
                     }
                 }
@@ -741,7 +744,7 @@ public class ZstdSampleTrainer {
                     for (byte[] s : history) sampleBytes += s.length;
                     savedCount = sampleRing.size(); // 历史已在盘上，无需重复归档
                 }
-                LOGGER.info("[Zstd] {} loaded {} history samples from disk", name, history.size());
+                LOGGER.debug("[Zstd] {} loaded {} history samples from disk", name, history.size());
             }
 
             // 启动即把磁盘字典发布到共享注册表，连接激活时可直接取用
