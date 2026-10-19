@@ -60,7 +60,8 @@ public final class ZstdStatsData {
      */
     public static synchronized String captureTabStats(int intervalSec) {
         long now = System.currentTimeMillis();
-        long elapsed = lastCaptureTime > 0 ? now - lastCaptureTime : intervalSec * 1000L;
+        boolean first = lastCaptureTime == 0;
+        long elapsed = first ? 0 : now - lastCaptureTime;
         long curTxRaw = ACCUM_TX_RAW.sum();
         long curTxWire = ACCUM_TX_WIRE.sum();
         long curRxIn = ACCUM_RX_IN.sum();
@@ -77,6 +78,14 @@ public final class ZstdStatsData {
         lastTxWire = curTxWire;
         lastRxIn = curRxIn;
         lastRxOut = curRxOut;
+
+        // ⚠️ 基线未建立、或距上次采样过久（HUD 关掉又打开、客户端长时间卡顿）时，
+        // 本周期只重新取基线、不写平滑环：此时 {@code d*} 里含的是"自上次采样以来的
+        // <b>全部</b>累计字节"，除以 1 秒会得到一个虚高成百上千倍的速率，
+        // 而且它会被写进 10 格平滑环，在接下来约 1 秒里持续把显示拉高。
+        if (first || elapsed > intervalSec * 3000L) {
+            return null;
+        }
 
         double sec = elapsed / 1000.0;
         if (sec <= 0) return null;

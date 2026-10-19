@@ -187,9 +187,13 @@ public final class ZstdCommand {
         boolean decStarted = triggerTrain(dec, forced);
 
         Component msg;
-        if (!forced && !encStarted && !decStarted) {
-            msg = Component.text("两端样本都不足，本次未触发训练。"
-                    + "可用 /mikuzstd train force 绕过样本门槛。", NamedTextColor.YELLOW);
+        if (!encStarted && !decStarted) {
+            // ⚠️ 不能一律报"已触发"：force 也可能提交不成功（已有训练在跑 / 执行器已关闭），
+            // 那种情况必须说清楚，否则命令输出会与实际情况不符。
+            msg = Component.text(forced
+                            ? "训练未提交：已有训练在进行，或训练执行器已关闭。"
+                            : "两端样本都不足，本次未触发训练。可用 /mikuzstd train force 绕过样本门槛。",
+                    NamedTextColor.YELLOW);
         } else {
             msg = Component.text(forced ? "Force training triggered. " : "Training triggered. ",
                     NamedTextColor.GREEN);
@@ -211,8 +215,7 @@ public final class ZstdCommand {
             return false;
         }
         if (forced) {
-            trainer.forceTrain();
-            return true;
+            return trainer.forceTrain();
         }
         return trainer.requestTrain();
     }
