@@ -52,46 +52,44 @@ class ZstdSwitchGateTest {
 
     @Test
     @DisplayName("闸门：连接已关闭时，销毁收尾绝不得改动管线（否则会抛 ChannelPipelineException）")
-    void noRollbackOnChannelClosed() {
+    void noPipelineEditOnChannelClosed() {
         ZstdSwitchGate gate = ZstdSwitchGate.create();
-        java.util.concurrent.atomic.AtomicBoolean rolledBack =
-                new java.util.concurrent.atomic.AtomicBoolean();
-        gate.setRollback(() -> rolledBack.set(true));
         EmbeddedChannel ch = new EmbeddedChannel(gate);
 
         // ⚠️ 用 voidPromise：EmbeddedChannel 会对"普通 promise 失败"记录异常并在后续调用时
         // 重放出来（那是测试框架的行为，不是缺陷）。voidPromise 不参与记录，
-        // 因此这里能干净地验证"销毁时不得回滚"。
+        // 因此这里能干净地验证"销毁时不得改动管线"。
         ch.writeOneOutbound(new FakeMinecraftPacket(11), ch.voidPromise());
         assertEquals(1, gate.heldCount(), "确认前必须扣住");
 
         // 关闭 = 连接不可用。EmbeddedChannel 在 close 时会走 pipeline destroy 路径，
         // 与线上"玩家断线→channelUnregistered→destroy"完全同型。
-        // 此时绝不得触发回滚：已注销的 pipeline 不接受任何 add/replace/remove，
+        // 此时绝不得改动管线：已注销的 pipeline 不接受任何 add/replace/remove，
         // 原版压缩处理器又是非 @Sharable，重复插入必然抛 ChannelPipelineException。
         ch.close();
 
         assertNull(ch.pipeline().get(ZstdSwitchGate.class), "关闭后闸门应已从管线摘除");
-        assertFalse(rolledBack.get(), "连接已关闭：不得回滚（回滚只会抛 ChannelPipelineException）");
-        assertFalse(gate.isConfirmed(), "未确认");
+        assertTrue(gate.isConfirmed(), "解链即视为已提交（服务端此刻已是 zstd，不能再退回原版）");
         ch.finishAndReleaseAll();
     }
 
     @Test
-    @DisplayName("闸门：回滚动作自身抛异常时不得冒泡（只记 debug）")
-    void rollbackFailureIsSwallowed() {
+    @DisplayName("闸门：客户端回了不带魔数的应答（无法确认切换）时仍须放行扣包，绝不据此关连接")
+    void releasesOnUnconfirmedAnswer() {
         ZstdSwitchGate gate = ZstdSwitchGate.create();
-        gate.setRollback(() -> {
-            throw new IllegalStateException("boom");
-        });
         EmbeddedChannel ch = new EmbeddedChannel(gate);
 
         ch.writeOutbound(new FakeMinecraftPacket(12));
-        // 主动 abort（等价于客户端拒绝 / 安装失败）：不得让回滚异常逃逸
-        gate.abort();
+        assertEquals(1, gate.heldCount(), "确认前必须扣住");
 
-        assertNull(ch.pipeline().get(ZstdSwitchGate.class), "abort 后必须自移除");
+        // ⚠️ 这条应答与"旧版客户端按原版规则回的空应答"字节完全相同，而旧版客户端
+        // 其实是 zstd —— 因此只能按"未确认"放行，绝不能当成拒绝去关连接。
+        // （txId 未设置 → 不校验）
+        assertTrue(gate.releaseUnconfirmed(0));
+
+        assertNull(ch.pipeline().get(ZstdSwitchGate.class), "放行后必须自移除");
         assertEquals(12, ((FakeMinecraftPacket) ch.readOutbound()).id, "扣住的包必须补发");
+        assertTrue(gate.isConfirmed(), "服务端已提交到 zstd：窗口到此结束");
         ch.finishAndReleaseAll();
     }
 
@@ -126,7 +124,7 @@ class ZstdSwitchGateTest {
         ch.pipeline().remove(gate);
 
         assertEquals(9, ((FakeMinecraftPacket) ch.readOutbound()).id, "扣住的包必须补发，不得丢失");
-        assertFalse(gate.isConfirmed(), "未收到确认就销毁：不得标记为已确认");
+        assertTrue(gate.isConfirmed(), "服务端此时已是 zstd：解链即视为已提交（不再有退回原版的可能）");
         ch.finishAndReleaseAll();
     }
 
@@ -146,7 +144,6 @@ class ZstdSwitchGateTest {
 
         ch.close().awaitUninterruptibly();
 
-        assertFalse(gate.isConfirmed(), "未收到确认就关闭：不得标记为已确认");
         assertEquals(0, payload.refCnt(), "包不会被写出：必须由闸门释放（不泄漏）");
         assertTrue(promise.isDone(), "挂起的 promise 必须被收尾（不能永久挂住调用方）");
         assertFalse(promise.isSuccess(), "通道已关闭：promise 必须以失败收尾");
@@ -154,7 +151,7 @@ class ZstdSwitchGateTest {
     }
 
     @Test
-    @DisplayName("闸门：超时后无条件放行并判定未确认（服务端据此双向回滚到原版）")
+    @DisplayName("闸门：超时后按「已确认」放行（服务端已切 zstd，退回原版做不到也不该做）")
     void releasesOnTimeout() throws InterruptedException {
         ZstdSwitchGate gate = ZstdSwitchGate.create();
         EmbeddedChannel ch = new EmbeddedChannel(gate);
@@ -172,7 +169,7 @@ class ZstdSwitchGateTest {
         }
 
         assertNull(ch.pipeline().get(ZstdSwitchGate.class), "超时后必须自移除");
-        assertFalse(gate.isConfirmed(), "超时 = 未确认：服务端必须双向回滚，绝不能留下一半 zstd 一半原版");
+        assertTrue(gate.isConfirmed(), "超时 = 按已确认处理：服务端早已切到 zstd，绝不能留下一半 zstd 一半原版");
         assertEquals(7, ((FakeMinecraftPacket) ch.readOutbound()).id, "超时后扣住的包仍必须补发");
         ch.finishAndReleaseAll();
     }

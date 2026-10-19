@@ -105,10 +105,10 @@ public final class ZstdClientActivation {
             boolean onZstd = Boolean.TRUE.equals(channel.attr(ACTIVATED).get())
                     && channel.pipeline().get("zstd_decoder") != null;
             // ⚠️ 无论能否切换，都必须回一条应答：
-            //   · 切成了 → success=true（服务端放行扣住的包并转严格 zstd）；
-            //   · 没切成就 → success=false（服务端<b>回滚到原版</b>）。
-            // 若不回，服务端只能等满超时再猜 —— 而任何猜测都有一半概率与客户端不一致，
-            // 结果就是"玩家进不去服务器"。
+            //   · 切成了 → success=true（服务端立即放行扣住的包并转严格 zstd）；
+            //   · 没切成就 → success=false（服务端<b>不会</b>退回原版 —— 那做不到，但会据此
+            //     立即放行扣住的包；本端届时仍是原版，解不开那些帧）。
+            // 若不回，服务端只能等满 5 秒超时才放行 —— 每次登录都白白多等 5 秒。
             sendSwitchConfirm(channel, txId, onZstd);
         });
     }

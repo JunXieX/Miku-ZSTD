@@ -43,7 +43,9 @@ public final class ZstdSwitchConfirmSniffer extends MessageToMessageDecoder<Byte
         int txId = ZstdStepFrames.readSwitchTxId(bare);
         boolean accepted = true;
         if (txId <= 0) {
-            // 拒绝包（success=false，无魔数）：客户端无法切换，服务端必须回滚
+            // 不带魔数的应答：客户端没能（或不会）确认切换。**不能**当拒绝处理 ——
+            // 旧版客户端在收到询问后会按原版规则回一个同样字节的空应答，而它其实是 zstd。
+            // 服务端已提交到 zstd，所以只按"未确认"放行扣住的包（见 ZstdSwitchGate 类注释）。
             txId = ZstdStepFrames.readSwitchRejectTxId(bare);
             accepted = false;
         }
@@ -59,8 +61,9 @@ public final class ZstdSwitchConfirmSniffer extends MessageToMessageDecoder<Byte
                 LOGGER.debug("[Zstd] switch confirmation received (txId={}) — releasing gate", txId);
                 mgr.confirmSwitch(txId);
             } else {
-                LOGGER.debug("[Zstd] switch REJECTED by client (txId={}) — rolling back", txId);
-                mgr.rejectSwitch(txId);
+                LOGGER.warn("[Zstd] switch NOT confirmed by client (txId={}) — releasing held packets anyway",
+                        txId);
+                mgr.releaseUnconfirmed(txId);
             }
         }
     }
