@@ -5,7 +5,6 @@ import com.github.luben.zstd.ZstdDecompressCtx;
 import io.netty.channel.Channel;
 import io.netty.util.AttributeKey;
 import mikumc.zstd.protocol.ZstdCompressLock;
-import mikumc.zstd.protocol.ZstdVarInts;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -30,8 +29,8 @@ public class ZstdPaperChannelManager {
 
     public static final AttributeKey<ZstdPaperChannelManager> KEY =
             AttributeKey.valueOf("miku-zstd:manager");
-    /** 协商协议版本（三端必须一致）。帧长度上限见 {@link ZstdVarInts#DEFAULT_MAX_VALUE}。 */
-    public static final int PROTOCOL_VERSION = 4;
+    /** 协商协议版本（三端必须一致）。版本不一致时客户端会干净回落原版，不会出现半 zstd。 */
+    public static final int PROTOCOL_VERSION = 5;
 
     /** 本连接的压缩统计（/mikuzstd top 用），close 时注销 */
     public final mikumc.zstd.protocol.ZstdConnStats stats = new mikumc.zstd.protocol.ZstdConnStats();

@@ -74,7 +74,7 @@ public final class ZstdClientActivation {
      *
      * <h2>⚠️ 为什么必须"应答写出之后"才能调</h2>
      * <p>本方法会真的替换出站管道。若在应答写出<b>之前</b>替换，这条应答就会以 zstd 帧
-     * （{@code [rawSize][varint pktLen][pkt]}）发出，而服务端此刻既没有 zstd 解码器，
+     * （{@code [rawSize][packet]}）发出，而服务端此刻既没有 zstd 解码器，
      * 帧层应答嗅探器也只认裸帧 {@code [0x02][txId]...}——应答会被丢弃或按未知包 id 解析，
      * 协商直接失败。调用点因此挂在"应答包写出"的回调上（Fabric 的 {@code callbacksConsumer}）。</p>
      *
@@ -121,8 +121,9 @@ public final class ZstdClientActivation {
      * 合并成多包帧；而服务端帧层嗅探器只认"单包直存帧"，合帧后识别失败 →
      * 确认丢失 → 服务端等满超时 → 双方各猜一半 → 进不去服务器。</p>
      *
-     * <p>客户端管线有独立 prepender，所以手工帧只需 {@code [rawSize=0][pktLen][packet]}，
-     * 外层长度由它补齐。</p>
+     * <p>客户端管线有独立 prepender，所以手工帧只需 {@code [rawSize=0][packet]}，
+     * 外层长度由它补齐。<b>不能</b>在 0 之后多写一层内层长度前缀：直存帧一帧一包、与原版
+     * 未压缩帧逐字节同形，服务端才能正确解释（见 {@code ZstdBatchEncoderBase} 的帧格式说明）。</p>
      */
     private static void sendSwitchConfirm(Channel channel, int txId, boolean accepted) {
         io.netty.channel.ChannelHandlerContext zstdCtx = channel.pipeline().context("zstd_encoder");
@@ -137,9 +138,7 @@ public final class ZstdClientActivation {
                 // 否则确认可能与其它包合帧，服务端帧层嗅探器只认单包帧）。
                 io.netty.buffer.ByteBuf frame = channel.alloc().buffer();
                 try {
-                    int pktLen = packet.readableBytes();
                     mikumc.zstd.protocol.ZstdVarInts.write(frame, 0);
-                    mikumc.zstd.protocol.ZstdVarInts.write(frame, pktLen);
                     frame.writeBytes(packet);
                     zstdCtx.writeAndFlush(frame);
                 } catch (Throwable t) {

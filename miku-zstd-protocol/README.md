@@ -25,12 +25,15 @@ MikuMC 系列插件交流群：1105054380
 
 ## 术语：本项目的 "v几" 有三个含义
 
-同一份代码同时属于"协商版本 v4"与"帧格式 v3"，两者是不同维度的编号：
+同一份代码同时属于"协商版本 v5"与"帧格式 v4"，两者是不同维度的编号：
 
-- **协商版本**：`PROTOCOL_VERSION = 4`，登录期在 negotiate 载荷里交换，三端必须一致；
-  不一致即回落原版 zlib。v4 的改动是"字典改为按需推送"。
-- **帧格式 v3**：帧头精简（magicless / 无 contentSize / 无 dictID）+ 一帧多包批处理。
-  **v4 没有再改帧格式。**
+- **协商版本**：`PROTOCOL_VERSION = 5`，登录期在 negotiate 载荷里交换，三端必须一致；
+  不一致即回落原版 zlib。v4 的改动是"字典改为按需推送"；v5 跟着帧格式 v4 一起前进
+  （帧格式一变，两端就必须同版本，否则会静默错乱）。
+- **帧格式 v4**：v3 做了帧头精简（magicless / 无 contentSize / 无 dictID）+ 一帧多包批处理；
+  **v4 把直存帧改成"一帧一包、不带内层长度前缀"**（`[0][packet]`），使其与原版未压缩帧
+  逐字节同形 —— 旧格式多写的那层 `[varint pktLen]` 会被对面包解码器当成包 id（`Unknown packet`）。
+  压缩帧仍合批，`payload = [varint pktLen][pkt]...` 不变。
 - **v1 / v2**：历史版本，只应出现在"我们为什么这么改"的说明里。
 
 完整说明见 `ZstdVarInts` 的类注释。
@@ -120,7 +123,7 @@ cd miku-zstd-velocity && ./gradlew test
 
 | 测试 | 覆盖 |
 |---|---|
-| `FrameLayoutTest` | 帧格式的逐字段布局（两种外层长度形态）、批处理合帧、压缩帧、往返还原；畸形输入与放大攻击**必须 fail-fast 关连接** |
+| `FrameLayoutTest` | 帧格式的逐字段布局（两种外层长度形态）、**直存帧一帧一包 / 不带内层长度前缀**、压缩帧合批、压缩无收益退回直存、往返还原；畸形输入与放大攻击**必须 fail-fast 关连接** |
 | `ProtocolUnitsTest` | VarInt 边界、字典 id 契约、协商状态码白名单、采样过滤、BossBar 模板与单位、流量统计、字典采纳判定 |
 
 `FrameLayoutTest` 用两个只差 `writeBodyLen` 一个开关的测试专用编解码器，

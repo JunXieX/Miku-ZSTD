@@ -65,7 +65,7 @@ public final class ZstdStepFrames {
     /**
      * 把一帧还原成"裸包体字节"（<b>不含包 id</b>），兼容三种外层形态：
      * <ul>
-     *   <li>直存 {@code [0][varint pktLen][packet]}（原版压缩启用后的未压缩帧 / zstd 直存帧）；</li>
+     *   <li>直存 {@code [0][packet]}（原版未压缩帧 / zstd 直存帧 —— 二者<b>逐字节同形</b>）；</li>
      *   <li>裸帧 {@code [packet]}（外层长度已被 frame-decoder 剥掉）；</li>
      *   <li>压缩帧 {@code [varint dataLength][deflate(packet)]}（原版压缩帧）。</li>
      * </ul>
@@ -79,20 +79,11 @@ public final class ZstdStepFrames {
         if (len < 2) return null;
         int first = in.getByte(start) & 0xFF;
 
-        // ① 直存：[0][varint pktLen][packet]
+        // ① 直存：[0][packet] —— 跳过"未压缩"标记，再去掉包 id
         if (first == 0x00) {
-            int idx = start + 1;
-            int pktLen = readVarInt(in, idx);
-            if (pktLen > 0) {
-                idx += varIntLen(in, idx);
-                // 必须<b>恰好</b>走完：原版未压缩帧同样是 [0][...]，但那段字节是包体而非长度。
-                if ((long) idx + pktLen == end) {
-                    byte[] out = new byte[Math.max(0, pktLen - 1)]; // 去掉包 id
-                    in.getBytes(idx + 1, out, 0, out.length);
-                    return out;
-                }
-            }
-            return null;
+            byte[] out = new byte[len - 2];
+            in.getBytes(start + 2, out, 0, out.length);
+            return out;
         }
 
         // ② 裸帧：帧层已剥掉外层长度，首字节是包 id

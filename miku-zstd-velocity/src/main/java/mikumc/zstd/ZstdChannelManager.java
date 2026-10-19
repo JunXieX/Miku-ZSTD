@@ -16,15 +16,16 @@ import org.slf4j.LoggerFactory;
  * <p>持有 zstd 压缩/解压上下文与协商状态机。生命周期：嗅探器检测到
  * {@code \0ZSTD\0} 握手标记时创建，连接关闭时释放本地资源。</p>
  *
- * <h2>帧格式（v3；协商版本见 {@link #PROTOCOL_VERSION}）</h2>
+ * <h2>帧格式（v4；协商版本见 {@link #PROTOCOL_VERSION}）</h2>
  * <ul>
- *   <li>服务端 → 客户端帧：{@code [varint bodyLen][varint rawSize][zstd(payload) | payload]}
+ *   <li>服务端 → 客户端帧：{@code [varint bodyLen][varint rawSize][zstd(payload) | packet]}
  *       —— Velocity 4.x 管线无独立 frame-encoder，编码器<b>自带</b> bodyLen 外层长度。</li>
- *   <li>客户端 → 服务端帧：{@code [varint rawSize][zstd(payload) | payload]}
+ *   <li>客户端 → 服务端帧：{@code [varint rawSize][zstd(payload) | packet]}
  *       —— 外层长度由客户端管线的 prepender 负责，服务端 frame-decoder 剥离后
  *       本解码器收到的即完整帧负载。</li>
- *   <li>{@code rawSize == 0} 表示未压缩直存；{@code payload = [varint pktLen][pkt]...}，
- *       一帧可含多个包（批处理）。</li>
+ *   <li>{@code rawSize == 0} 表示未压缩直存：帧体<b>恰好是一个包</b>（{@code [0][packet]}），
+ *       与原版未压缩帧逐字节同形；{@code rawSize > 0} 才是压缩帧，其
+ *       {@code payload = [varint pktLen][pkt]...} 可含多个包（批处理只在这里）。</li>
  *   <li>「v几」有三种含义（协商版本 / 帧格式 / 历史版本），见
  *       {@link ZstdVarInts} 类注释里的术语表——不要混用。</li>
  * </ul>
@@ -53,8 +54,8 @@ public class ZstdChannelManager {
     public static final AttributeKey<ZstdChannelManager> KEY =
             AttributeKey.valueOf("zstd:manager");
 
-    /** 协商协议版本（三端必须一致）。帧长度上限见 {@link ZstdVarInts#DEFAULT_MAX_VALUE}。 */
-    public static final int PROTOCOL_VERSION = 4;
+    /** 协商协议版本（三端必须一致）。版本不一致时客户端会干净回落原版，不会出现半 zstd。 */
+    public static final int PROTOCOL_VERSION = 5;
 
     /** 本连接的压缩统计（/mikuzstd top 用），close 时注销 */
     public final mikumc.zstd.protocol.ZstdConnStats stats = new mikumc.zstd.protocol.ZstdConnStats();
@@ -107,7 +108,7 @@ public class ZstdChannelManager {
     }
 
     /**
-     * 帧格式 v3 的帧头精简：去掉双方都已知道的冗余字段。
+     * 帧头精简（自帧格式 v3 起）：去掉双方都已知道的冗余字段。
      *
      * <ul>
      *   <li>{@code magicless}：省 4 字节 magic（对几十字节的小包占比可观）；</li>

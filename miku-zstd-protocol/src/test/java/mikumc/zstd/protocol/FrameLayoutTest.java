@@ -45,9 +45,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *
  * <h2>时序确定性</h2>
  * <p>批处理窗口设成 60s（测试期间不会到期），靠"攒够 batch_max_packets 立即成帧"来
- * 精确控制帧边界：<b>写 N 个包 → 恰好一帧含 N 个包</b>。这样既不依赖虚拟时钟推进，
- * 也不会有随机时序抖动。压缩路径本身是异步的（提交到压缩线程池），
- * 那条用例才需要等待。</p>
+ * 精确控制帧边界。注意 <b>直存帧一帧一包</b>（帧格式 v4）：写 N 个小包会得到 N 个帧，
+ * 只有压缩帧才会把多个包合成一帧。这样既不依赖虚拟时钟推进，也不会有随机时序抖动。
+ * 压缩路径本身是异步的（提交到压缩线程池），那条用例才需要等待。</p>
  */
 class FrameLayoutTest {
 
@@ -79,7 +79,7 @@ class FrameLayoutTest {
     // ────────────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("直存帧（Velocity 形态）：[bodyLen][0][payload]，bodyLen 等于其后字节数")
+    @DisplayName("直存帧（Velocity 形态）：[bodyLen][0][packet]，bodyLen 等于其后字节数")
     void storedFrameLayoutWithBodyLen() {
         TestEncoder encoder = new TestEncoder(true, Integer.MAX_VALUE, 1);
         EmbeddedChannel ch = new EmbeddedChannel(encoder);
@@ -94,11 +94,16 @@ class FrameLayoutTest {
         int rawSize = ZstdVarInts.tryRead(frame, Integer.MAX_VALUE);
         assertEquals(0, rawSize, "直存帧的 rawSize 必须是 0");
         assertEquals(afterBodyLen, bodyLen, "bodyLen 必须等于其后剩余字节数");
+        // 帧体 = [0][packet]，packet = [包 id 0x2A][负载] —— 恰好一个包、<b>不带内层长度前缀</b>
+        assertEquals(1 + 1 + ascii("hello").length, bodyLen,
+                "帧体必须恰好是一个包（含包 id），不得出现内层长度前缀");
+        assertEquals(0x2A, frame.readByte() & 0xFF,
+                "紧随 rawSize 的必须是包 id —— 若这里是长度值，对面包解码器会报 Unknown packet");
         assertFalse(encoder.lastCompressed, "低于阈值不应走压缩");
     }
 
     @Test
-    @DisplayName("直存帧（Paper/Fabric 形态）：帧头就是 [0][payload]，不写 bodyLen")
+    @DisplayName("直存帧（Paper/Fabric 形态）：帧头就是 [0][packet]，不写 bodyLen")
     void storedFrameLayoutWithoutBodyLen() {
         TestEncoder encoder = new TestEncoder(false, Integer.MAX_VALUE, 1);
         EmbeddedChannel ch = new EmbeddedChannel(encoder);
@@ -110,9 +115,8 @@ class FrameLayoutTest {
         int total = frame.readableBytes();
         int rawSize = ZstdVarInts.tryRead(frame, Integer.MAX_VALUE);
         assertEquals(0, rawSize);
-        // 帧 = [varint 0][varint pktLen][pkt]，其中 pkt = 1 字节包 id + 2 字节负载
-        assertEquals(1 + ZstdVarInts.length(3) + 3, total,
-                "帧应只含 [0][varint pktLen][pkt]，不含任何外层长度");
+        // 帧 = [varint 0][packet]，其中 packet = 1 字节包 id + 2 字节负载
+        assertEquals(1 + 1 + 2, total, "帧应只含 [0][packet]，不含内层长度前缀与任何外层长度");
     }
 
     // ────────────────────────────────────────────────────────────────
@@ -120,8 +124,8 @@ class FrameLayoutTest {
     // ────────────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("批处理：攒够 batch_max_packets 合成一帧，负载为 [varint pktLen][pkt] 顺序拼接")
-    void batchIsCombinedIntoSingleFrame() {
+    @DisplayName("直存路径：写 N 个小包 → 得到 N 个单包帧（一帧一包，与原版同形）")
+    void storedBatchEmitsOneFramePerPacket() {
         TestEncoder encoder = new TestEncoder(true, Integer.MAX_VALUE, 3);
         EmbeddedChannel ch = new EmbeddedChannel(encoder);
 
@@ -132,22 +136,28 @@ class FrameLayoutTest {
         ch.writeOutbound(packet(p2));
         ch.writeOutbound(packet(p3));
 
-        ByteBuf frame = readFrame(ch);
-        assertNotNull(frame);
-        int bodyLen = ZstdVarInts.tryRead(frame, Integer.MAX_VALUE);
-        int afterBodyLen = frame.readableBytes();
-        int rawSize = ZstdVarInts.tryRead(frame, Integer.MAX_VALUE);
-        assertEquals(0, rawSize);
-        assertEquals(afterBodyLen, bodyLen);
-
-        assertArrayEquals(new byte[][]{fullPacket(p1), fullPacket(p2), fullPacket(p3)},
-                drainPackets(frame), "三个包应按顺序出现在同一帧里");
-        assertEquals(1, encoder.frames.size(), "三包应只产生一帧");
-        assertNull(readFrame(ch), "不应有第二帧");
+        List<byte[]> got = new ArrayList<>();
+        int frames = 0;
+        ByteBuf frame;
+        while ((frame = readFrame(ch)) != null) {
+            frames++;
+            int bodyLen = ZstdVarInts.tryRead(frame, Integer.MAX_VALUE);
+            assertEquals(frame.readableBytes(), bodyLen, "bodyLen 必须等于其后剩余字节数");
+            assertEquals(0, ZstdVarInts.tryRead(frame, Integer.MAX_VALUE), "直存帧的 rawSize 必须是 0");
+            byte[] pkt = new byte[frame.readableBytes()];
+            frame.getBytes(frame.readerIndex(), pkt);
+            got.add(pkt);
+            frame.release();
+        }
+        assertEquals(3, frames, "直存帧必须一帧一包（不合批）");
+        assertArrayEquals(fullPacket(p1), got.get(0), "第 1 帧的内容");
+        assertArrayEquals(fullPacket(p2), got.get(1), "第 2 帧的内容");
+        assertArrayEquals(fullPacket(p3), got.get(2), "第 3 帧的内容");
+        assertEquals(3, encoder.frames.size(), "统计口径：直存路径按包计帧");
     }
 
     @Test
-    @DisplayName("往返：一帧多包 → 解码按序还原（两种外层长度形态各测一遍）")
+    @DisplayName("往返：N 个包 → 解码按序还原（两种外层长度形态各测一遍）")
     void roundTrip() {
         for (boolean withBodyLen : new boolean[]{true, false}) {
             assertRoundTrip(withBodyLen, 3, 3);
@@ -197,8 +207,8 @@ class FrameLayoutTest {
     @Test
     @DisplayName("压缩帧多包批：3 个包合成一帧压缩，解码按序还原")
     void compressedFrameMultiPacketRoundTrip() {
-        // 现有一帧多包用例只覆盖直存路径；压缩路径的内层切包（splitAndEmit(byte[])）
-        // 与直存路径是两份不同实现，必须单独验证。
+        // ⚠️ 多包合批<b>只发生在压缩路径</b>（直存帧一帧一包），所以压缩路径的内层切包
+        // （splitAndEmit(byte[])）必须单独验证。
         TestEncoder encoder = new TestEncoder(true, 0 /* 一律压缩 */, 3);
         EmbeddedChannel ch = new EmbeddedChannel(encoder);
         EmbeddedChannel in = new EmbeddedChannel(new TestDecoder(decompressCtx));
@@ -323,9 +333,45 @@ class FrameLayoutTest {
             frame.release();
         }
         assertEquals(2, frames, "超出字节预算的包必须另起一帧，而不是合并");
-        int perPacket = payload + 1 + ZstdVarInts.length(payload + 1);
+        int perPacket = payload + 1; // 含包 id
         assertEquals(2 * (1 + perPacket), encoder.frames.stream().mapToInt(v -> v[0]).sum(),
-                "两帧各自的 rawSize 字段都要计入");
+                "两帧各自的 rawSize=0 字段都要计入（直存帧一帧一包，按包计）");
+        ch.finishAndReleaseAll();
+    }
+
+    @Test
+    @DisplayName("压缩无收益时退回直存：仍是一帧一包、不带内层长度前缀（回归：Unknown packet）")
+    void incompressibleBatchFallsBackToStoredFrames() throws InterruptedException {
+        // 回归用例：压缩结果不小于原始大小（例如已压缩过的数据）时必须写 rawSize=0 的直存帧；
+        // 旧实现在这条路径上写出的是 [0][varint pktLen][pkt]...，那层长度前缀会被对面包解码器
+        // 当成包 id → Unknown packet → 玩家进不去服务器。所以这里逐字段钉死"一帧一包"。
+        TestEncoder encoder = new TestEncoder(true, 0 /* 一律压缩 */, 1);
+        EmbeddedChannel ch = new EmbeddedChannel(encoder);
+        byte[] payload = incompressible(1024);
+
+        ch.writeOutbound(packet(payload));
+        ByteBuf frame = readFrame(ch, 5000);
+        assertNotNull(frame, "压缩走线程池，需要等待回到 event loop");
+
+        ByteBuf probe = frame.duplicate();
+        int bodyLen = ZstdVarInts.tryRead(probe, Integer.MAX_VALUE);
+        int afterBodyLen = probe.readableBytes();
+        assertEquals(0, ZstdVarInts.tryRead(probe, Integer.MAX_VALUE),
+                "压不动时必须写 rawSize=0（直存）");
+        assertEquals(afterBodyLen, bodyLen, "bodyLen 必须等于其后剩余字节数");
+        byte[] rest = new byte[probe.readableBytes()];
+        probe.getBytes(probe.readerIndex(), rest);
+        assertEquals(1 + payload.length, rest.length, "帧体恰好是一个包（含包 id）");
+        assertEquals(0x2A, rest[0] & 0xFF,
+                "紧随 rawSize 的必须是包 id —— 不得出现内层长度前缀");
+        assertFalse(encoder.lastCompressed, "压不动时不得标记为压缩帧");
+
+        EmbeddedChannel in = new EmbeddedChannel(new TestDecoder(decompressCtx));
+        feed(in, frame);
+        List<byte[]> got = drainInbound(in);
+        assertEquals(1, got.size(), "退回直存后仍必须整包还原");
+        assertArrayEquals(fullPacket(payload), got.get(0), "包内容必须与写入一致");
+        in.finishAndReleaseAll();
         ch.finishAndReleaseAll();
     }
 
@@ -435,8 +481,8 @@ class FrameLayoutTest {
     }
 
     @Test
-    @DisplayName("握手窗口：同一个原版帧在确认之后必须被拒绝（严格 zstd 模式）")
-    void legacyFrameRejectedWhenConfirmed() {
+    @DisplayName("严格模式：同一个未压缩帧（[0][裸包]）同样整包下传——与直存帧逐字节同形")
+    void uncompressedFrameAcceptedInStrictModeToo() {
         TestDecoder decoder = new TestDecoder(decompressCtx, true, true);
         EmbeddedChannel in = new EmbeddedChannel(decoder);
 
@@ -445,21 +491,23 @@ class FrameLayoutTest {
         ZstdVarInts.write(frame, 0);
         frame.writeBytes(packet);
         in.writeInbound(frame);
-        in.runPendingTasks();
 
-        // 已确认 = 协议保证对端在发 zstd 帧：内层长度 8 与实际 4 字节不符 → fail-fast
-        assertNull(in.readInbound(), "严格模式下不得把它当成原版帧放行");
-        assertFalse(in.isOpen(), "严格模式下畸形帧必须关闭连接");
+        // ⚠️ 这条断言正是帧格式 v4 的核心：确认之后不再有"原版帧 vs zstd 直存帧"的歧义，
+        // 同一串字节在窗口内外都解释成同一个包，因此不存在任何字节级启发式。
+        List<byte[]> got = drainInbound(in);
+        assertEquals(1, got.size(), "未压缩帧必须还原成 1 个包");
+        assertArrayEquals(packet, got.get(0), "内容必须与写入一致（含包 id）");
+        assertTrue(in.isOpen(), "合法帧不得关闭连接");
         in.finishAndReleaseAll();
     }
 
     @Test
-    @DisplayName("握手窗口：确认到达后，同一连接立即转为严格模式（不会把 zstd 帧误当原版）")
-    void strictModeTakesEffectImmediatelyAfterConfirm() {
+    @DisplayName("握手窗口：同一串 [0][裸包] 字节在窗口内与确认后必须解释成同一个包")
+    void uncompressedFrameInterpretationIsIdenticalAcrossWindow() {
         TestDecoder decoder = new TestDecoder(decompressCtx, true, false);
         EmbeddedChannel in = new EmbeddedChannel(decoder);
 
-        // 窗口内：原版裸包整包下传
+        // 窗口内：按原版帧解释，整包下传
         byte[] vanilla = {0x2A, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08};
         ByteBuf vf = Unpooled.buffer();
         ZstdVarInts.write(vf, 0);
@@ -467,17 +515,16 @@ class FrameLayoutTest {
         in.writeInbound(vf);
         assertArrayEquals(vanilla, drainInbound(in).get(0), "窗口内必须当作原版帧");
 
-        // 客户端确认后：同样的字节必须按 zstd 直存帧切包
+        // 客户端确认后：同样的字节必须被解释成同一个包（形状无歧义）
         decoder.confirm();
         ByteBuf zf = Unpooled.buffer();
         ZstdVarInts.write(zf, 0);
-        ZstdVarInts.write(zf, vanilla.length);
         zf.writeBytes(vanilla);
         in.writeInbound(zf);
         List<byte[]> got = drainInbound(in);
-        assertEquals(1, got.size(), "确认后必须按 zstd 帧解析");
-        assertArrayEquals(vanilla, got.get(0), "切包后内容必须一致");
-        assertTrue(in.isOpen(), "合法 zstd 帧不得关闭连接");
+        assertEquals(1, got.size(), "确认后必须同样解释成 1 个包");
+        assertArrayEquals(vanilla, got.get(0), "两种解释必须逐字节一致");
+        assertTrue(in.isOpen(), "合法帧不得关闭连接");
         in.finishAndReleaseAll();
     }
 
@@ -512,8 +559,9 @@ class FrameLayoutTest {
         TestDecoder decoder = new TestDecoder(decompressCtx, true, false);
         EmbeddedChannel in = new EmbeddedChannel(decoder);
 
-        // 包 id = 0x2D = 45，包体共 46 字节 → "id 数值恰好等于剩余字节数"，
-        // 只看内层长度自洽性会被误当成 zstd 直存帧。窗口内一律按原版处理。
+        // 包 id = 0x2D = 45，包体共 46 字节 → "id 数值恰好等于剩余字节数"——在旧格式下这串字节
+        // 既像原版裸包、又像 zstd 直存帧。帧格式 v4 把直存帧做成与原版帧逐字节同形后，
+        // 这种歧义在结构上<b>不可能</b>存在，本用例钉死"窗口内一律整包下传"这一侧。
         byte[] packet = new byte[46];
         packet[0] = 0x2D;
         packet[1] = (byte) 0xAA;
@@ -530,49 +578,43 @@ class FrameLayoutTest {
     }
 
     @Test
-    @DisplayName("严格模式（已确认）：合法的 zstd 直存帧（单包 / 多包 / 大包长前缀）按 zstd 切包")
+    @DisplayName("严格模式（已确认）：直存帧一律整包下传，绝不做任何切包")
     void realZstdStoredFramesStillRecognized() {
         TestDecoder decoder = new TestDecoder(decompressCtx, true, true);
         EmbeddedChannel in = new EmbeddedChannel(decoder);
 
-        // 单包直存：[0][pktLen=20][0x2A …]（pktLen 之后是包 id 0x2A，落在 0~2 之外）。
+        // 单包直存：[0][0x2A …]（首个帧体字节是包 id，不是长度）。
         // ⚠️ 这里必须直接 writeInbound（不进 feed()）：feed() 会把形如
         // [0][7] 的帧误当成 [bodyLen][...] 剥掉首字节。
-        // ⚠️ 包 id 取 0x2A：包 id 为 0/1/2 的样本在切换窗口内与原版裸包无法区分。
         byte[] packet = fullPacket(ascii("stored-payload-1234"));
         ByteBuf single = Unpooled.buffer();
         ZstdVarInts.write(single, 0);
-        ZstdVarInts.write(single, packet.length);
         single.writeBytes(packet);
         in.writeInbound(single);
         List<byte[]> got = drainInbound(in);
-        assertEquals(1, got.size(), "单包直存帧应还原出 1 个包");
+        assertEquals(1, got.size(), "直存帧应还原出 1 个包");
         assertArrayEquals(packet, got.get(0), "包内容必须与写入一致");
 
-        // 多包直存：pktLen 9（首发字节 0x09，第二字节 0x2A 是包 id）
-        ByteBuf multi = Unpooled.buffer();
-        ZstdVarInts.write(multi, 0);
-        ZstdVarInts.write(multi, 9);
-        multi.writeBytes(new byte[]{0x2A, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08});
-        ZstdVarInts.write(multi, 3);
-        multi.writeBytes(new byte[]{0x2B, 0x21, 0x22});
-        in.writeInbound(multi);
+        // ⚠️ 回归点：包体形如 [varint 9][9 字节数据] —— 旧格式会把它当成"内层长度 + 包"切开，
+        // 新格式下这段字节整体就是一个包，必须原样下传（否则对端拿到的是被切碎的包）。
+        byte[] tricky = {0x2A, 0x09, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08};
+        ByteBuf trickyFrame = Unpooled.buffer();
+        ZstdVarInts.write(trickyFrame, 0);
+        trickyFrame.writeBytes(tricky);
+        in.writeInbound(trickyFrame);
         List<byte[]> got2 = drainInbound(in);
-        assertEquals(2, got2.size(), "多包直存帧应还原出 2 个包");
-        assertEquals(9, got2.get(0).length, "第 1 个包长度");
-        assertEquals(0x2A, got2.get(0)[0] & 0xFF, "第 1 个包 id");
-        assertArrayEquals(new byte[]{0x2B, 0x21, 0x22}, got2.get(1), "第 2 个包内容");
+        assertEquals(1, got2.size(), "形如 [长度][数据] 的包体不得被切包");
+        assertArrayEquals(tricky, got2.get(0), "必须整包原样下传");
 
-        // 大包长前缀（≥128 → 首字节带续位，第二字节为续位字节 ≥0x80）
+        // 大包同理（首字节 ≥128 时，旧格式会把它读成两字节 varint）
         byte[] big = new byte[200];
         big[0] = 0x2C;
         ByteBuf bigFrame = Unpooled.buffer();
         ZstdVarInts.write(bigFrame, 0);
-        ZstdVarInts.write(bigFrame, big.length);
         bigFrame.writeBytes(big);
         in.writeInbound(bigFrame);
         List<byte[]> got3 = drainInbound(in);
-        assertEquals(1, got3.size(), "大包长前缀的直存帧应还原出 1 个包");
+        assertEquals(1, got3.size(), "大包同样整包下传");
         assertArrayEquals(big, got3.get(0), "大包内容必须一致");
         assertTrue(in.isOpen(), "合法 zstd 帧不得关闭连接");
         in.finishAndReleaseAll();
@@ -600,27 +642,25 @@ class FrameLayoutTest {
     }
 
     @Test
-    @DisplayName("严格模式：见过合法 zstd 帧之后，畸形帧仍必须被拒绝")
+    @DisplayName("严格模式：见过合法 zstd 帧之后，畸形帧仍必须被拒绝（不得回退成原版解释）")
     void malformedFrameRejectedAfterValidZstdFrame() {
         TestDecoder decoder = new TestDecoder(decompressCtx, true, true);
         EmbeddedChannel in = new EmbeddedChannel(decoder);
 
-        // 先来一个合法 zstd 直存帧：[0][pktLen=9][0x2A …]（pktLen 之后是包 id 0x2A）。
+        // 先来一个合法 zstd 直存帧：[0][0x2A …]（帧体恰好一个包）。
         byte[] packet = {0x2A, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08};
         ByteBuf ok = Unpooled.buffer();
         ZstdVarInts.write(ok, 0);
-        ZstdVarInts.write(ok, packet.length);
         ok.writeBytes(packet);
         in.writeInbound(ok);
         assertEquals(1, drainInbound(in).size(), "首个合法 zstd 帧应正常还原");
 
-        // 再来一个内层长度越界的畸形帧：不得被当成"原版帧"放行。
-        // 形态：[0][pktLen=0x8C 0x02=268][0x2A …]——pktLen 是两字节 varint（0x8C 带续位），
-        // 属于明确的 zstd 帧形状，但内层声明 268 字节而实际只有 4 字节，必须 fail-fast。
+        // 再来一个畸形帧：声明 32MB 却只给 1 字节（放大攻击）→ 必须 fail-fast。
+        // ⚠️ 注意不能再用"内层长度越界"来构造畸形帧：帧格式 v4 的直存帧没有内层长度，
+        // 形如 [0][长度][数据] 的字节现在是一个<b>合法</b>的单包帧（见上一用例）。
         ByteBuf bad = Unpooled.buffer();
-        ZstdVarInts.write(bad, 0);
-        ZstdVarInts.write(bad, 268);
-        bad.writeBytes(new byte[]{0x2A, 0x01, 0x02, 0x03});
+        ZstdVarInts.write(bad, ZstdVarInts.DEFAULT_MAX_VALUE);
+        bad.writeByte(0x00);
         in.writeInbound(bad);
         in.runPendingTasks();
         assertNull(in.readInbound(), "见过 zstd 帧后不得再回退");
@@ -731,27 +771,21 @@ class FrameLayoutTest {
     }
 
     @Test
-    @DisplayName("拒绝：内层包长越界（声明长度超出帧体）")
+    @DisplayName("拒绝：压缩帧解压后内层包长越界（声明长度超出负载）")
     void rejectInnerLengthOverrun() {
-        ByteBuf buf = Unpooled.buffer();
-        ZstdVarInts.write(buf, 0);   // 直存
-        ZstdVarInts.write(buf, 999); // 内层声明 999 字节
-        buf.writeBytes(ascii("short"));
-        assertRejected(buf);
-    }
+        // 直存帧没有内层长度（帧体就是一个包），所以内层越界只可能出现在压缩帧里。
+        // 负载 = [varint 999][300 字节 0]：声明 999 而实际只剩 300 → fail-fast。
+        // 用 300 字节的零填充是为了让这句断言成立（5 字节的输入压完反而更大）。
+        byte[] payload = new byte[302];
+        payload[0] = (byte) 0xE7; // varint(999)
+        payload[1] = 0x07;
+        byte[] compressed = compressCtx.compress(payload);
+        assertTrue(compressed.length < payload.length, "用例前提：压缩后更小");
 
-    @Test
-    @DisplayName("拒绝：直存帧内层 pktLen 超过 32MB 上限（走 INVALID 而非整数溢出）")
-    void rejectStoredInnerLengthOverMax() {
-        // 直存帧的内层 pktLen 由 tryRead 以 DEFAULT_MAX_VALUE（32MB）为上限，
-        // 因此 0x7FFFFFFF 会被直接判成 INVALID 并干净拒绝 —— 这条路径**不存在** int 溢出
-        //（压缩帧那一侧用的是不设上限的 readAt，才需要 long 相加，见下一个用例）。
-        // 本用例钉死这一差异，避免日后有人"顺手"把两侧改成同一套判据而引入回归。
         ByteBuf frame = Unpooled.buffer();
-        ZstdVarInts.write(frame, 0);                  // rawSize = 0 → 直存帧
-        ZstdVarInts.write(frame, Integer.MAX_VALUE);  // 内层 pktLen = 0x7FFFFFFF > 32MB
-        frame.writeBytes(ascii("short"));
-        assertRejected(frame);
+        ZstdVarInts.write(frame, payload.length); // 声明解压后长度
+        frame.writeBytes(compressed);
+        assertRejectedCompressed(frame);
     }
 
     @Test
@@ -796,13 +830,17 @@ class FrameLayoutTest {
     }
 
     @Test
-    @DisplayName("拒绝：直存帧里内层包长为 0")
+    @DisplayName("拒绝：压缩帧解压后内层包长为 0")
     void rejectZeroInnerLength() {
-        ByteBuf buf = Unpooled.buffer();
-        ZstdVarInts.write(buf, 0);
-        ZstdVarInts.write(buf, 0);
-        buf.writeByte(0x01);
-        assertRejected(buf);
+        // 同 rejectInnerLengthOverrun：直存帧没有内层长度，所以这条判据只作用于压缩帧。
+        byte[] payload = new byte[257]; // [varint 0][256 字节 0] —— 内层声明 0
+        byte[] compressed = compressCtx.compress(payload);
+        assertTrue(compressed.length < payload.length, "用例前提：压缩后更小");
+
+        ByteBuf frame = Unpooled.buffer();
+        ZstdVarInts.write(frame, payload.length);
+        frame.writeBytes(compressed);
+        assertRejectedCompressed(frame);
     }
 
     // ────────────────────────────────────────────────────────────────
@@ -875,22 +913,23 @@ class FrameLayoutTest {
         return out;
     }
 
-    /** 逐字段走一遍帧体，按 {@code [varint pktLen][pkt]...} 切出各包。 */
-    private static byte[][] drainPackets(ByteBuf frame) {
-        byte[] data = new byte[frame.readableBytes()];
-        frame.getBytes(frame.readerIndex(), data);
-        List<byte[]> out = new ArrayList<>();
-        int[] cursor = {0};
-        while (cursor[0] < data.length) {
-            int len = ZstdVarInts.readAt(data, cursor[0], cursor);
-            assertTrue(len > 0, "内层包长必须为正");
-            assertTrue(cursor[0] + len <= data.length, "内层包长不得越界");
-            byte[] p = new byte[len];
-            System.arraycopy(data, cursor[0], p, 0, len);
-            cursor[0] += len;
-            out.add(p);
-        }
-        return out.toArray(new byte[0][]);
+    /**
+     * 畸形<b>压缩帧</b>：必须经真实解压路径被干净拒绝。
+     *
+     * <p>与 {@link #assertRejected} 的区别：压缩帧要走过 zstd 解压才谈得上"内层切包"，
+     * 所以解压上下文不能为 null（否则只会因为"上下文不可用"而关连接，
+     * 断言虽然通过，但实际没测到目标判据）。</p>
+     */
+    private void assertRejectedCompressed(ByteBuf frame) {
+        TestDecoder decoder = new TestDecoder(decompressCtx);
+        EmbeddedChannel in = new EmbeddedChannel(decoder);
+        in.writeInbound(frame);
+        in.runPendingTasks();
+        assertNull(in.readInbound(), "畸形帧不得产出任何包");
+        assertFalse(in.isOpen(), "畸形帧必须 fail-fast 关闭连接");
+        assertNull(decoder.lastError,
+                "必须走 protocolError 干净拒绝；非 null 说明判定被绕过、由未捕获异常兜住");
+        in.finishAndReleaseAll();
     }
 
     private static void assertRejected(ByteBuf frame) {
@@ -953,6 +992,13 @@ class FrameLayoutTest {
         for (int i = 0; i < size; i++) {
             b[i] = (byte) (i % 7);
         }
+        return b;
+    }
+
+    /** 不可压缩数据（固定种子，结果可复现）：zstd 压不动，用于验证"压缩无收益 → 退回直存"。 */
+    private static byte[] incompressible(int size) {
+        byte[] b = new byte[size];
+        new java.util.Random(20261019L).nextBytes(b);
         return b;
     }
 

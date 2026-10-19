@@ -548,9 +548,9 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
             if (mgr != null) mgr.expectSwitchTxId(txId);
             mikumc.zstd.protocol.ZstdStepFrames.writeQuery(packet, txId,
                     mikumc.zstd.protocol.ZstdSwitchGate.CHANNEL);
-            int pktLen = packet.readableBytes();
+            // 帧格式（v4）：[rawSize=0][packet] —— 直存帧一帧一包、不带内层长度前缀，
+            // 与原版未压缩帧逐字节同形（见 ZstdBatchEncoderBase 的帧格式说明）。
             ZstdVarInts.write(frame, 0);
-            ZstdVarInts.write(frame, pktLen);
             frame.writeBytes(packet);
             writeCtx.writeAndFlush(frame);
             LOGGER.debug("[Zstd] switch request sent");

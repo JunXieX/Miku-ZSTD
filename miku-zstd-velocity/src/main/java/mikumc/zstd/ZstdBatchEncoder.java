@@ -7,7 +7,7 @@ import mikumc.zstd.protocol.ZstdCompressLock;
 import mikumc.zstd.protocol.ZstdTrafficCounter;
 
 /**
- * Miku-ZSTD 编码器（服务端 → 客户端）帧格式 <b>v3</b>（协商版本 v4）。
+ * Miku-ZSTD 编码器（服务端 → 客户端）帧格式 <b>v4</b>（协商版本 v5）。
  *
  * <p>批处理、建帧、promise 编排等全部逻辑在共享基类
  * {@link ZstdBatchEncoderBase} 中（两端同一份源码）；本类只声明服务端的

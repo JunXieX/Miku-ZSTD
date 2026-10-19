@@ -290,9 +290,10 @@ public class ZstdHijacker extends ChannelDuplexHandler {
                     ctx.channel().pipeline().names());
             // ⚠️ 必须同步进入 hold：Velocity 在写完 SetCompression 后会立刻写 LoginSuccess，
             // 而激活要等协商应答（一个 RTT）。若不拦下这段窗口内的包，它们会走原版压缩编码器
-            // 发出去，而客户端收到 SetCompression 后已经切到 zstd —— v3 的批量帧格式
-            // （内层带 pktLen）与原版帧 `[0][packet]` 不再同形，客户端必然解析错乱。
-            // v2 之所以侥幸没事，是因为"一帧一包"下两种格式恰好同形。
+            // 发出去，而客户端收到 SetCompression 后已经把解码器换成了 zstd —— 原版压缩帧
+            // （[dataLength>0][deflate]）会被 zstd 解码器按 zstd 帧解析，必然错乱/断连。
+            //（未压缩帧 [0][packet] 与 zstd 直存帧逐字节同形、不在其中；但 LoginSuccess 这类
+            // 数据量较大的包会被原版压缩器真正压缩，所以整段窗口都必须扣住。）
             holding = true;
             super.write(ctx, msg, promise); // SetCompression 本身原样透传（此刻尚未压缩）
             ctx.channel().eventLoop().execute(() -> tryActivate(ctx, 0));
@@ -815,12 +816,11 @@ public class ZstdHijacker extends ChannelDuplexHandler {
                 // Velocity 端没有独立 prepender：外层 bodyLen 只由 ZstdBatchEncoder 写。
                 // 我们从编码器之后写出（跳过它），所以必须自己把 bodyLen 补上，
                 // 否则客户端 frame-decoder 会把首字节 0x00 当成"帧长为 0"直接抛异常。
-                // 帧格式：[bodyLen][rawSize=0][varint pktLen][packet]
-                int pktLen = packet.readableBytes();
-                int bodyLen = 1 /*rawSize=0*/ + pktLen + varIntLen(pktLen);
+                // 帧格式（v4）：[bodyLen][rawSize=0][packet] —— 直存帧一帧一包、不带内层长度前缀，
+                // 与原版未压缩帧逐字节同形（见 ZstdBatchEncoderBase 的帧格式说明）。
+                int bodyLen = 1 /*rawSize=0*/ + packet.readableBytes();
                 mikumc.zstd.protocol.ZstdVarInts.write(frame, bodyLen);
                 mikumc.zstd.protocol.ZstdVarInts.write(frame, 0);
-                mikumc.zstd.protocol.ZstdVarInts.write(frame, pktLen);
                 frame.writeBytes(packet);
 
                 writeCtx.writeAndFlush(frame);
@@ -837,16 +837,6 @@ public class ZstdHijacker extends ChannelDuplexHandler {
             LOGGER.debug("[Zstd] failed to send switch request: {}", e.toString());
             return false;
         }
-    }
-
-    /** varint 的字节数（用于手工拼帧时计算 bodyLen）。 */
-    private static int varIntLen(int value) {
-        int n = 1;
-        while ((value & ~0x7F) != 0) {
-            value >>>= 7;
-            n++;
-        }
-        return n;
     }
 
     /**

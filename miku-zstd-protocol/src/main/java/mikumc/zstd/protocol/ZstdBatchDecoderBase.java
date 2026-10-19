@@ -11,15 +11,19 @@ import org.slf4j.LoggerFactory;
 import java.util.List;
 
 /**
- * Miku-ZSTD 入站解码器基类（帧格式 <b>v3</b>，协商版本 v4）——三端共享实现。
+ * Miku-ZSTD 入站解码器基类（帧格式 <b>v4</b>，协商版本 v5）——三端共享实现。
  *
- * <h2>帧格式（v3）</h2>
+ * <h2>帧格式（v4）</h2>
  * <pre>
- *   [varint rawSize][zstd(payload) | payload]
- *   payload = [varint pktLen][pkt] [varint pktLen][pkt] ...
+ *   [varint rawSize][zstd(payload) | packet]
+ *   payload = [varint pktLen][pkt] [varint pktLen][pkt] ...   // 仅 rawSize > 0
  * </pre>
- * <p>{@code rawSize == 0} 表示未压缩直存。一帧可含<b>多个</b>包，按内层
- * {@code [varint pktLen]} 逐个切出并下传（v2 是一帧一包，内层没有长度前缀）。</p>
+ * <p>{@code rawSize == 0} 表示未压缩直存：帧体<b>恰好是一个包</b>（{@code [0][packet]}），
+ * 与原版未压缩帧<b>逐字节同形</b>。因此"按原版解释"与"按 zstd 解释"对这段字节得到的结果
+ * <b>完全相同</b>——切换窗口内外的处理不需要任何形状判断（见 {@link #acceptsLegacyFrames()}）。</p>
+ * <p>压缩帧（{@code rawSize > 0}）可含<b>多个</b>包，按内层 {@code [varint pktLen]} 逐个切出
+ * 并下传。（v2 是一帧一包、内层没有长度前缀；v4 起直存帧同样是一帧一包——原因见
+ * {@code ZstdBatchEncoderBase} 的"帧格式"一节。）</p>
  * <p>传入的 {@code in} 已是完整帧负载：两端管线的前置 frame-decoder / prepender
  * 已负责外层长度（服务端侧由编码器自带 bodyLen、客户端侧由 prepender 负责）。</p>
  *
@@ -263,8 +267,10 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
         }
 
         if (rawSize == 0) {
-            // 切换未确认（协议保证的窗口）：客户端此刻必然还在用原版帧，一律按原版解释。
-            // ⚠️ 这里不做任何"看起来像不像 zstd 直存帧"的判断——那正是残留风险的来源。
+            // 未压缩帧：帧体<b>恰好是一个包</b>。这里之所以（也<b>必须</b>）完全不区分
+            // "原版未压缩帧"与"zstd 直存帧"，是因为编码侧把直存帧做成了与原版帧逐字节同形
+            //（{@code [0][packet]}，见 ZstdBatchEncoderBase 的帧格式一节）：两种解释结果相同，
+            // 因此不存在任何"看起来像不像 zstd 帧"的启发式判断（那正是残留风险的来源）。
             if (legacyFallbackAllowed()) {
                 sawVanillaFrame = true;
                 out.add(in.readRetainedSlice(remaining));
@@ -272,16 +278,13 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
             }
 
             sawZstdFrame = true;
-            // 直存帧：payload 就在输入缓冲里，用 retained slice 零拷贝切分
             onStoredFrame(remaining);
             if (wantsStoredPayload()) {
                 // 直存帧按定义一定不大（超过阈值就会被压缩），整帧拷一份的代价可忽略；
                 // 但采样方要求"独占数组"（帧缓冲会被复用），所以这里必须拷。
-                byte[] stored = new byte[remaining];
-                in.getBytes(in.readerIndex(), stored, 0, remaining);
-                onStoredPayload(stored);
+                onStoredPayload(singlePacketBatch(in, remaining));
             }
-            splitAndEmit(ctx, in, remaining, out);
+            out.add(in.readRetainedSlice(remaining));
             return;
         }
 
@@ -377,34 +380,18 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
         }
     }
 
-    /** 直存帧：在输入缓冲上按内层长度前缀切出各包（零拷贝 retained slice）。 */
-    private void splitAndEmit(ChannelHandlerContext ctx, ByteBuf in, int total, List<Object> out) {
-        int consumed = 0;
-        int packets = 0;
-        while (consumed < total) {
-            int before = in.readerIndex();
-            int pktLen = ZstdVarInts.tryRead(in, ZstdVarInts.DEFAULT_MAX_VALUE);
-            if (pktLen <= 0) {
-                protocolError(ctx, "illegal inner packet length in stored frame at offset " + consumed);
-                return;
-            }
-            consumed += in.readerIndex() - before;
-            // 注：这里的 pktLen 由 tryRead 以 DEFAULT_MAX_VALUE（32MB）为上限，
-            // 因此 consumed + pktLen 不可能 int 溢出，无需 long 相加。
-            // 压缩帧那一侧（splitAndEmit(byte[])）用的是不设上限的 readAt，
-            // pktLen 可达 2^31-1，所以那里必须用 long —— 两侧的差别是有意的。
-            if (consumed + pktLen > total) {
-                protocolError(ctx, "inner packet length " + pktLen + " overruns frame ("
-                        + consumed + "+" + pktLen + " > " + total + ")");
-                return;
-            }
-            out.add(in.readRetainedSlice(pktLen));
-            consumed += pktLen;
-            packets++;
-        }
-        if (packets == 0) {
-            protocolError(ctx, "stored frame contained no packet");
-        }
+    /**
+     * 把"未压缩帧的帧体"（恰好一个包）包装成采样方要求的批格式
+     * {@code [varint pktLen][pkt]}。
+     *
+     * <p>采样器（{@code ZstdSampleTrainer}）对压缩帧与直存帧用<b>同一套</b>拆包逻辑，
+     * 所以单包这一侧必须补上长度前缀——否则采样器会把包 id 当成"包长"读。</p>
+     */
+    private static byte[] singlePacketBatch(ByteBuf in, int len) {
+        byte[] out = new byte[ZstdVarInts.length(len) + len];
+        int off = ZstdVarInts.writeTo(out, 0, len);
+        in.getBytes(in.readerIndex(), out, off, len);
+        return out;
     }
 
     /** 压缩帧：把解压出来的 byte[] 按内层长度前缀切成多个包。 */

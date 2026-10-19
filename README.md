@@ -170,9 +170,9 @@ First launch creates `Miku-ZSTD/config.yml` in your game directory.
 ## How it works
 **工作原理**
 
-Protocol version v4, identical across Velocity, Paper and Fabric.
+Protocol version v5, identical across Velocity, Paper and Fabric (frame format v4).
 
-协议版本 v4（Velocity / Paper / Fabric 三端的协议版本常量一致）。
+协议版本 v5（Velocity / Paper / Fabric 三端的协议版本常量一致；帧格式 v4）。
 
 ```text
 Client --handshake (marker "\0ZSTD\0" appended to hostname)--> Server
@@ -201,19 +201,20 @@ Client --handshake (marker "\0ZSTD\0" appended to hostname)--> Server
 
 > 为什么字典在 v4 改成按需推送：v3 把字典字节内联进 negotiate，于是所有连接都要吃这几百 KB，无论客户端是否支持 zstd、本地是否已有缓存。拆成两段后，重连（缓存命中）与非 zstd 客户端都是零字典流量。
 
-### Frame format (protocol v4)
-**帧格式（协议 v4）**
+### Frame format (v4)
+**帧格式（v4）**
 
 ```text
-Server -> Client   [varint bodyLen?][varint rawSize][zstd(payload) | payload]
-Client -> Server   [varint rawSize][zstd(payload) | payload]
-payload = [varint pktLen][pkt] [varint pktLen][pkt] ...   <- one or more packets
+Server -> Client   [varint bodyLen?][varint rawSize][zstd(payload) | packet]
+Client -> Server   [varint rawSize][zstd(payload) | packet]
+compressed frame (rawSize > 0)  payload = [varint pktLen][pkt] [varint pktLen][pkt] ...  <- one or more packets
+stored frame (rawSize == 0)     exactly one packet [0][packet], byte-identical to a vanilla uncompressed frame
 ```
 
-- `rawSize == 0` means stored uncompressed, and the payload is then the raw content. Otherwise it is a magicless zstd frame
-    - `rawSize == 0` 表示未压缩直存，此时 payload 就是原始内容；否则是 magicless zstd 帧
-- Multi-packet framing: packets inside the batching window share one frame, amortizing header and entropy-table cost
-    - 一帧多包：批处理窗口内的包合帧，帧头与熵表开销被摊薄
+- `rawSize == 0` means stored uncompressed: the frame body is exactly one packet (`[0][packet]`), byte-identical to a vanilla uncompressed frame, so both the vanilla `CompressionDecoder` and the packet decoder read it directly. Stored frames therefore carry no inner length prefix — one extra `[varint pktLen]` would be read as the packet id by the packet decoder (`Unknown packet`), and the player could not join
+    - `rawSize == 0` 表示未压缩直存：帧体恰好是一个包（`[0][packet]`），与原版未压缩帧逐字节同形，原版解码器与包解码器都能直接读懂。因此直存帧不带任何内层长度前缀——多写一层 `[varint pktLen]` 会被包解码器当成包 id（`Unknown packet`），玩家将无法进入服务器
+- Multi-packet framing happens only for compressed frames: packets inside the batching window share one frame, amortizing header and entropy-table cost. Stored frames are by definition too small to be worth batching
+    - 一帧多包只发生在压缩帧：批处理窗口内的包合成一帧压缩，帧头与熵表开销被摊薄；直存帧按定义都是"小到不值得压缩"的包
 - Magicless zstd frame: saves the 4-byte magic and omits contentSize and dictID, since the size comes from `rawSize` and the dictionary is loaded explicitly by both sides
     - magicless zstd 帧：省 4 字节 magic，且不写 contentSize 与 dictID（解压尺寸由 `rawSize` 提供，字典由双方显式加载）
 - `bodyLen` is written by Velocity only, because its pipeline has no standalone frame-encoder. On the client side the prepender handles it. This is deliberate: a missing or duplicated length field breaks decoding
