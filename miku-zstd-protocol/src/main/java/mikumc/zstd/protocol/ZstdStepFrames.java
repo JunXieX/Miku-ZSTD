@@ -167,9 +167,15 @@ public final class ZstdStepFrames {
         int[] cursor = {0};
         int txId = ZstdVarInts.readOr(bare, cursor, -1);
         if (txId <= 0) return -1;
-        // txId 之后必须恰好紧贴 4 字节魔数（与 readSwitchRejectTxId 的对称校验）：
-        // 否则"任意包尾恰好是魔数"的长帧会被误判成切换握手。
-        if (cursor[0] + 4 != bare.length) return -1;
+        // ⚠️ 这里<b>不能</b>要求"txId 紧贴魔数"：本方法同时用于两种线格式，
+        //   · 服务端 → 客户端的询问：{@code [txId][varint len][channel][magic]}
+        //     （txId 与魔数之间还有一个 channel 名）；
+        //   · 客户端 → 服务端的确认：{@code [txId][bool success][magic]}
+        //     （txId 与魔数之间还有一个 bool）。
+        // 5.0.5 曾在这里加过 {@code cursor[0] + 4 == bare.length} 的"对称校验"，
+        // 结果两种格式都过不了 —— 客户端嗅探器永不命中、从不回真确认，
+        // 服务端只能收到 MC 自动回的空应答（实测 5.0.5~5.0.9 的掉线就是这个）。
+        // 判据只保留"魔数在末尾 + txId 为正"，与两种格式都相容。
         return txId;
     }
 
