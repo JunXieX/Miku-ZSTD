@@ -72,16 +72,26 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
     private static final int SCRATCH_KEEP_LIMIT = 512 * 1024;
 
     private ZstdCompressCtx compressCtx;
-    /** 压缩目标缓冲（渐进扩容复用；只增到 {@link #SCRATCH_KEEP_LIMIT}，超限走临时数组） */
-    private byte[] dstArray;
-    /** 原始负载拼接缓冲（复用；只增到 {@link #SCRATCH_KEEP_LIMIT}，超限走临时数组） */
-    private byte[] rawArray;
+
     /**
-     * 当前批次<b>实际</b>使用的原始缓冲：小批次是常驻的 {@link #rawArray}，大帧是临时数组。
+     * 压缩目标缓冲（池化直存缓冲，渐进扩容复用）。
+     *
+     * <p>⚠️ 从 {@code byte[]} 改为 {@link ByteBuf}：zstd-jni 的
+     * {@code compressDirectByteBuffer} 只在 direct 缓冲上才走 native 直压路径，
+     * 堆数组必须先由 JNI 复制一份。用 Netty 的池化直存缓冲后，这份复制省掉，
+     * 并且分配由 PooledByteBufAllocator 复用——不再每批 new 一个 byte[]。</p>
+     */
+    private ByteBuf dstBuf;
+
+    /** 原始负载拼接缓冲（同上：池化直存，按需增长复用）。 */
+    private ByteBuf rawBuf;
+
+    /**
+     * 当前批次<b>实际</b>使用的原始缓冲：小批次是常驻的 {@link #rawBuf}，大帧是临时缓冲。
      * 压缩在池线程执行，必须把实例捕获进 lambda，不能在池线程里重新读字段
      *（那时字段可能已被下一次成帧换掉）。
      */
-    private byte[] batchRaw;
+    private ByteBuf batchRaw;
 
     /**
      * 单连接待发送数据的硬上限（字节）。
@@ -176,8 +186,11 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
      *
      * <p>默认空实现：不需要字典的一端无需关心。实现在此接收的是<b>未经压缩的批次字节</b>
      * （{@code [varint pktLen][pkt]...}），采样方必须自行复制——该缓冲会被复用。</p>
+     *
+     * <p>参数是池化直存 {@link ByteBuf}（{@code readerIndex()} 在起点、可读长度为 length），
+     * 采样方用 {@code getBytes} 复制即可，不要改动其 readerIndex。</p>
      */
-    protected void onRawBatch(byte[] raw, int length) {
+    protected void onRawBatch(ByteBuf raw, int length) {
     }
 
     /** 批处理窗口（毫秒），0 = 立刻成帧 */
@@ -313,7 +326,7 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
         if (pending.isEmpty()) {
             return;
         }
-        // ⚠️ 有压缩任务在途时绝不开始新一批：compressCtx / rawArray / dstArray 都是
+        // ⚠️ 有压缩任务在途时绝不开始新一批：compressCtx / rawBuf / dstBuf 都是
         // 「每连接独占」的资源，被两个线程同时用会直接损坏数据；同时这也是保持写出
         // 顺序的关键。积压的数据不会滞留——在途任务完成后的回调会重新检查 pending。
         if (compressing) {
@@ -331,10 +344,10 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
         List<ChannelPromise> promises = new ArrayList<>(pendingPromises.subList(0, batchCount));
 
         final int rawTotal;
-        final byte[] raw;
+        final ByteBuf raw;
         try {
-            rawTotal = concatPending(batchPackets);
-            raw = batchRaw; // 本批实际使用的缓冲：大帧是临时数组，必须捕获实例传给池线程
+            rawTotal = concatPending(batchPackets, ctx);
+            raw = batchRaw; // 本批实际使用的缓冲：大帧是临时缓冲，必须捕获实例传给池线程
             // 立刻摘掉字段引用：此后只有上面这个局部变量持有它。否则大帧（如进服阶段的
             // 注册表帧，几十 MB）会被字段一直留到下一批 —— 刚进服就挂机的连接会白占一份。
             batchRaw = null;
@@ -383,7 +396,7 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
         try {
             ZstdCompressPool.execute(() -> {
                 final int produced;
-                final byte[] dst;
+                ByteBuf dst = null;
                 try {
                     // 与「换字典 / close」互斥：ctx 不是线程安全的，且可能已被释放
                     synchronized (lock) {
@@ -396,8 +409,8 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
                                     0, null, raw, rawTotal, withBodyLen);
                             return;
                         }
-                        // raw 是本批捕获的实例（大帧是临时数组）；dst 也按需临时分配
-                        dst = ensureCompressDstCapacity(rawTotal);
+                        // raw 是本批捕获的实例（大帧是临时缓冲）；dst 走池化直存
+                        dst = ensureCompressDstCapacity(ctx, rawTotal);
                         // 上下文必须每批重新取：客户端可能在重协商后换掉了它（见钩子注释）
                         ZstdCompressCtx batchCtx = compressContextForBatch();
                         if (batchCtx == null) {
@@ -405,10 +418,16 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
                                     0, null, raw, rawTotal, withBodyLen);
                             return;
                         }
-                        // 第 3 个参数是"目标缓冲区可用空间"，必须传数组实际长度
-                        // （传 srcSize 会报 Destination buffer is too small）
-                        produced = batchCtx.compressByteArray(
-                                dst, 0, dst.length, raw, 0, rawTotal);
+                        // ⚠️ 必须走 compressDirectByteBuffer：只有 direct 缓冲才免掉
+                        // JNI 侧的一次整批复制（堆数组要 memcpy 进 native 才能压）。
+                        // 第 3 个参数是"目标缓冲区可用空间"，必须传实际容量。
+                        // ⚠️ internalNioBuffer(index, length) 返回的是<b>独立视图</b>：
+                        // 它的 position=0、limit=length，所以偏移参数必须传 0 ——
+                        // 传 readerIndex 会被 checkFromIndexSize 判越界（或读到错误位置）。
+                        produced = batchCtx.compressDirectByteBuffer(
+                                dst.internalNioBuffer(0, dst.capacity()), 0, dst.capacity(),
+                                raw.internalNioBuffer(raw.readerIndex(), rawTotal),
+                                0, rawTotal);
                     }
                 } catch (Throwable t) {
                     backToEventLoop(ctx, promises, t, 0, null, raw, rawTotal, withBodyLen);
@@ -428,7 +447,7 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
 
     /** 压缩完成后回到 event loop：组帧、写出、并立刻接手积压的下一批。 */
     private void backToEventLoop(ChannelHandlerContext ctx, List<ChannelPromise> promises,
-                                 Throwable failure, int produced, byte[] dst, byte[] raw,
+                                 Throwable failure, int produced, ByteBuf dst, ByteBuf raw,
                                  int rawTotal, boolean withBodyLen) {
         ctx.executor().execute(() -> {
             compressing = false;
@@ -459,6 +478,14 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
                     failAll(promises, t);
                     LOGGER.error("[Zstd] encoder frame build failed", t);
                 }
+            }
+
+            // 大帧用的临时缓冲（不在字段里，池化分配器不会替我们回收）
+            if (raw != null && raw != rawBuf) {
+                raw.release();
+            }
+            if (dst != null && dst != dstBuf) {
+                dst.release();
             }
 
             // 压缩期间攒下的包：立刻接着发（不设 compressing 了，可以再走一轮）
@@ -515,7 +542,7 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
         return count;
     }
 
-    private int concatPending(List<ByteBuf> packets) {
+    private int concatPending(List<ByteBuf> packets, ChannelHandlerContext ctx) {
         long rawTotalLong = 0;
         for (ByteBuf b : packets) {
             rawTotalLong += (long) ZstdVarInts.length(b.readableBytes()) + b.readableBytes();
@@ -524,14 +551,13 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
             throw new IllegalArgumentException("batch raw size exceeds integer range: " + rawTotalLong);
         }
         int rawTotal = (int) rawTotalLong;
-        final byte[] raw = ensureRawCapacity(rawTotal);
+        final ByteBuf raw = ensureRawCapacity(ctx, rawTotal);
         batchRaw = raw;
-        int off = 0;
+        raw.clear();
         for (ByteBuf b : packets) {
             int n = b.readableBytes();
-            off = ZstdVarInts.writeTo(raw, off, n);
-            b.getBytes(b.readerIndex(), raw, off, n);
-            off += n;
+            ZstdVarInts.write(raw, n);
+            raw.writeBytes(b, b.readerIndex(), n);
         }
         onRawBatch(raw, rawTotal); // 采样（必须在缓冲复用前）
         // ⚠️ 这里<b>不</b>释放 packets：release 必须发生在 removePendingPrefix 读完长度之后。
@@ -570,15 +596,17 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
      * <p>⚠️ 先把整批校验完再动手写：写了一半才失败，会让"已经写出去的帧"与"被失败化的
      * promise"对不上——上游以为没发出去，其实数据已经在路上。</p>
      */
-    private void writeStoredFrames(ChannelHandlerContext ctx, byte[] raw, int rawTotal,
+    private void writeStoredFrames(ChannelHandlerContext ctx, ByteBuf raw, int rawTotal,
                                    boolean withBodyLen, List<ChannelPromise> promises) {
         final int bodyLimit = ZstdVarInts.MC_MAX_FRAME_BYTES - (withBodyLen ? 5 : 0);
+        final int base = raw.readerIndex();
+        final int end = base + rawTotal;
 
-        int[] cursor = {0};
-        while (cursor[0] < rawTotal) {
+        int[] cursor = {base};
+        while (cursor[0] < end) {
             int start = cursor[0];
-            int pktLen = ZstdVarInts.readOr(raw, cursor, ZstdVarInts.INVALID);
-            if (pktLen <= 0 || cursor[0] + (long) pktLen > rawTotal) {
+            int pktLen = ZstdVarInts.readOr(raw, cursor, ZstdVarInts.INVALID, end);
+            if (pktLen <= 0 || cursor[0] + (long) pktLen > end) {
                 throw new IllegalStateException("corrupt batch layout at offset " + start
                         + " (pktLen=" + pktLen + ", total=" + rawTotal + ")");
             }
@@ -589,10 +617,10 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
             cursor[0] += pktLen;
         }
 
-        cursor[0] = 0;
+        cursor[0] = base;
         int promiseIndex = 0;
-        while (cursor[0] < rawTotal) {
-            int pktLen = ZstdVarInts.readOr(raw, cursor, ZstdVarInts.INVALID);
+        while (cursor[0] < end) {
+            int pktLen = ZstdVarInts.readOr(raw, cursor, ZstdVarInts.INVALID, end);
             int bodyOff = cursor[0];
             int bodyLen = 1 /* rawSize=0 */ + pktLen;
 
@@ -628,7 +656,7 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
      * 压缩帧：{@code [bodyLen?][rawSize>0][zstd(payload)]}，
      * {@code payload} 保持批格式 {@code [varint pktLen][pkt]...}（多包合批只发生在这里）。
      */
-    private ByteBuf buildCompressedFrame(ChannelHandlerContext ctx, byte[] dst,
+    private ByteBuf buildCompressedFrame(ChannelHandlerContext ctx, ByteBuf dst,
                                          int outLen, int rawTotal, boolean withBodyLen) {
         ByteBuf frame;
         if (withBodyLen) {
@@ -639,7 +667,7 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
             frame = ctx.alloc().directBuffer(ZstdVarInts.length(rawTotal) + outLen);
         }
         ZstdVarInts.write(frame, rawTotal);
-        frame.writeBytes(dst, 0, outLen);
+        frame.writeBytes(dst, dst.readerIndex(), outLen);
         ensureFrameFitsMcLimit(frame, rawTotal);
         onFrame(1 + rawTotal, frame.readableBytes(), true);
         return frame;
@@ -726,30 +754,45 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
      * 压缩目标缓冲（按需增长复用）。
      *
      * <p>初值刻意取得小（8KB）而不是 64KB：实际批次通常只有 2~8KB，而 64KB 初值是
-     * <b>每连接</b>两份（本缓冲 + rawArray），200 连接光初值就白占 25MB。
+     * <b>每连接</b>两份（本缓冲 + rawBuf），200 连接光初值就白占 25MB。
      * 扩容是均摊 O(1)，大流量下多几次 arraycopy 远比常驻大数组划算。</p>
      */
-    private byte[] ensureCompressDstCapacity(int srcSize) {
+    /**
+     * 取压缩目标缓冲：小批次复用常驻的池化直存缓冲，大帧临时分配（用完即弃）。
+     *
+     * <p>容量按 {@code compressBound} 预留（{@code n + n/256 + 64}），
+     * 与 zstd 的最坏膨胀量一致——目标不够时 zstd 会报 Destination buffer is too small。</p>
+     */
+    private ByteBuf ensureCompressDstCapacity(ChannelHandlerContext ctx, int srcSize) {
         int needed = srcSize + (srcSize >>> 8) + 64;
         if (needed > SCRATCH_KEEP_LIMIT) {
-            // 大帧临时分配，用完即弃：常驻会让"连过的最大批"永久占住缓冲
-            return new byte[needed];
+            return ctx.alloc().directBuffer(needed);
         }
-        if (dstArray == null || dstArray.length < needed) {
-            dstArray = new byte[Math.max(needed, INITIAL_BUFFER)];
+        if (dstBuf == null || dstBuf.capacity() < needed) {
+            if (dstBuf != null) {
+                dstBuf.release();
+            }
+            dstBuf = ctx.alloc().directBuffer(Math.max(needed, INITIAL_BUFFER));
         }
-        return dstArray;
+        return dstBuf;
     }
 
-    private byte[] ensureRawCapacity(int needed) {
+    /**
+     * 取原始负载缓冲：小批次复用常驻的池化直存缓冲，大帧临时分配（用完即弃）。
+     *
+     * <p>大帧只在进服时出现（区块 / 注册表），常驻会让"连过的最大批"永久占住内存。</p>
+     */
+    private ByteBuf ensureRawCapacity(ChannelHandlerContext ctx, int needed) {
         if (needed > SCRATCH_KEEP_LIMIT) {
-            // 同上：大帧临时分配，不写入常驻字段
-            return new byte[needed];
+            return ctx.alloc().directBuffer(needed);
         }
-        if (rawArray == null || rawArray.length < needed) {
-            rawArray = new byte[Math.max(needed, INITIAL_BUFFER)];
+        if (rawBuf == null || rawBuf.capacity() < needed) {
+            if (rawBuf != null) {
+                rawBuf.release();
+            }
+            rawBuf = ctx.alloc().directBuffer(Math.max(needed, INITIAL_BUFFER));
         }
-        return rawArray;
+        return rawBuf;
     }
 
     @Override
@@ -777,6 +820,24 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
         failInflight(new ClosedChannelException());
         inflightPromises = null;
         compressing = false;
+        releaseScratch();
+    }
+
+    /**
+     * 释放在本 handler 上常驻的两块池化缓冲。
+     *
+     * <p>⚠️ 只释放<b>常驻</b>的那两份：本批若用临时缓冲（大帧），它已在
+     * {@link #backToEventLoop} 里单独释放，字段里不会留引用。</p>
+     */
+    private void releaseScratch() {
+        if (rawBuf != null) {
+            rawBuf.release();
+            rawBuf = null;
+        }
+        if (dstBuf != null) {
+            dstBuf.release();
+            dstBuf = null;
+        }
     }
 
     @Override
@@ -789,6 +850,8 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
         failPending(new ClosedChannelException());
         pendingPromises.clear();
         failInflight(new ClosedChannelException());
+        // 注意不在这里 releaseScratch()：channelInactive 之后 handlerRemoved 仍会执行，
+        // 放在两处会 double-release（池化缓冲释放两次会让分配器状态错乱）。
         super.channelInactive(ctx);
     }
 

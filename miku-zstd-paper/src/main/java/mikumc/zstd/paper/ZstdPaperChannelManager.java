@@ -2,6 +2,7 @@ package mikumc.zstd.paper;
 
 import com.github.luben.zstd.ZstdCompressCtx;
 import com.github.luben.zstd.ZstdDecompressCtx;
+import mikumc.zstd.protocol.ZstdCtxPool;
 import io.netty.channel.Channel;
 import io.netty.util.AttributeKey;
 import mikumc.zstd.protocol.ZstdCompressLock;
@@ -52,11 +53,13 @@ public class ZstdPaperChannelManager {
 
     public ZstdPaperChannelManager() {
         ZstdPaperConfig cfg = ZstdPaperConfig.INSTANCE;
-        this.compressCtx = new ZstdCompressCtx();
-        this.compressCtx.setLevel(cfg.level);
+        // ⚠️ 从租借池取，而不是每连接 new：level 3 下每个 ctx 约 650KiB 原生内存，
+        // 登录风暴时集中 malloc/free 会造成 RSS 尖峰与分配抖动（GC 管不到原生内存）。
+        // 池里归还的实例已被 reset 成"刚创建"的状态，因此下面必须重新设全部参数。
+        this.compressCtx = ZstdCtxPool.borrowCompress(cfg.level);
         this.compressCtx.setWindowLog(cfg.windowLog);
         this.compressCtx.setLong(1); // LDM：提升区块级长距离重复的压缩率
-        this.decompressCtx = new ZstdDecompressCtx();
+        this.decompressCtx = ZstdCtxPool.borrowDecompress();
         // 帧头精简必须与客户端一致（magicless / 无 contentSize / 无 dictID）
         this.compressCtx.setMagicless(true);
         this.compressCtx.setContentSize(false);
@@ -411,8 +414,9 @@ public class ZstdPaperChannelManager {
         // 标志即可安全放弃；顺序反了（先 close 后立标志）等于没防（详见 ZstdCompressLock 注释）。
         synchronized (compressLock) {
             compressLock.markClosed();
-            compressCtx.close();
-            decompressCtx.close();
+            // 归还而非关闭：池内部会 reset（清字典与参数），池满或已停用时才真正 close
+            ZstdCtxPool.returnCompress(compressCtx);
+            ZstdCtxPool.returnDecompress(decompressCtx);
         }
         ZstdPaperDictRegistry.Entry enc = encoderDictEntry;
         if (enc != null) {

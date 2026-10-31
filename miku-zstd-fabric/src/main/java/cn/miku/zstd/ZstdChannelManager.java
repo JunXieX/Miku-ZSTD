@@ -2,6 +2,7 @@ package cn.miku.zstd;
 
 import com.github.luben.zstd.ZstdCompressCtx;
 import com.github.luben.zstd.ZstdDecompressCtx;
+import mikumc.zstd.protocol.ZstdCtxPool;
 import io.netty.util.AttributeKey;
 import mikumc.zstd.protocol.ZstdCompressLock;
 import mikumc.zstd.protocol.ZstdNegotiateStatus;
@@ -74,11 +75,11 @@ public class ZstdChannelManager {
 
     public ZstdChannelManager() {
         ZstdConfig cfg = ZstdConfig.INSTANCE;
-        this.compressCtx = new ZstdCompressCtx();
-        this.compressCtx.setLevel(cfg.level);
+        // 上下文从租借池取（池内实例已 reset，参数需重设）
+        this.compressCtx = ZstdCtxPool.borrowCompress(cfg.level);
         this.compressCtx.setWindowLog(cfg.windowLog);
         this.compressCtx.setLong(1); // LDM：提升区块级长距离重复的压缩率
-        this.decompressCtx = new ZstdDecompressCtx();
+        this.decompressCtx = ZstdCtxPool.borrowDecompress();
         applySlimFrameFormat();
     }
 
@@ -165,15 +166,14 @@ public class ZstdChannelManager {
             encoderDictEntry = null;
             releaseQuietly(decoderDictEntry);
             decoderDictEntry = null;
-            // 清空装载状态：直接覆盖为无字典的新上下文（旧上下文在本锁内释放）
-            compressCtx.close();
-            decompressCtx.close();
+            // 清空装载状态：换一份干净上下文（旧的归还池，池内 reset 会清掉字典绑定）
+            ZstdCtxPool.returnCompress(compressCtx);
+            ZstdCtxPool.returnDecompress(decompressCtx);
             ZstdConfig cfg = ZstdConfig.INSTANCE;
-            compressCtx = new ZstdCompressCtx();
-            compressCtx.setLevel(cfg.level);
+            compressCtx = ZstdCtxPool.borrowCompress(cfg.level);
             compressCtx.setWindowLog(cfg.windowLog);
             compressCtx.setLong(1);
-            decompressCtx = new ZstdDecompressCtx();
+            decompressCtx = ZstdCtxPool.borrowDecompress();
             applySlimFrameFormat();
         }
     }
@@ -257,8 +257,9 @@ public class ZstdChannelManager {
         // 标志即可安全放弃；顺序反了（先 close 后立标志）等于没防（详见 ZstdCompressLock 注释）。
         synchronized (compressLock) {
             compressLock.markClosed();
-            this.compressCtx.close();
-            this.decompressCtx.close();
+            // 归还池（内部 reset 清字典）；池满/已停用时才真正 close
+            ZstdCtxPool.returnCompress(this.compressCtx);
+            ZstdCtxPool.returnDecompress(this.decompressCtx);
         }
         ZstdDictRegistry.Entry enc = encoderDictEntry;
         if (enc != null) {

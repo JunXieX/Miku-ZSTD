@@ -194,6 +194,29 @@ public final class ZstdVarInts {
         return fallback;
     }
 
+    /**
+     * {@link ByteBuf} 版本，带显式读取上限 {@code end}（相对 {@code buf} 的绝对索引）。
+     *
+     * <p>为什么需要显式上限：批缓冲是复用的 ByteBuf，其 {@code writerIndex} 可能比本帧的有效
+     * 长度更长，用 {@code readableBytes()} 会把上一批的残留字节读进来。</p>
+     */
+    public static int readOr(ByteBuf buf, int[] cursor, int fallback, int end) {
+        int pos = cursor[0];
+        int result = 0;
+        int shift = 0;
+        while (pos < end && shift <= 28) {
+            byte b = buf.getByte(pos++);
+            result |= (b & 0x7F) << shift;
+            if ((b & 0x80) == 0) {
+                cursor[0] = pos;
+                return result;
+            }
+            shift += 7;
+        }
+        cursor[0] = pos;
+        return fallback;
+    }
+
     /** 写 UTF-8 字符串（VarInt 长度前缀 + 字节）。 */
     public static void writeString(ByteBuf buf, String s) {
         byte[] bytes = s.getBytes(java.nio.charset.StandardCharsets.UTF_8);
