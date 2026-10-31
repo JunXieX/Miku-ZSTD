@@ -109,6 +109,12 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
      */
     private static final long MAX_PENDING_BYTES = 128L * 1024 * 1024;
 
+    /** 低于这个原始大小不切块：切了只会多摊块头，并行收益抵不过块头的带宽成本。 */
+    private static final int PARALLEL_MIN_BYTES = 256 * 1024;
+
+    /** 单帧最多切几块。 */
+    private static final int MAX_PARALLEL_BLOCKS = 4;
+
     private final List<ByteBuf> pending = new ArrayList<>();
     private final List<ChannelPromise> pendingPromises = new ArrayList<>();
     /** {@link #pending} 中 ByteBuf 的总可读字节数（仅 event loop 线程读写） */
@@ -168,6 +174,15 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
 
     /** 小包跳过压缩的阈值：低于该值直接直存，不调用 zstd */
     protected abstract int skipCompressThreshold(boolean hasCompressDict);
+
+    /** 压缩等级（分块并行时给每块配临时 ctx 用）。 */
+    protected abstract int configLevel();
+
+    /** 窗口日志（0 = 交给 zstd 按等级自动选）。 */
+    protected abstract int configWindowLog();
+
+    /** 本连接的压缩字典（可能为 null）。 */
+    protected abstract com.github.luben.zstd.ZstdDictCompress compressDict();
 
     /** 帧头是否写外层 {@code bodyLen}（服务端 true；客户端 false——prepender 负责） */
     protected abstract boolean writeBodyLen();
@@ -345,9 +360,14 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
 
         final int rawTotal;
         final ByteBuf raw;
+        final boolean rawTemporary;
         try {
             rawTotal = concatPending(batchPackets, ctx);
             raw = batchRaw; // 本批实际使用的缓冲：大帧是临时缓冲，必须捕获实例传给池线程
+            // ⚠️ 必须在这里就记下"是不是临时缓冲"：回调执行时 handlerRemoved 可能已经把
+            // rawBuf 释放并置 null，那时再比较 raw != rawBuf 会成立，导致对已被释放的
+            // 常驻缓冲二次 release（实测 IllegalReferenceCountException: refCnt 0）。
+            rawTemporary = raw != rawBuf;
             // 立刻摘掉字段引用：此后只有上面这个局部变量持有它。否则大帧（如进服阶段的
             // 注册表帧，几十 MB）会被字段一直留到下一批 —— 刚进服就挂机的连接会白占一份。
             batchRaw = null;
@@ -393,48 +413,14 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
         inflightPromises = promises;
         final ZstdCompressLock lock = compressLock();
 
+        int blocks = parallelBlocks(rawTotal);
         try {
-            ZstdCompressPool.execute(() -> {
-                final int produced;
-                ByteBuf dst = null;
-                try {
-                    // 与「换字典 / close」互斥：ctx 不是线程安全的，且可能已被释放
-                    synchronized (lock) {
-                        // ⚠️ 拿到锁之后再判一次：本任务可能在连接断开**之前**提交、
-                        // 在 close() 释放 native 上下文**之后**才轮到执行。此时必须直接放弃，
-                        // 绝不能碰 compressCtx（那是已释放的内存 → SIGSEGV，整进程崩）。
-                        // 判据必须在锁内读——见 ZstdCompressLock 的类注释。
-                        if (lock.isClosed()) {
-                            backToEventLoop(ctx, promises, new ClosedChannelException(),
-                                    0, null, raw, rawTotal, withBodyLen);
-                            return;
-                        }
-                        // raw 是本批捕获的实例（大帧是临时缓冲）；dst 走池化直存
-                        dst = ensureCompressDstCapacity(ctx, rawTotal);
-                        // 上下文必须每批重新取：客户端可能在重协商后换掉了它（见钩子注释）
-                        ZstdCompressCtx batchCtx = compressContextForBatch();
-                        if (batchCtx == null) {
-                            backToEventLoop(ctx, promises, new ClosedChannelException(),
-                                    0, null, raw, rawTotal, withBodyLen);
-                            return;
-                        }
-                        // ⚠️ 必须走 compressDirectByteBuffer：只有 direct 缓冲才免掉
-                        // JNI 侧的一次整批复制（堆数组要 memcpy 进 native 才能压）。
-                        // 第 3 个参数是"目标缓冲区可用空间"，必须传实际容量。
-                        // ⚠️ internalNioBuffer(index, length) 返回的是<b>独立视图</b>：
-                        // 它的 position=0、limit=length，所以偏移参数必须传 0 ——
-                        // 传 readerIndex 会被 checkFromIndexSize 判越界（或读到错误位置）。
-                        produced = batchCtx.compressDirectByteBuffer(
-                                dst.internalNioBuffer(0, dst.capacity()), 0, dst.capacity(),
-                                raw.internalNioBuffer(raw.readerIndex(), rawTotal),
-                                0, rawTotal);
-                    }
-                } catch (Throwable t) {
-                    backToEventLoop(ctx, promises, t, 0, null, raw, rawTotal, withBodyLen);
-                    return;
-                }
-                backToEventLoop(ctx, promises, null, produced, dst, raw, rawTotal, withBodyLen);
-            });
+            if (blocks <= 1) {
+                ZstdCompressPool.execute(() ->
+                        compressOneBlock(ctx, promises, raw, rawTotal, withBodyLen, lock, rawTemporary));
+            } else {
+                compressBlocksInParallel(ctx, promises, raw, rawTotal, withBodyLen, lock, blocks, rawTemporary);
+            }
         } catch (Throwable t) {
             // 池被关闭 / 线程创建失败：这批已经移出 pending 且 promises 已进 inflight，
             // 不在这里收尾就是"promise 永挂 + compressing 永久为真"（该连接之后再也发不出帧）。
@@ -445,52 +431,188 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
         }
     }
 
+    /**
+     * 分块数：小批次不切（切了反而多摊块头），只有大帧才值得并行。
+     *
+     * <p>上限取"池线程数"——块任务本身就跑在池里，超过线程数只会排队，
+     * 而每个排队任务都会白借一份原生 ctx。</p>
+     */
+    private int parallelBlocks(int rawTotal) {
+        if (rawTotal < PARALLEL_MIN_BYTES) {
+            return 1;
+        }
+        int bySize = rawTotal / PARALLEL_MIN_BYTES;
+        return Math.max(1, Math.min(Math.min(MAX_PARALLEL_BLOCKS, bySize), ZstdCompressPool.threads()));
+    }
+
+    /** 单块：小批次走这条（与分块前的行为逐字节等价，只是多了一个 blockCount=1）。 */
+    private void compressOneBlock(ChannelHandlerContext ctx, List<ChannelPromise> promises,
+                                  ByteBuf raw, int rawTotal, boolean withBodyLen,
+                                  ZstdCompressLock lock, boolean rawTemporary) {
+        Block block;
+        try {
+            synchronized (lock) {
+                if (lock.isClosed()) {
+                    backToEventLoop(ctx, promises, new ClosedChannelException(), null, raw, rawTotal, withBodyLen, rawTemporary);
+                    return;
+                }
+                ZstdCompressCtx useCtx = compressContextForBatch();
+                if (useCtx == null) {
+                    backToEventLoop(ctx, promises, new ClosedChannelException(), null, raw, rawTotal, withBodyLen, rawTemporary);
+                    return;
+                }
+                block = compressBlock(ctx, raw, 0, rawTotal, useCtx);
+            }
+        } catch (Throwable t) {
+            backToEventLoop(ctx, promises, t, null, raw, rawTotal, withBodyLen, rawTemporary);
+            return;
+        }
+        backToEventLoop(ctx, promises, null, new Block[]{block}, raw, rawTotal, withBodyLen, rawTemporary);
+    }
+
+    /**
+     * 大帧分块并行压缩。
+     *
+     * <p>每块独占一份原生 ctx（块之间不能共享，zstd ctx 非线程安全），按字节均分——
+     * 原始负载是 {@code [pktLen][pkt]...} 的连续字节，按任意字节切分，解压后顺序拼回即可。</p>
+     *
+     * <p>汇聚点放在"最后一个完成的块"上：主线程不再等待，避免池线程互等造成排队。</p>
+     */
+    private void compressBlocksInParallel(ChannelHandlerContext ctx, List<ChannelPromise> promises,
+                                          ByteBuf raw, int rawTotal, boolean withBodyLen,
+                                          ZstdCompressLock lock, int blocks, boolean rawTemporary) {
+        int per = (rawTotal + blocks - 1) / blocks;
+        Block[] results = new Block[blocks];
+        java.util.concurrent.atomic.AtomicInteger remaining =
+                new java.util.concurrent.atomic.AtomicInteger(blocks);
+        java.util.concurrent.atomic.AtomicReference<Throwable> failure =
+                new java.util.concurrent.atomic.AtomicReference<>();
+
+        for (int i = 0; i < blocks; i++) {
+            final int index = i;
+            final int offset = i * per;
+            final int length = Math.min(per, rawTotal - offset);
+            try {
+                ZstdCompressPool.execute(() -> {
+                    try {
+                        // ⚠️ 锁只用来"借 ctx 并绑字典"与判 closed，压缩本身必须在锁外：
+                        // 块并行用的是各块独立的临时 ctx，把它们整段放进连接的锁里
+                        // 会让所有块重新串行化，块并行就白做了。
+                        ZstdCompressCtx blockCtx;
+                        synchronized (lock) {
+                            if (lock.isClosed()) {
+                                throw new ClosedChannelException();
+                            }
+                            blockCtx = borrowBlockCtx();
+                        }
+                        try {
+                            results[index] = compressBlock(ctx, raw, offset, length, blockCtx);
+                        } finally {
+                            ZstdCtxPool.returnCompress(blockCtx);
+                        }
+                    } catch (Throwable t) {
+                        failure.compareAndSet(null, t);
+                    } finally {
+                        if (remaining.decrementAndGet() == 0) {
+                            backToEventLoop(ctx, promises, failure.get(), results, raw, rawTotal, withBodyLen, rawTemporary);
+                        }
+                    }
+                });
+            } catch (Throwable t) {
+                failure.compareAndSet(null, t);
+                // 提交被拒也可能是最后一个：不在这里兜底，promise 与 compressing 就永远悬着。
+                if (remaining.decrementAndGet() == 0) {
+                    backToEventLoop(ctx, promises, failure.get(), results, raw, rawTotal, withBodyLen, rawTemporary);
+                }
+            }
+        }
+    }
+
+    /** 借一份已按本连接参数配好的临时 ctx（并行块专用，用完必须归还）。 */
+    private ZstdCompressCtx borrowBlockCtx() {
+        ZstdCompressCtx c = ZstdCtxPool.borrowCompress(configLevel());
+        c.setWindowLog(configWindowLog());
+        c.setLong(1);
+        c.setMagicless(true);
+        c.setContentSize(false);
+        c.setDictID(false);
+        com.github.luben.zstd.ZstdDictCompress dict = compressDict();
+        if (dict != null) {
+            c.loadDict(dict);
+        }
+        return c;
+    }
+
+    /** 压一块。返回的 chunk 是池化缓冲，由调用方（或帧构建）释放。 */
+    private Block compressBlock(ChannelHandlerContext ctx, ByteBuf raw, int offset, int length,
+                               ZstdCompressCtx useCtx) {
+        ByteBuf dst = ctx.alloc().directBuffer(length + (length >>> 8) + 64);
+        try {
+            int produced = useCtx.compressDirectByteBuffer(
+                    dst.internalNioBuffer(0, dst.capacity()), 0, dst.capacity(),
+                    raw.internalNioBuffer(raw.readerIndex() + offset, length), 0, length);
+            dst.writerIndex(produced);
+            return new Block(length, dst);
+        } catch (Throwable t) {
+            dst.release();
+            throw t;
+        }
+    }
+
+    /** 一个块的压缩结果：原文长度 + 压缩后的 chunk。 */
+    private static final class Block {
+        final int rawLen;
+        final ByteBuf chunk;
+
+        Block(int rawLen, ByteBuf chunk) {
+            this.rawLen = rawLen;
+            this.chunk = chunk;
+        }
+    }
+
     /** 压缩完成后回到 event loop：组帧、写出、并立刻接手积压的下一批。 */
     private void backToEventLoop(ChannelHandlerContext ctx, List<ChannelPromise> promises,
-                                 Throwable failure, int produced, ByteBuf dst, ByteBuf raw,
-                                 int rawTotal, boolean withBodyLen) {
+                                 Throwable failure, Block[] blocks, ByteBuf raw,
+                                 int rawTotal, boolean withBodyLen, boolean rawTemporary) {
         ctx.executor().execute(() -> {
             compressing = false;
             inflightPromises = null;
-
-            if (removed) {
-                failAll(promises, new ClosedChannelException());
-                return;
-            } else if (failure != null) {
-                failAll(promises, failure);
-            } else if (!ctx.channel().isActive()) {
-                // 通道已关：结果无处可去，promise 也已由 channelInactive 失败化（tryFailure 幂等）
-                failAll(promises, new ClosedChannelException());
-                return;
-            } else {
-                try {
-                    boolean compressed = produced > 0 && produced < rawTotal;
-                    if (compressed) {
-                        writeFrame(ctx, buildCompressedFrame(ctx, dst, produced, rawTotal, withBodyLen), promises);
+            try {
+                if (removed) {
+                    failAll(promises, new ClosedChannelException());
+                } else if (failure != null) {
+                    failAll(promises, failure);
+                } else if (!ctx.channel().isActive()) {
+                    // 通道已关：结果无处可去，promise 也已由 channelInactive 失败化（tryFailure 幂等）
+                    failAll(promises, new ClosedChannelException());
+                } else {
+                    int wireTotal = 0;
+                    for (Block b : blocks) {
+                        wireTotal += b.chunk.readableBytes();
+                    }
+                    // 压缩无收益（压不动、或压缩后反而更大）时退回直存：直存帧与压缩帧
+                    // 逐字节不同形，对端靠 rawSize==0 分支识别，所以这条回退是协议内的。
+                    if (wireTotal > 0 && wireTotal < rawTotal) {
+                        writeFrame(ctx, buildCompressedFrame(ctx, blocks, rawTotal, withBodyLen), promises);
                     } else {
-                        // ⚠️ 压缩无收益（压不动、或压缩后反而更大）：退回直存。这里<b>必须</b>
-                        // 走与直存路径完全相同的一帧一包写法——旧实现在这种情况下写出的是
-                        // {@code [0][varint pktLen][pkt]...}，那条内层长度前缀会被对面包解码器
-                        // 当成包 id（Unknown packet → 断连），与 2026-10-19 的线上事故同型。
                         writeStoredFrames(ctx, raw, rawTotal, withBodyLen, promises);
                     }
-                } catch (Throwable t) {
-                    failAll(promises, t);
-                    LOGGER.error("[Zstd] encoder frame build failed", t);
                 }
-            }
-
-            // 大帧用的临时缓冲（不在字段里，池化分配器不会替我们回收）
-            if (raw != null && raw != rawBuf) {
-                raw.release();
-            }
-            if (dst != null && dst != dstBuf) {
-                dst.release();
-            }
-
-            // 压缩期间攒下的包：立刻接着发（不设 compressing 了，可以再走一轮）
-            if (!pending.isEmpty()) {
-                emitBatch(ctx);
+            } catch (Throwable t) {
+                failAll(promises, t);
+                LOGGER.error("[Zstd] encoder frame build failed", t);
+            } finally {
+                releaseBlocks(blocks);
+                // 大帧用的临时缓冲（不在字段里，池化分配器不会替我们回收）。
+                // 判据用成帧时记下的 rawTemporary：此处 rawBuf 可能已被 handlerRemoved 释放。
+                if (rawTemporary && raw != null) {
+                    raw.release();
+                }
+                // 压缩期间攒下的包：立刻接着发（不设 compressing 了，可以再走一轮）。
+                // handler 已移除时不能再碰 pipeline。
+                if (!removed && !pending.isEmpty()) {
+                    emitBatch(ctx);
+                }
             }
         });
     }
@@ -580,6 +702,17 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
         ctx.flush();
     }
 
+    private static void releaseBlocks(Block[] blocks) {
+        if (blocks == null) {
+            return;
+        }
+        for (Block b : blocks) {
+            if (b != null) {
+                b.chunk.release();
+            }
+        }
+    }
+
     private static void failAll(List<ChannelPromise> promises, Throwable cause) {
         for (ChannelPromise p : promises) {
             p.tryFailure(cause);
@@ -656,18 +789,35 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
      * 压缩帧：{@code [bodyLen?][rawSize>0][zstd(payload)]}，
      * {@code payload} 保持批格式 {@code [varint pktLen][pkt]...}（多包合批只发生在这里）。
      */
-    private ByteBuf buildCompressedFrame(ChannelHandlerContext ctx, ByteBuf dst,
-                                         int outLen, int rawTotal, boolean withBodyLen) {
+    /**
+     * 压缩帧：{@code [bodyLen?][rawSize][blockCount]} + 每块 {@code [blockRawLen][chunkLen][chunk]}。
+     *
+     * <p>单块（blockCount=1）与分块并行共用同一格式，解码端无需区分。每块自带原文长度，
+     * 是因为 zstd 帧头里的 contentSize 被关掉了（省字节），没有它就不知道该解出多少。</p>
+     */
+    private ByteBuf buildCompressedFrame(ChannelHandlerContext ctx, Block[] blocks,
+                                         int rawTotal, boolean withBodyLen) {
+        int payloadLen = 0;
+        for (Block b : blocks) {
+            payloadLen += ZstdVarInts.length(b.rawLen) + ZstdVarInts.length(b.chunk.readableBytes())
+                    + b.chunk.readableBytes();
+        }
+        int innerLen = ZstdVarInts.length(rawTotal) + ZstdVarInts.length(blocks.length) + payloadLen;
+
         ByteBuf frame;
         if (withBodyLen) {
-            int bodyLen = ZstdVarInts.length(rawTotal) + outLen;
-            frame = ctx.alloc().directBuffer(ZstdVarInts.length(bodyLen) + bodyLen);
-            ZstdVarInts.write(frame, bodyLen);
+            frame = ctx.alloc().directBuffer(ZstdVarInts.length(innerLen) + innerLen);
+            ZstdVarInts.write(frame, innerLen);
         } else {
-            frame = ctx.alloc().directBuffer(ZstdVarInts.length(rawTotal) + outLen);
+            frame = ctx.alloc().directBuffer(innerLen);
         }
         ZstdVarInts.write(frame, rawTotal);
-        frame.writeBytes(dst, dst.readerIndex(), outLen);
+        ZstdVarInts.write(frame, blocks.length);
+        for (Block b : blocks) {
+            ZstdVarInts.write(frame, b.rawLen);
+            ZstdVarInts.write(frame, b.chunk.readableBytes());
+            frame.writeBytes(b.chunk, b.chunk.readerIndex(), b.chunk.readableBytes());
+        }
         ensureFrameFitsMcLimit(frame, rawTotal);
         onFrame(1 + rawTotal, frame.readableBytes(), true);
         return frame;

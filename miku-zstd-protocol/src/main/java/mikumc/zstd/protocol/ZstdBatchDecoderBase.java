@@ -130,6 +130,12 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
      *
      * @return 解压上下文；{@code null} 表示该连接不可用（收到帧时会 fail-fast）
      */
+    /** 单帧最多允许多少块（并行压缩上限的兜底，防止对端声明一个巨大的块数）。 */
+    protected static final int MAX_BLOCK_COUNT = 64;
+
+    /** 块头的最大开销：{@code blockCount} 加每块两个 varint（各 5 字节）。 */
+    protected static final int MAX_BLOCK_HEADER_BYTES = 5 + MAX_BLOCK_COUNT * 10;
+
     protected abstract ZstdDecompressCtx resolveDecompressContext(ChannelHandlerContext ctx);
 
     /**
@@ -295,8 +301,10 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
             return;
         }
 
-        if (remaining > rawSize) {
-            protocolError(ctx, "compressed size " + remaining + " > declared rawSize " + rawSize);
+        // 压缩帧现在含"块数 + 每块的 (rawLen, chunkLen)"头，所以允许比 rawSize 略大：
+        // 不可压缩数据压出来几乎等于原文，块头会把总量顶过 rawSize。
+        if (remaining > rawSize + MAX_BLOCK_HEADER_BYTES) {
+            protocolError(ctx, "compressed size " + remaining + " >> declared rawSize " + rawSize);
             return;
         }
 
@@ -309,18 +317,38 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
             return;
         }
 
-        byte[] src = acquireScratch(remaining);
-        in.getBytes(in.readerIndex(), src, 0, remaining);
+        // 协议 v6：rawSize 之后是 blockCount，其后逐块 [blockRawLen][chunkLen][chunk]。
+        int blockCount = ZstdVarInts.tryRead(in, MAX_BLOCK_COUNT);
+        if (blockCount <= 0) {
+            protocolError(ctx, "illegal blockCount in frame header (rawSize=" + rawSize + ")");
+            return;
+        }
 
         ZstdDecompressCtx dctx = decompressContextForFrame();
         if (dctx == null) {
             protocolError(ctx, "decompress context unavailable");
             return;
         }
+
+        byte[] data = new byte[rawSize];
+        int off = 0;
         try {
-            byte[] data = dctx.decompress(src, 0, remaining, rawSize);
+            for (int i = 0; i < blockCount; i++) {
+                int blockRaw = ZstdVarInts.tryRead(in, rawSize);
+                int chunkLen = ZstdVarInts.tryRead(in, in.readableBytes());
+                if (blockRaw <= 0 || chunkLen <= 0
+                        || blockRaw > rawSize - off || chunkLen > in.readableBytes()) {
+                    protocolError(ctx, "illegal block " + i + " (blockRaw=" + blockRaw
+                            + ", chunk=" + chunkLen + ", left=" + (rawSize - off) + ")");
+                    return;
+                }
+                byte[] chunk = acquireScratch(chunkLen);
+                in.readBytes(chunk, 0, chunkLen);
+                byte[] block = dctx.decompress(chunk, 0, chunkLen, blockRaw);
+                System.arraycopy(block, 0, data, off, blockRaw);
+                off += blockRaw;
+            }
             sawZstdFrame = true;
-            in.skipBytes(remaining);
             onCompressedFrame(remaining, data.length);
             onDecodedPayload(data); // 采样（data 为本帧独占数组，可安全持有）
             splitAndEmit(ctx, data, out);

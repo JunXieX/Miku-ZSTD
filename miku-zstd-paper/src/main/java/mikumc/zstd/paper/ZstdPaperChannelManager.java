@@ -128,6 +128,12 @@ public class ZstdPaperChannelManager {
     }
 
     /** 压缩方向是否已装载字典（编码器据此选小包跳过阈值）。 */
+    /** 当前装载的压缩字典（分块并行时给临时 ctx 绑定用）；未装载返回 null。 */
+    public com.github.luben.zstd.ZstdDictCompress compressDict() {
+        ZstdPaperDictRegistry.Entry e = encoderDictEntry;
+        return e == null ? null : e.compressDict();
+    }
+
     public boolean hasCompressDict() {
         return encoderDictEntry != null;
     }

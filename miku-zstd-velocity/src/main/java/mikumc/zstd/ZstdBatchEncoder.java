@@ -54,6 +54,22 @@ public class ZstdBatchEncoder extends ZstdBatchEncoderBase {
 
     /** Velocity 无 frame-encoder：外层 bodyLen 由本编码器写。 */
     @Override
+    protected int configLevel() {
+        return ZstdVelocityConfig.INSTANCE.level;
+    }
+
+    @Override
+    protected int configWindowLog() {
+        return ZstdVelocityConfig.INSTANCE.windowLog;
+    }
+
+    @Override
+    protected com.github.luben.zstd.ZstdDictCompress compressDict() {
+        ZstdChannelManager m = manager;
+        return m == null ? null : m.compressDict();
+    }
+
+    @Override
     protected boolean writeBodyLen() {
         return true;
     }
