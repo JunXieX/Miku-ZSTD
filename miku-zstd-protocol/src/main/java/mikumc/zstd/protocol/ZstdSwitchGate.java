@@ -111,6 +111,16 @@ public final class ZstdSwitchGate extends ChannelDuplexHandler {
     private volatile boolean confirmed;
     private io.netty.util.concurrent.ScheduledFuture<?> scheduled;
 
+    /**
+     * 收到"未确认"应答后的延迟放行任务。
+     *
+     * <p>⚠️ 不能收到就放行：MC 客户端对<b>未注册 channel</b> 的 {@code LoginPluginRequest}
+     * 会<b>自动</b>回一条 {@code success=false} 的空应答，而我们的帧层嗅探器随后还会回一条
+     * 带魔数的真确认（切换在客户端 event loop 上完成）。若拿到前一条就放行，客户端可能
+     * 还没切完，首个 zstd 帧就解不开 —— 这是 5.0.6 实机掉线的直接成因。</p>
+     */
+    private io.netty.util.concurrent.ScheduledFuture<?> delayedRelease;
+
     /** 本处理器在管线中的上下文（handlerAdded 时记录）。 */
     private volatile ChannelHandlerContext selfCtx;
 
@@ -165,7 +175,18 @@ public final class ZstdSwitchGate extends ChannelDuplexHandler {
             LOGGER.info("[Zstd] 客户端未回切换确认（不带魔数的应答）——旧版模组的正常行为，"
                     + "服务端已放行扣住的包；本条只提示一次");
         }
-        release();
+        // ⚠️ 延迟放行，不等这个空应答立刻放开：新客户端（延迟切换 / 或嗅探器还没跑完）
+        // 会在随后回一条带魔数的真确认；200ms 足够它到达，而旧客户端只多等 200ms。
+        // 真确认到达时 release() 会取消这个延迟任务并立即放行。
+        ChannelHandlerContext gateCtx = selfCtx;
+        if (gateCtx != null) {
+            if (delayedRelease == null) {
+                delayedRelease = gateCtx.executor().schedule(this::release, 200,
+                        TimeUnit.MILLISECONDS);
+            }
+        } else {
+            release();
+        }
         return true;
     }
 
@@ -251,6 +272,10 @@ public final class ZstdSwitchGate extends ChannelDuplexHandler {
         if (scheduled != null) {
             scheduled.cancel(false);
             scheduled = null;
+        }
+        if (delayedRelease != null) {
+            delayedRelease.cancel(false);
+            delayedRelease = null;
         }
         if (ctx != null) {
             flushHeld(ctx, heldSnapshot, promiseSnapshot);
