@@ -496,11 +496,18 @@ public class ZstdHijacker extends ChannelDuplexHandler {
                 // ⚠️ 这句日志必须能自证"卡在哪一步"：只写"超时"无法区分
                 //「协商应答就没收到」与「协商应答收到了、字典也推了，但字典应答没回来」，
                 // 而两者的排查方向完全相反（前者看客户端有没有收到查询，后者看推送有没有被接受）。
-                LOGGER.warn("[Zstd] Negotiate response not received after {}ms — skipping zstd (vanilla fallback)"
+                LOGGER.warn("[Zstd] Negotiate response not received after {}ms — closing connection"
                                 + "（字典已请求={} 字典已确认={}；字典已请求=false 表示连协商应答都没收到）",
                         RESPONSE_RETRY_MS * maxRetries,
                         mgr.isDictRequested(), mgr.isDictConfirmed());
-                giveUp(ctx); // 回落原版：补发扣下的包 + 摘掉自身
+                // ⚠️ 完全没应答只可能是异常（原版客户端也会回 success=false 走 isProtocolMismatch）。
+                // 按原版补发扣包时，对端若其实是模组客户端（应答丢了），它已切 zstd → 必断连。
+                // 明确关连接，让客户端重连一次，故障也更可见。
+                releaseHeld(ctx);
+                ctx.channel().close();
+                if (ctx.pipeline().get(ZstdHijacker.class) != null) {
+                    ctx.pipeline().remove(this);
+                }
                 return;
             }
             channel.eventLoop().schedule(() -> tryActivate(ctx, attempt + 1),

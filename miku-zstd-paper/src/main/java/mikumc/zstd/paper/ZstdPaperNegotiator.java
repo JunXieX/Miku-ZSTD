@@ -409,9 +409,15 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
             // 详见 DICT_MAX_RETRIES 的注释。
             int maxRetries = mgr.isDictRequested() ? DICT_MAX_RETRIES : MAX_RETRIES;
             if (attempt >= maxRetries) {
-                LOGGER.warn("[Zstd] no negotiate response within {}ms — staying vanilla",
+                // ⚠️ 完全没应答只可能是异常：原版客户端也会回一条 success=false 的应答
+                //（走 isRefused 分支立即回落，不会走到这里）。所以这里不能"按原版补发扣包" ——
+                // 对端若其实是模组客户端（只是应答丢了），它已经切到 zstd，补发即断连；
+                // 明确关连接让客户端重连一次，故障可见且不会出现"单侧 zstd"的诡异状态。
+                LOGGER.warn("[Zstd] no negotiate response within {}ms — closing connection so the client can retry",
                         RETRY_MS * maxRetries);
-                finishVanilla(ctx); // 明确回落：补发扣包并自移除
+                releaseHeld(ctx);
+                ctx.channel().close();
+                retire(ctx);
                 return;
             }
             channel.eventLoop().schedule(() -> tryActivate(ctx, attempt + 1), RETRY_MS, TimeUnit.MILLISECONDS);

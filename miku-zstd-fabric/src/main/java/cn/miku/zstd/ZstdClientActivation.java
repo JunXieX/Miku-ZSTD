@@ -78,13 +78,20 @@ public final class ZstdClientActivation {
         if (channel == null) return;
         channel.eventLoop().execute(() -> {
             if (!channel.isActive()) return;
+            // ⚠️ 必须<b>立即切换</b>，不能等服务端的 zstd:switch：
+            // 服务端在收到协商应答后就激活并按 zstd 发帧；若本端等到 switch 才切，
+            // 只要那条 switch 帧没被识别（嗅探器锚点缺失、第三方压缩层、旧版服务端
+            // 不发 switch），本端就会回 success=false 并停在原版 ——
+            // 服务端此时已提交到 zstd，只能"放行扣包"，两边帧格式对不上即断连。
+            // 实测（Velocity + 5.0.6 客户端）就是这个路径。
             if (deactivateIfStale(channel)) return;
             ChannelPipeline p = channel.pipeline();
             removeStaleVanillaHandlers(p);
-            // 嗅探器必须位于 decompress 之前：它处理的是帧（ByteBuf），
-            // 放在包层收不到、且裸询问会被原版压缩解码器丢弃。
+            activateInEventLoop(channel, false, 0);
+            // 切换嗅探器仍要装：它负责把"已切换"的确认（带魔数）回给服务端的闸门，
+            // 让服务端立刻放行扣住的登录包，而不是干等 5 秒超时。
             installSwitchSniffer(p);
-            LOGGER.debug("[Zstd] client armed for switch handshake; pipeline={}", p.names());
+            LOGGER.debug("[Zstd] client activated + armed for switch confirm; pipeline={}", p.names());
         });
     }
 
