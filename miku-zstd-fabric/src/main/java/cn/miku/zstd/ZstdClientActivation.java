@@ -76,7 +76,22 @@ public final class ZstdClientActivation {
      */
     public static void prepareForSwitch(Channel channel) {
         if (channel == null) return;
-        channel.eventLoop().execute(() -> {
+        // ⚠️ 必须在<b>当前线程</b>就切换：本方法由 {@code setupCompression} 的 TAIL 调用，
+        // 那一刻本来就在 event loop 上。旧实现无条件 {@code eventLoop().execute(...)}，
+        // 等于把切换排到下一轮事件循环 —— 而服务端的 zstd:switch 帧（以及 MC 对未注册
+        // channel 自动回的 success=false 空应答）可能先一步到达：
+        //   服务端收到 success=false → 立即放行扣住的登录包（zstd 编码）
+        //   而本端切换任务还没跑 → 仍按原版解 → 首帧即失败断连。
+        // 这就是 5.0.6 实机掉线的时序（与客户端版本新旧无关）。
+        if (channel.eventLoop().inEventLoop()) {
+            prepareNow(channel);
+            return;
+        }
+        channel.eventLoop().execute(() -> prepareNow(channel));
+    }
+
+    private static void prepareNow(Channel channel) {
+        {
             if (!channel.isActive()) return;
             // ⚠️ 必须<b>立即切换</b>，不能等服务端的 zstd:switch：
             // 服务端在收到协商应答后就激活并按 zstd 发帧；若本端等到 switch 才切，
@@ -92,7 +107,7 @@ public final class ZstdClientActivation {
             // 让服务端立刻放行扣住的登录包，而不是干等 5 秒超时。
             installSwitchSniffer(p);
             LOGGER.debug("[Zstd] client activated + armed for switch confirm; pipeline={}", p.names());
-        });
+        }
     }
 
     /**

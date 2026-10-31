@@ -87,6 +87,15 @@ class ZstdSwitchGateTest {
         // （txId 未设置 → 不校验）
         assertTrue(gate.releaseUnconfirmed(0));
 
+        // ⚠️ 现在是**延迟**放行（200ms，给"带魔数的真确认"留窗口，见 releaseUnconfirmed 的注释），
+        // 断言前必须等定时任务到期 —— 旧实现是立即 release，这里曾直接断言过。
+        try {
+            Thread.sleep(250);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        ch.runScheduledPendingTasks();
+
         assertNull(ch.pipeline().get(ZstdSwitchGate.class), "放行后必须自移除");
         assertEquals(12, ((FakeMinecraftPacket) ch.readOutbound()).id, "扣住的包必须补发");
         assertTrue(gate.isConfirmed(), "服务端已提交到 zstd：窗口到此结束");
