@@ -97,7 +97,17 @@ public final class ZstdSwitchGate extends ChannelDuplexHandler {
 
     private final List<Object> held = new ArrayList<>();
     private final List<ChannelPromise> heldPromises = new ArrayList<>();
-    private boolean released;
+
+    /**
+     * 保护 {@link #held} / {@link #heldPromises} 与 {@link #released}。
+     *
+     * <p>⚠️ 扣包发生在<b>写包线程</b>（Paper 主线程；Folia 上是 global region 或区域线程），
+     * 而释放发生在 netty eventLoop（确认嗅探器、超时任务）或管线重建线程。
+     * 没有这把锁时，释放瞬间仍在 {@code add} 的包会掉出快照 —— 既没被发出、也没被释放，
+     * 客户端因此缺包；缺的是登录期关键包时，表现就是「激活日志之后连接直接断开」。</p>
+     */
+    private final Object heldLock = new Object();
+    private volatile boolean released;
     private volatile boolean confirmed;
     private io.netty.util.concurrent.ScheduledFuture<?> scheduled;
 
@@ -161,7 +171,9 @@ public final class ZstdSwitchGate extends ChannelDuplexHandler {
 
     /** 扣住的包数（诊断用）。 */
     public int heldCount() {
-        return held.size();
+        synchronized (heldLock) {
+            return held.size();
+        }
     }
 
     @Override
@@ -176,12 +188,19 @@ public final class ZstdSwitchGate extends ChannelDuplexHandler {
 
     @Override
     public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) {
-        if (released || !mustHold(msg)) {
-            ctx.write(msg, promise);
-            return;
+        boolean pass;
+        synchronized (heldLock) {
+            pass = released || !mustHold(msg);
+            if (!pass) {
+                held.add(msg);
+                heldPromises.add(promise);
+            }
         }
-        held.add(msg);
-        heldPromises.add(promise);
+        // 放行放在锁外：写操作会一路走到 netty 的 outbound buffer，持锁会让写线程与
+        // 释放线程互相等待。
+        if (pass) {
+            ctx.write(msg, promise);
+        }
     }
 
     /**
@@ -202,18 +221,26 @@ public final class ZstdSwitchGate extends ChannelDuplexHandler {
      * 因为"服务端已提交到 zstd"是这四种情形的共同结论（详见类注释）。</p>
      */
     private void release() {
-        if (released) return;
-        released = true;
-        confirmed = true;
+        List<Object> heldSnapshot;
+        List<ChannelPromise> promiseSnapshot;
+        ChannelHandlerContext ctx = selfCtx;
+        synchronized (heldLock) {
+            if (released) return;
+            released = true;
+            confirmed = true;
+            heldSnapshot = new ArrayList<>(held);
+            promiseSnapshot = new ArrayList<>(heldPromises);
+            held.clear();
+            heldPromises.clear();
+        }
         if (scheduled != null) {
             scheduled.cancel(false);
             scheduled = null;
         }
-        ChannelHandlerContext ctx = selfCtx;
         if (ctx != null) {
-            flushHeld(ctx);
+            flushHeld(ctx, heldSnapshot, promiseSnapshot);
         } else {
-            releaseAll();
+            releaseAll(heldSnapshot, promiseSnapshot);
         }
         if (ctx != null) {
             try {
@@ -227,7 +254,7 @@ public final class ZstdSwitchGate extends ChannelDuplexHandler {
         }
     }
 
-    private void flushHeld(ChannelHandlerContext ctx) {
+    private void flushHeld(ChannelHandlerContext ctx, List<Object> held, List<ChannelPromise> heldPromises) {
         if (held.isEmpty()) return;
         // ⚠️ 判据只能用"连接是否还活跃"。handlerRemoved() 被调用时本处理器<b>已经</b>从管线
         // 解链，{@code pipeline().context(this) != null} 必然为 false —— 那样会让"插件卸载 /
@@ -249,20 +276,16 @@ public final class ZstdSwitchGate extends ChannelDuplexHandler {
                 failQuietly(p);
             }
         }
-        held.clear();
-        heldPromises.clear();
         if (deliverable) {
             ctx.flush();
         }
     }
 
-    private void releaseAll() {
+    private void releaseAll(List<Object> held, List<ChannelPromise> heldPromises) {
         for (int i = 0; i < held.size(); i++) {
             ReferenceCountUtil.release(held.get(i));
             failQuietly(heldPromises.get(i));
         }
-        held.clear();
-        heldPromises.clear();
     }
 
     /**
@@ -287,22 +310,23 @@ public final class ZstdSwitchGate extends ChannelDuplexHandler {
         // 扣住的包按当前管道补发，并标记"已提交"。这里<b>绝不</b>改动管线（原版处理器
         // 实例已无法重新插入，见类注释），否则只会抛一条吓人的 ChannelPipelineException。
         //
-        // ⚠️ 若已确认（正常放行后自移除），released 已为 true，此处不会再做事。
-        if (!released) {
+        // ⚠️ 取快照与清空必须在一把锁内完成：写包线程可能正在 add，漏掉的包既发不出去也
+        // 不会被释放（引用计数泄漏 + 客户端缺包）。
+        List<Object> heldSnapshot;
+        List<ChannelPromise> promiseSnapshot;
+        synchronized (heldLock) {
+            heldSnapshot = new ArrayList<>(held);
+            promiseSnapshot = new ArrayList<>(heldPromises);
+            held.clear();
+            heldPromises.clear();
             released = true;
             confirmed = true;
-            if (scheduled != null) {
-                scheduled.cancel(false);
-                scheduled = null;
-            }
-            flushHeld(selfCtx != null ? selfCtx : ctx);
-            return;
         }
         if (scheduled != null) {
             scheduled.cancel(false);
             scheduled = null;
         }
-        flushHeld(ctx);
+        flushHeld(selfCtx != null ? selfCtx : ctx, heldSnapshot, promiseSnapshot);
     }
 
     /**

@@ -49,7 +49,20 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
      */
     private static final int DICT_MAX_RETRIES = 100;
 
-    private boolean holding;
+    /**
+     * 是否处于「已看到 SetCompression、尚未完成激活」的扣包窗口。
+     *
+     * <p>⚠️ {@code volatile} + {@link #holdLock}：写包线程与激活线程不是同一个。
+     * Paper 上写包基本集中在主线程，Folia 上则分布在 global region 与各区域线程，
+     * 而 {@code tryActivate} / {@code releaseHeld} 跑在 netty eventLoop。
+     * 非 volatile 时 eventLoop 可能读不到写线程刚置位的值 —— 于是 SetCompression 之后
+     * 的包会以<b>原版 zlib</b> 发出；而客户端在收到 SetCompression 时就已切到 zstd，
+     * 这一帧必然解码失败、连接立即断开（表现为 activated 日志后 1 秒内 Disconnected）。</p>
+     */
+    private volatile boolean holding;
+
+    /** 保护 {@link #holding} 的迁移与两个扣包列表：写线程与 eventLoop 线程都会碰。 */
+    private final Object holdLock = new Object();
     private final List<Object> heldPackets = new ArrayList<>();
     private final List<ChannelPromise> heldPromises = new ArrayList<>();
 
@@ -253,24 +266,32 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
             return;
         }
 
-        if (!holding && isPacket(msg)
-                && msg.getClass().getSimpleName().contains("ClientboundLoginCompression")) {
-            sendNegotiate(ctx); // 兜底
-            holding = true;
+        // ⚠️ 判定与扣包必须在同一把锁内完成，且要先置 holding 再写 SetCompression：
+        // 否则并发的写线程可能在「SetCompression 已写出、holding 只对本题线程可见」的缝里
+        // 把后续包按原版 zlib 发出去 —— 客户端此时已切 zstd，收到即解码失败断开。
+        boolean startHold = false;
+        boolean held = false;
+        synchronized (holdLock) {
+            if (!holding && isPacket(msg)
+                    && msg.getClass().getSimpleName().contains("ClientboundLoginCompression")) {
+                holding = true;
+                startHold = true;
+            } else if (holding && isPacket(msg)) {
+                // ⚠️ 只扣 MC 包：管道里还会流经 netty 自身的控制消息（协议阶段切换用的 Runnable），
+                // 扣住它会阻塞 LOGIN→CONFIGURATION 切换且日志无异常。
+                heldPackets.add(msg);
+                heldPromises.add(promise);
+                held = true;
+            }
+        }
+
+        if (startHold) {
+            sendNegotiate(ctx); // 兜底（写操作放在锁外，避免持锁进 netty）
             super.write(ctx, msg, promise);
             ctx.channel().eventLoop().execute(() -> tryActivate(ctx, 0));
             return;
         }
-
-        if (holding) {
-            // ⚠️ 只扣 MC 包：管道里还会流经 netty 自身的控制消息（协议阶段切换用的 Runnable），
-            // 扣住它会阻塞 LOGIN→CONFIGURATION 切换且日志无异常。
-            if (isPacket(msg)) {
-                heldPackets.add(msg);
-                heldPromises.add(promise);
-                return;
-            }
-            super.write(ctx, msg, promise);
+        if (held) {
             return;
         }
 
@@ -415,7 +436,8 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
             return;
         }
         mgr.setReplaced(true); // 计数已内聚在 setReplaced 内（幂等，避免重复 +1）
-        LOGGER.info("[Zstd] zstd transport activated on Paper");
+        LOGGER.info("[Zstd] zstd transport activated on {}", MikuZstdPaper.platformName());
+        LOGGER.debug("[Zstd] activation pipeline: {}", channel.pipeline().names());
 
         // ⚠️ 闸门此刻正扣着登录期的大帧（例如 LoginSuccess 压缩帧）。客户端在收到它之前
         // 不可能完成登录，也就没有任何东西会触发它的切换 —— 必须主动补一条"服务端已就绪"。
@@ -454,12 +476,17 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
     }
 
     private void releaseHeld(ChannelHandlerContext ctx) {
-        holding = false;
-        if (heldPackets.isEmpty()) return;
-        List<Object> packets = new ArrayList<>(heldPackets);
-        List<ChannelPromise> promises = new ArrayList<>(heldPromises);
-        heldPackets.clear();
-        heldPromises.clear();
+        List<Object> packets;
+        List<ChannelPromise> promises;
+        // 取快照与清空在同一把锁内，写操作放到锁外：持锁进 netty 会与写线程互相等。
+        synchronized (holdLock) {
+            holding = false;
+            if (heldPackets.isEmpty()) return;
+            packets = new ArrayList<>(heldPackets);
+            promises = new ArrayList<>(heldPromises);
+            heldPackets.clear();
+            heldPromises.clear();
+        }
         LOGGER.debug("[Zstd] releasing {} packet(s) held during activation window", packets.size());
         for (int i = 0; i < packets.size(); i++) {
             ctx.write(packets.get(i), promises.get(i));
@@ -493,20 +520,26 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
 
     /** 销毁收尾（幂等）：释放扣住的包并失败化其 promise。列表清空后重复调用无副作用。 */
     private void releaseHeldOnTeardown() {
-        holding = false;
+        List<Object> packets;
+        List<ChannelPromise> promises;
+        synchronized (holdLock) {
+            holding = false;
+            packets = new ArrayList<>(heldPackets);
+            promises = new ArrayList<>(heldPromises);
+            heldPackets.clear();
+            heldPromises.clear();
+        }
         // ⚠️ 先把包本身 release 掉：它们是 ReferenceCounted 的（内部持有 ByteBuf），
         // 扣下时所有权已转到本处理器；既然永远不会被写出，就没有别人替我们释放。
-        for (Object p : heldPackets) {
+        for (Object p : packets) {
             io.netty.util.ReferenceCountUtil.release(p);
         }
-        heldPackets.clear();
-        if (!heldPromises.isEmpty()) {
+        if (!promises.isEmpty()) {
             LOGGER.debug("[Zstd] negotiator torn down with {} held packet(s) — failing their promises",
-                    heldPromises.size());
-            for (ChannelPromise p : heldPromises) {
+                    promises.size());
+            for (ChannelPromise p : promises) {
                 p.tryFailure(new java.nio.channels.ClosedChannelException());
             }
-            heldPromises.clear();
         }
     }
 
