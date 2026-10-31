@@ -111,20 +111,24 @@ Typical combinations:
 | | Requirement |
 |---|---|
 | Proxy | Velocity 4.x |
-| Server | Paper 26.2+ |
+| Server | Paper 26.2+ / Folia 26.2+ |
 | Client | Fabric, Minecraft 26.2+ |
 | Java | 25+ |
 
 | | 要求 |
 |---|---|
 | 代理 | Velocity 4.x |
-| 服务端 | Paper 26.2+ |
+| 服务端 | Paper 26.2+ / Folia 26.2+ |
 | 客户端 | Fabric，Minecraft 26.2+ |
 | Java | 25+ |
 
 Paper extra requirement: `network-compression-threshold` in `server.properties` must be 0 or higher, and 256 is recommended. This plugin replaces rather than stacks on top of vanilla compression, so there is no double CPU cost. If that value is set to -1 (vanilla compression disabled), the plugin disables itself and logs a warning; joining is not affected.
 
 Paper 端额外要求：`server.properties` 的 `network-compression-threshold` 必须 ≥ 0（推荐 256）。本插件是替换而非叠加原版压缩，因此不会带来双份 CPU 开销。若该值设为 -1（关闭原版压缩），插件会因缺少切换信号而自动停用并打 WARN —— 不影响正常进服。
+
+Folia: the same jar works unchanged — no separate build, no extra configuration. Folia has no main thread, so every scheduled action goes through the region schedulers: the connect hook uses `GlobalRegionScheduler`, and the BossBar refresh is bound to the player's own `EntityScheduler` (it keeps landing on the owning region thread after teleports and world changes). `folia-supported: true` is declared in `paper-plugin.yml`; without it Folia refuses to load the plugin.
+
+Folia 端：同一个 jar 直接可用，不需要单独的构建产物或额外配置。Folia 没有主线程，插件的定时动作全部走区域调度器 —— 连接挂钩用 `GlobalRegionScheduler`，BossBar 刷新绑在玩家自己的 `EntityScheduler` 上（玩家传送、换世界后仍然落在拥有他的区域线程）；`paper-plugin.yml` 里已声明 `folia-supported: true`，缺少该声明时 Folia 根本不会加载本插件。
 
 ---
 

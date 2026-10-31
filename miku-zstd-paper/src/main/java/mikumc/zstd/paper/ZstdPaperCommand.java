@@ -60,6 +60,12 @@ public final class ZstdPaperCommand implements BasicCommand {
 
         int threshold = ZstdPaperCommandSupport.readCompressionThreshold();
         sender.sendMessage("§e── 环境 ──");
+        // 平台一行是排查"任务为什么没跑"的第一判据：Paper 上所有调度都在主线程，
+        // Folia 上则按区域/实体分派，同一个秒级任务在两边的触发时机完全不同。
+        sender.sendMessage("§7  服务端: §b" + MikuZstdPaper.platformName()
+                + (MikuZstdPaper.isFolia()
+                        ? "§7（区域化多线程：BossBar 任务绑玩家实体）"
+                        : "§7（单主线程）"));
         sender.sendMessage(threshold < 0
                 ? "§c  原版压缩阈值 = " + threshold + "（已关闭）→ 本插件会自动停用"
                 : "§a  原版压缩阈值 = " + threshold + " → zstd 可接管");

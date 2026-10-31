@@ -3,6 +3,8 @@ package mikumc.zstd.paper;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelInitializer;
+import io.papermc.paper.ServerBuildInfo;
+import net.kyori.adventure.key.Key;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -70,8 +72,12 @@ public class MikuZstdPaper extends JavaPlugin {
 
         ZstdPaperTrainer.init(getDataFolder().toPath());
         ZstdCompressPool.init(ZstdPaperConfig.INSTANCE.compressThreads, 5);
-        // onEnable 阶段 MC 的监听通道通常还没建立，等服务器就绪后再挂钩
-        getServer().getScheduler().runTask(this, this::installHook);
+        // onEnable 阶段 MC 的监听通道通常还没建立，等服务器就绪后再挂钩。
+        // ⚠️ 这里不能用 BukkitScheduler：Folia 上 Bukkit.getScheduler() 直接抛
+        // UnsupportedOperationException（BukkitScheduler 建立在"唯一主线程"这个前提上，Folia 没有该前提）。
+        // GlobalRegionScheduler 在 Paper 上等价于主线程、在 Folia 上是真正的全局区域线程，
+        // 而挂钩动作本身不属于任何区域（只走反射替换 Netty 的 childHandler），因此两端共用同一份代码。
+        getServer().getGlobalRegionScheduler().run(this, task -> installHook());
         // ⚠️ Paper 插件不支持在 paper-plugin.yml 里声明命令，getCommand() 会抛
         // UnsupportedOperationException（曾因此导致插件启用失败、自动停用）。
         // 必须走生命周期事件注册。
@@ -79,7 +85,8 @@ public class MikuZstdPaper extends JavaPlugin {
                 io.papermc.paper.plugin.lifecycle.event.types.LifecycleEvents.COMMANDS,
                 commands -> commands.registrar().register(
                         "mikuzstd", "查看 Miku-ZSTD 状态与字典训练情况", new ZstdPaperCommand()));
-        LOGGER.info("[Zstd] Miku-ZSTD Paper 已启用（目标 Paper 26.2+，纯 Paper，无 Bukkit 兼容层）");
+        LOGGER.info("[Zstd] Miku-ZSTD Paper 已启用（目标 Paper/Folia 26.2+，平台={}，无 Bukkit 兼容层）",
+                platformName());
     }
 
     @Override
@@ -149,11 +156,35 @@ public class MikuZstdPaper extends JavaPlugin {
     /** 挂钩监听通道；首次未成功时再延迟重试一次。 */
     private void installHook() {
         if (tryInstallHook()) return;
-        getServer().getScheduler().runTaskLater(this, () -> {
+        // 延迟重试同样走全局区域调度器（Folia 上没有可用的 BukkitScheduler）。
+        getServer().getGlobalRegionScheduler().runDelayed(this, task -> {
             if (!tryInstallHook()) {
                 LOGGER.warn("[Zstd] 未能挂钩监听通道——本端 zstd 不可用（连接仍走原版 zlib，不影响正常游玩）");
             }
         }, 40L);
+    }
+
+    /**
+     * 当前是否运行在 Folia 上。
+     *
+     * <p>判定走 {@link ServerBuildInfo#isBrandCompatible(Key)}，而不是查类是否存在：
+     * Folia 与 Paper 共用 paper-api，区域调度器类在两端<b>都存在</b>，
+     * 用类路径判断必然误判成 Paper。品牌标识才是权威信号。</p>
+     *
+     * <p>包了 try/catch：该方法在拿不到 build info 的实现上会抛异常，
+     * 而当前它只影响状态展示与日志文案，不值得让启用流程失败。</p>
+     */
+    public static boolean isFolia() {
+        try {
+            return ServerBuildInfo.buildInfo().isBrandCompatible(Key.key("papermc", "folia"));
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** 平台名（日志与 /mikuzstd 状态共用）。 */
+    public static String platformName() {
+        return isFolia() ? "Folia" : "Paper";
     }
 
     private boolean tryInstallHook() {

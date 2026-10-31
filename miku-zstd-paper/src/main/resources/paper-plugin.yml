@@ -1,8 +1,11 @@
-# Miku-ZSTD — Paper 端（纯 Paper，无 Bukkit/Spigot 兼容层）
+# Miku-ZSTD — Paper 端（纯 Paper，无 Bukkit/Spigot 兼容层；同一份产物也跑 Folia）
 name: Miku-ZSTD
-version: 5.0.1
+version: 5.0.2
 main: mikumc.zstd.paper.MikuZstdPaper
 api-version: 1.26
+# Folia 只加载显式声明的插件。本插件的调度全部走区域调度器（GlobalRegionScheduler /
+# EntityScheduler），没有 BukkitScheduler 调用，因此 Paper 与 Folia 共用同一个 jar。
+folia-supported: true
 authors: [JunXieX]
 description: 用 zstd 替代原版 zlib 压缩玩家连接的网络流量（需客户端安装 Miku-ZSTD 模组）
 website: https://github.com/JunXieX/Miku-ZSTD
