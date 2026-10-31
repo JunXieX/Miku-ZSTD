@@ -131,6 +131,12 @@ public class ZstdChannelManager {
      * 压缩方向是否已装载字典。编码器据此选择"小包跳过压缩"的阈值：
      * 实测无字典时 48B 以下压缩反而膨胀，有字典时 24B 起才有收益（见 ZstdConfig）。
      */
+    /** 当前装载的压缩字典（分块并行给临时 ctx 用）；未装载返回 null。 */
+    public com.github.luben.zstd.ZstdDictCompress compressDict() {
+        ZstdDictRegistry.Entry e = encoderDictEntry;
+        return e == null ? null : e.compressDict();
+    }
+
     public boolean hasCompressDict() {
         return decoderDictEntry != null;
     }

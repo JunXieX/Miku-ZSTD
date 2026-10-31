@@ -67,6 +67,22 @@ public class ZstdBatchEncoder extends ZstdBatchEncoderBase {
                 : cfg.skipCompressBelowBytes;
     }
 
+    @Override
+    protected int configLevel() {
+        return ZstdConfig.INSTANCE.level;
+    }
+
+    @Override
+    protected int configWindowLog() {
+        return ZstdConfig.INSTANCE.windowLog;
+    }
+
+    @Override
+    protected com.github.luben.zstd.ZstdDictCompress compressDict() {
+        ZstdChannelManager m = manager;
+        return m == null ? null : m.compressDict();
+    }
+
     /** 客户端管线有 prepender：本编码器不写外层长度。 */
     @Override
     protected boolean writeBodyLen() {

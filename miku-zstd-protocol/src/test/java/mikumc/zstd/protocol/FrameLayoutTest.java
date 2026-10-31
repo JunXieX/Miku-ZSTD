@@ -758,6 +758,9 @@ class FrameLayoutTest {
 
         ByteBuf frame = Unpooled.buffer();
         ZstdVarInts.write(frame, body.length); // 声明解压后长度
+        ZstdVarInts.write(frame, 1);              // blockCount
+        ZstdVarInts.write(frame, body.length);    // blockRawLen
+        ZstdVarInts.write(frame, compressed.length);
         frame.writeBytes(compressed);
 
         EmbeddedChannel in = new EmbeddedChannel(new TestDecoder(decompressCtx));
@@ -784,6 +787,9 @@ class FrameLayoutTest {
 
         ByteBuf frame = Unpooled.buffer();
         ZstdVarInts.write(frame, payload.length); // 声明解压后长度
+        ZstdVarInts.write(frame, 1);              // blockCount
+        ZstdVarInts.write(frame, payload.length); // blockRawLen
+        ZstdVarInts.write(frame, compressed.length);
         frame.writeBytes(compressed);
         assertRejectedCompressed(frame);
     }
@@ -805,6 +811,9 @@ class FrameLayoutTest {
 
         ByteBuf frame = Unpooled.buffer();
         ZstdVarInts.write(frame, payload.length); // 声明解压后长度
+        ZstdVarInts.write(frame, 1);              // blockCount
+        ZstdVarInts.write(frame, payload.length); // blockRawLen
+        ZstdVarInts.write(frame, compressed.length);
         frame.writeBytes(compressed);
 
         TestDecoder decoder = new TestDecoder(decompressCtx);
@@ -1064,6 +1073,21 @@ class FrameLayoutTest {
         @Override
         protected int skipCompressThreshold(boolean hasDict) {
             return skip;
+        }
+
+        @Override
+        protected int configLevel() {
+            return 3;
+        }
+
+        @Override
+        protected int configWindowLog() {
+            return 0;
+        }
+
+        @Override
+        protected com.github.luben.zstd.ZstdDictCompress compressDict() {
+            return null;
         }
 
         @Override

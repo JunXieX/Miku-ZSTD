@@ -10,7 +10,11 @@ package mikumc.zstd.protocol;
 public final class ZstdProtocolVersion {
 
     /** 协商协议版本（登录期在 negotiate 载荷里交换，三端必须一致）。 */
-    public static final int NEGOTIATE = 5;
+    /**
+     * 6：帧内改成 [rawSize][blockCount] + 每块 [blockRawLen][chunkLen][chunk]（大帧分块并行）。
+     * 两端必须同版本。
+     */
+    public static final int NEGOTIATE = 6;
 
     /** 帧格式版本（写进文档；线格式变更时与 {@link #NEGOTIATE} 一起升）。 */
     public static final int FRAME = 4;

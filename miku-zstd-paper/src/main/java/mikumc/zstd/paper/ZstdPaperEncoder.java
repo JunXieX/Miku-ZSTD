@@ -45,6 +45,22 @@ public class ZstdPaperEncoder extends ZstdBatchEncoderBase {
     }
 
     @Override
+    protected int configLevel() {
+        return ZstdPaperConfig.INSTANCE.level;
+    }
+
+    @Override
+    protected int configWindowLog() {
+        return ZstdPaperConfig.INSTANCE.windowLog;
+    }
+
+    @Override
+    protected com.github.luben.zstd.ZstdDictCompress compressDict() {
+        ZstdPaperChannelManager m = manager;
+        return m == null ? null : m.compressDict();
+    }
+
+    @Override
     protected boolean writeBodyLen() {
         return false;
     }
