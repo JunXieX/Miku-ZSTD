@@ -15,8 +15,9 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
  * 它在本方法整体返回后（本轮所有注入都已完成）才通过 eventLoop 排队执行，
  * 因此晚于任何在登录压缩流程中后置安装的压缩处理器，保证 zstd 最终生效。</p>
  *
- * <p>⚠️ 这条「晚于后置安装」的保证<b>不是</b>为了与 Krypton 共存（本模组<b>不兼容
- * Krypton</b>，客户端压缩优化已内置，两者会争抢同一条压缩管线）。</p>
+ * <p>这条「晚于后置安装」的保证同时覆盖了 Krypton：它在 {@code setupCompression} 的 HEAD
+ * 用同名 handler 装上 libdeflate 版压缩器，TAIL 时本模组会把它们替换成 zstd，
+ * 因此两者可以共存（zstd 接管压缩，Krypton 其余优化保留）。</p>
  */
 @Mixin(ClientHandshakePacketListenerImpl.class)
 public class MixinHandshakeListener {
