@@ -158,12 +158,12 @@ public final class ZstdSwitchGate extends ChannelDuplexHandler {
             return false;
         }
         LOGGER.debug("[Zstd] switch not confirmed by client (txId={}) — releasing held packets", txId);
-        // 只提示一次：这条应答最常见的原因就是"客户端模组版本较旧，没有切换嗅探器"，
-        // 它会命中该玩家的<b>每一次</b>登录；逐条 WARN 只会把日志刷满。
+        // ⚠️ 这是<b>正常兼容路径</b>而非异常：旧版客户端没有切换嗅探器，收到询问后会按原版
+        // 规则回一个空应答，而它同样在 SetCompression 时切到了 zstd —— 服务端照常放行即可。
+        // 以前这条打 WARN，运维看到会以为出了问题（实测日志里就是这么被误读的），现降为 INFO。
         if (UNCONFIRMED_WARNED.compareAndSet(false, true)) {
-            LOGGER.warn("[Zstd] 客户端未确认 zstd 切换（收到不带魔数的应答）。若该玩家反复出现，"
-                    + "通常是其客户端模组版本较旧、不支持切换握手 —— 请让玩家更新到与插件同版本。"
-                    + "（本条只提示一次）");
+            LOGGER.info("[Zstd] 客户端未回切换确认（不带魔数的应答）——旧版模组的正常行为，"
+                    + "服务端已放行扣住的包；本条只提示一次");
         }
         release();
         return true;
