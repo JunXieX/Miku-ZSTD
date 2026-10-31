@@ -71,12 +71,17 @@ public final class ZstdPaperSwitchConfirmSniffer extends MessageToMessageDecoder
             out.add(in.retain());
             return;
         }
-        ctx.pipeline().remove(this);
+        // ⚠️ 只有"真确认"才摘掉自己。空应答（accepted=false）必须先留着嗅探器：
+        // MC 客户端对未注册 channel 的 LoginPluginRequest 会<b>自动</b>先回一条空应答，
+        // 而我们的帧层嗅探器随后还会回一条带魔数的真确认 —— 两条几乎同时到达。
+        // 旧实现在空应答上就把自己移除了，真确认到达时无人识别，
+        // 闸门只能等满 200ms 兜底（实测 5.0.9 的 delta=229ms 就是这条路径）。
         if (accepted) {
+            ctx.pipeline().remove(this);
             LOGGER.debug("[Zstd] switch confirmation received (txId={}) — releasing gate", txId);
         } else {
-            LOGGER.warn("[Zstd] switch NOT confirmed by client (txId={}) — releasing held packets anyway",
-                    txId);
+            LOGGER.info("[Zstd] 客户端未回切换确认（不带魔数的应答）——旧版模组的正常行为，"
+                    + "服务端将按 200ms 兜底放行；本条只提示一次");
         }
     }
 }
