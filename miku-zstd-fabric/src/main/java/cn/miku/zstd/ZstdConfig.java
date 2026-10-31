@@ -61,7 +61,7 @@ public class ZstdConfig {
         this.level = clamp(getInt(c, "level", 3), 1, 22);
         this.windowLog = clamp(getInt(c, "window_log", 20), 10, 27);
         this.compressThreads = clamp(getInt(c, "threads", 0), 0, 256);
-        this.batchWindowMs = clamp(getInt(c, "batch_window_ms", 1), 0, 1000);
+        this.batchWindowMs = clamp(getInt(c, "batch_window_ms", 2), 0, 1000);
         this.batchMaxPackets = clamp(getInt(c, "batch_max_packets", 64), 1, 4096);
         this.skipCompressBelowBytes = clamp(getInt(c, "skip_compress_below_bytes", 48), 0, 65536);
         this.skipCompressBelowBytesWithDict =
@@ -174,7 +174,7 @@ public class ZstdConfig {
                       # ⚠️ 这是【每个包都要等】的固定开销，ping 往返会翻倍计：
                       #     3ms → 往返 +6ms；1ms → 往返 +2ms。取 1 几乎不损失带宽收益。
                       # ⚠️ 不要设 0：那等于关闭批处理（每包一帧），带宽收益会消失。
-                      batch_window_ms: 1
+                      batch_window_ms: 2
 
                       # 单帧最多合并多少个包（防止极端流量下内存与延迟失控）。
                       batch_max_packets: 64
