@@ -85,12 +85,14 @@ public final class ZstdSwitchConfirmSniffer extends MessageToMessageDecoder<Byte
             out.add(in.retain());
             return;
         }
-        ctx.pipeline().remove(this);
+        // ⚠️ 只有"真确认"才摘掉自己：空应答（accepted=false）必须先留着嗅探器，
+        // 否则随后到达的带魔数真确认就没人识别，闸门只能等超时兜底。
         if (accepted) {
+            ctx.pipeline().remove(this);
             LOGGER.debug("[Zstd] switch confirmation received (txId={}) — releasing gate", txId);
         } else {
-            LOGGER.warn("[Zstd] switch NOT confirmed by client (txId={}) — releasing held packets anyway",
-                    txId);
+            LOGGER.info("[Zstd] 客户端未回切换确认（不带魔数的应答）——旧版模组的正常行为，"
+                    + "服务端将按兜底放行；本条只提示一次");
         }
     }
 }
