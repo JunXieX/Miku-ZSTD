@@ -7,7 +7,6 @@
     "ConnectionAccessor",
     "ClientHandshakePacketListenerAccessor",
     "MixinClientIntentionPacket",
-    "MixinConnectionDebug",
     "MixinConnectionSetup",
     "MixinHandshakeListener",
     "MixinHud"

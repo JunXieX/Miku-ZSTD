@@ -38,7 +38,6 @@ public class ZstdConfig {
 
     /** 压缩线程池大小；<=0 表示自动（CPU 核心数 − 1，给服务端主逻辑留一个核） */
     public final int compressThreads;
-    public final boolean debug;
     public final boolean hudEnabled;
 
     /** 帧格式 v3 的批处理窗口（毫秒）：窗口内发出的多个包合成一帧 */
@@ -67,9 +66,6 @@ public class ZstdConfig {
         this.skipCompressBelowBytes = clamp(getInt(c, "skip_compress_below_bytes", 48), 0, 65536);
         this.skipCompressBelowBytesWithDict =
                 clamp(getInt(c, "skip_compress_below_bytes_with_dict", 24), 0, 65536);
-
-        Map<String, Object> l = section(map, "logging");
-        this.debug = getBool(l, "debug", false);
 
         Map<String, Object> d = section(map, "display");
         this.hudEnabled = getBool(d, "hud_enabled", false);
@@ -196,9 +192,6 @@ public class ZstdConfig {
                       # 游戏内按 F8 也可临时开关（不落盘，重启后回到这里的值）。
                       hud_enabled: false
 
-                    logging:
-                      # 调试日志开关：输出逐包收发诊断（仅在排查问题时开启，会刷很多行）
-                      debug: false
                     """;
             Files.writeString(configPath, yaml, StandardCharsets.UTF_8);
         } catch (IOException e) {
