@@ -23,10 +23,16 @@ import org.slf4j.LoggerFactory;
  * 从而覆盖路径 1 的结果。路径 2 在 handleCompression 整体返回后（本轮所有注入
  * 都已完成）再通过 eventLoop 排队执行，因此总是最后生效。</p>
  *
- * <p>⚠️ <b>不兼容 Krypton</b>（客户端侧压缩优化模组）：本模组已内置客户端压缩优化，
- * 两者会争抢同一条压缩管线，同时安装时压缩行为会互相覆盖。<br>
- * 注意上面「晚于后置安装」这条保证<b>不是</b>为了与 Krypton 共存——它只是确保 zstd
- * 相对于本轮登录压缩流程中安装的处理器最终生效。</p>
+ * <p><b>与 Krypton 共存</b>：Krypton（客户端侧压缩优化模组）在 {@code setupCompression} 的
+ * HEAD 就把 {@code compress}/{@code decompress} 换成基于 libdeflate 的同名 handler，
+ * 名字不变 —— 因此本模组仍能按同一个锚点替换它们。激活成功后由 zstd 接管压缩，
+ * Krypton 的加密、长度前缀（prepender）、flush 合并继续生效；若本轮没有协商成功，
+ * Krypton 会继续用 libdeflate 压缩（原版 zlib 帧），不影响进服。</p>
+ *
+ * <p>⚠️ 不能把"本模组与 Krypton 都改压缩管线"理解成冲突：真正的冲突是<b>两侧被不同模组
+ * 各换一半</b>（出站 zstd、入站 libdeflate）。因此 {@code activateInEventLoop} 在安装后
+ * 会再校验一次 {@code zstd_encoder} 与 {@code zstd_decoder} 是否同时在位，缺一侧就放弃
+ * 本轮激活，让下一次触发补齐，绝不置成"已激活"。</p>
  *
  * <h2>3.1.0 修复</h2>
  * <ul>
@@ -343,6 +349,18 @@ public final class ZstdClientActivation {
         // 服务端的切换询问（zstd:switch）以裸帧到达，必须在 zstd_decoder 之前截获，
         // 否则首个 varint（0x04）会被当成 rawSize 解析 → 直接断连。
         installSwitchSniffer(p);
+
+        // ⚠️ 安装后必须再校验一次"两侧确实都是 zstd"。
+        // Krypton 之类的压缩模组用<b>同名</b> handler（compress/decompress）接管管线，
+        // 若它的注入落在我们之后，就会把一侧换回 libdeflate —— 形成
+        // "出站 zstd / 入站 libdeflate" 的单侧状态：两边日志都显示已激活，首个往返即断连。
+        // 缺任何一侧都不置 ACTIVATED，让下一次触发（handleCompression 的 TAIL）补齐；
+        // 补齐后仍不一致则本端保持原版，服务端会按"未确认/无应答"处理，不会形成半 zstd。
+        if (p.get("zstd_encoder") == null || p.get("zstd_decoder") == null) {
+            LOGGER.warn("[Zstd] 激活后校验失败（encoder={}, decoder={}）——管线被其它模组覆盖，本轮保持原版",
+                    p.get("zstd_encoder") != null, p.get("zstd_decoder") != null);
+            return;
+        }
 
         channel.attr(ZstdChannelManager.ZSTD_STATE).set(ZstdChannelManager.TransportState.ZSTD_ACTIVE);
         channel.attr(ACTIVATED).set(Boolean.TRUE);

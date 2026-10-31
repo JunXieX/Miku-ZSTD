@@ -347,8 +347,8 @@ Read-only subcommands (`status`, `top`) are open to everyone, because Velocity h
     - ViaVersion：兼容；关键操作在 ViaVersion 处理器前后正确注入
 - Other plugins that append hostname markers, such as ServerSwitcher: compatible, the markers do not interfere with each other
     - 其他追加主机名标记的插件（如 ServerSwitcher）：兼容，各自标记互不干扰
-- Krypton, the client-side compression optimization mod: NOT compatible, do not install both. The Fabric side already includes client-side compression optimization, and the two would fight over the same compression pipeline, overwriting each other's behavior
-    - Krypton（客户端侧压缩优化模组）：不兼容，请勿同时安装。本模组的 Fabric 端已内置客户端压缩优化，两者会争抢同一条压缩管线，同时安装会导致压缩行为互相覆盖
+- Krypton, the client-side compression optimization mod: compatible. Krypton installs its libdeflate-based compressors under the same handler names (`compress`/`decompress`), and Miku-ZSTD replaces them on activation — zstd takes over compression while Krypton's encryption, frame prepender and flush consolidation stay active. If negotiation does not succeed, Krypton keeps compressing with libdeflate and joining is unaffected
+    - Krypton（客户端侧压缩优化模组）：可共存。Krypton 用同名 handler（`compress`/`decompress`）装上基于 libdeflate 的压缩器，本模组在激活时按同一锚点替换 —— zstd 接管压缩，Krypton 的加密、长度前缀与 flush 合并继续生效；本轮未协商成功时 Krypton 继续用 libdeflate 压缩，不影响进服
 - Multiple plugin jars with the same id: not supported, see the installation notes
     - 多个同 id 插件 jar：不兼容，见上方安装说明
 

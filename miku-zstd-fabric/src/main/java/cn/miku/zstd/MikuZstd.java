@@ -41,6 +41,30 @@ public final class MikuZstd {
         migrateLegacyConfig(configPath);
         ZstdConfig.load(configPath);
         ZstdCompressPool.init(ZstdConfig.INSTANCE.compressThreads, 5);
+        detectKrypton();
+    }
+
+    /**
+     * 检测 Krypton 是否在场，并说明两者如何共存。
+     *
+     * <p>Krypton 在 {@code setupCompression} 的 HEAD 用<b>同名</b> handler
+     * （{@code compress}/{@code decompress}）装上 libdeflate 版压缩器；本模组在 TAIL
+     * 按同一锚点替换成 zstd。所以两者可以共存：zstd 接管压缩，Krypton 的加密、
+     * 长度前缀与 flush 合并继续生效；本轮未协商成功时 Krypton 继续用 libdeflate。</p>
+     *
+     * <p>只做一次性日志，不据此改变行为——真正的冲突由 {@code activateInEventLoop}
+     * 的"双侧校验"兜住（缺一侧就放弃激活）。</p>
+     */
+    private static void detectKrypton() {
+        try {
+            Class.forName("me.steinborn.krypton.mod.shared.network.compression.MinecraftCompressEncoder");
+            LOGGER.info("[Zstd] 检测到 Krypton：zstd 激活后将接管压缩管线，"
+                    + "Krypton 的其余优化（加密 / 长度前缀 / flush 合并）继续生效");
+        } catch (ClassNotFoundException notInstalled) {
+            // 未安装 Krypton：无需提示
+        } catch (Throwable t) {
+            LOGGER.debug("[Zstd] Krypton 检测跳过: {}", t.toString());
+        }
     }
 
     /**
