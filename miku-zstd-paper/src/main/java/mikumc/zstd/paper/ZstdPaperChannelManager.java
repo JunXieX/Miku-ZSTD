@@ -38,9 +38,9 @@ public class ZstdPaperChannelManager {
     private final ZstdCompressCtx compressCtx;
     private final ZstdDecompressCtx decompressCtx;
 
-    private int negotiateTxId = -1;
+    private volatile int negotiateTxId = -1;
     /** zstd:dict 查询的 txId（协议 v4 按需推送字典） */
-    private int dictTxId = -1;
+    private volatile int dictTxId = -1;
     /** 已取用的共享字典条目，连接关闭时归还引用 */
     private ZstdPaperDictRegistry.Entry encoderDictEntry;
     private ZstdPaperDictRegistry.Entry decoderDictEntry;
@@ -133,6 +133,21 @@ public class ZstdPaperChannelManager {
         return dictTxId;
     }
 
+    /**
+     * 抢占字典查询的 txId（只允许一次）。
+     *
+     * <p>⚠️ 与 {@link #claimNegotiateTxId(int)} 同一个理由：两条发查询的路径可能并发，
+     * 重复发出会让客户端多回一个应答，而多出来的那个应答没人认领 —— 落到
+     * {@code ServerLoginPacketListenerImpl} 就是 "unexpected query response" 断连。</p>
+     *
+     * @return 是否抢到（{@code false} 表示本连接已经推过字典，调用方应直接返回）
+     */
+    public synchronized boolean claimDictTxId(int txId) {
+        if (this.dictTxId != -1) return false;
+        this.dictTxId = txId;
+        return true;
+    }
+
     public void setDictTxId(int txId) {
         this.dictTxId = txId;
     }
@@ -143,6 +158,24 @@ public class ZstdPaperChannelManager {
 
     public int getNegotiateTxId() {
         return negotiateTxId;
+    }
+
+    /**
+     * 抢占协商查询的 txId（每条连接只允许发一次）。
+     *
+     * <p>⚠️ 必须是原子的 check-and-set：发查询有<b>两个</b>触发点——入站线程看到握手包、
+     * 写包线程看到 {@code SetCompression} 时的兜底。Folia 上这两个线程天然分离，
+     * 没有抢占时可能各发一条 {@code LoginPluginRequest}；客户端回两个应答，
+     * 而协商器只认最后登记的那个 txId，剩下那个会漏给
+     * {@code ServerLoginPacketListenerImpl} —— 它不认识我们自造的 txId，
+     * 直接以 "unexpected query response" 断开连接（实测：Folia 上玩家因此进不了服）。</p>
+     *
+     * @return 是否抢到（{@code false} 表示已经发过，调用方应直接返回）
+     */
+    public synchronized boolean claimNegotiateTxId(int txId) {
+        if (this.negotiateTxId != -1) return false;
+        this.negotiateTxId = txId;
+        return true;
     }
 
     public void setNegotiateTxId(int txId) {

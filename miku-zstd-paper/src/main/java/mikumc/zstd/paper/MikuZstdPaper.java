@@ -14,6 +14,7 @@ import java.lang.reflect.Method;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 import mikumc.zstd.protocol.ZstdCompressPool;
 
 /**
@@ -341,12 +342,41 @@ public class MikuZstdPaper extends JavaPlugin {
         }
     }
 
-    /** 注入应答嗅探器与协商器（eventLoop 线程；幂等）。 */
+    /** 注入协商器（eventLoop 线程；幂等）。 */
     private static void injectHandlers(Channel channel) {
+        injectHandlers(channel, 0);
+    }
+
+    /**
+     * 注入实现：<b>必须等 {@code packet_handler} 就位</b>再插入协商器。
+     *
+     * <p>协商器的存在意义就是"抢在 {@code packet_handler} 之前消费查询应答"。
+     * 若协议处理器尚未出现就插进去（Folia 与部分协议库的初始化顺序并不保证
+     * childHandler 调用期间已完成协议配置），协商器会落在链尾；等 MC 用 {@code addLast}
+     * 把 splitter/decoder/prepender/encoder/packet_handler 追加上来后，它实际位于
+     * packet_handler <b>之后</b> —— 入站应答被 {@code ServerLoginPacketListenerImpl} 先消费，
+     * 而它不认识我们自造的 txId，直接判定 "unexpected query response" 并断开。
+     * 实测日志：{@code EncoderException: Pipeline has no outbound protocol configured ...
+     * ClientboundLoginDisconnectPacket[reason=multiplayer.disconnect.unexpected_query_response]}。</p>
+     */
+    private static void injectHandlers(Channel channel, int attempt) {
         if (!channel.isActive()) return;
         if (channel.attr(ZstdPaperChannelManager.KEY).get() != null) return;
 
         var p = channel.pipeline();
+        if (p.get("packet_handler") == null) {
+            if (attempt < 200) {
+                // 每 10ms 重试一次，上限约 2s：正常情况下协议处理器在通道激活时就已经在了，
+                // 这里只是兜住初始化顺序差异，不会真的等满。
+                channel.eventLoop().schedule(() -> injectHandlers(channel, attempt + 1),
+                        10, TimeUnit.MILLISECONDS);
+            } else {
+                LOGGER.debug("[Zstd] packet_handler 始终未出现，放弃为本次连接注入协商器; pipeline={}",
+                        p.names());
+            }
+            return;
+        }
+
         // ⚠️ 构造放在 try 内：ZstdPaperChannelManager 的构造器会立刻把配置里的
         // level / window_log 施加到 zstd 上下文上，越界配置会让 zstd-jni 抛异常。
         // 这段跑在通道初始化路径上，异常外泄会让"配置写错"变成"连不上"。
@@ -363,19 +393,9 @@ public class MikuZstdPaper extends JavaPlugin {
 
         // 注：不再安装帧层应答嗅探器 —— 应答改由协商器在包层拦截（见 ZstdPaperNegotiator.channelRead），
         // 这样不依赖 "splitter" 等 handler 名在注入时刻是否已存在。
-        // 协商器：必须放在 packet_handler **之前**。
-        // ⚠️ 实测教训：放在末尾（packet_handler 之后）时，出站事件仍能收到（negotiate 靠兜底发出去了），
-        // 但**入站包会被 packet_handler 先消费掉**，协商器永远收不到应答——表现为
-        // "negotiate 发出、客户端也回了，服务端却一直等不到应答"。
-        // 放在 packet_handler 之前即可同时满足：入站能看到 login start 与应答，出站在最前面看到 SetCompression。
+        // 协商器：必须放在 packet_handler **之前**，且只此一个位置，不再提供 addLast 兜底。
         if (p.get("miku-zstd-negotiator") == null) {
-            if (p.get("packet_handler") != null) {
-                p.addBefore("packet_handler", "miku-zstd-negotiator", new ZstdPaperNegotiator());
-            } else if (p.get("encoder") != null) {
-                p.addAfter("encoder", "miku-zstd-negotiator", new ZstdPaperNegotiator());
-            } else {
-                p.addLast("miku-zstd-negotiator", new ZstdPaperNegotiator());
-            }
+            p.addBefore("packet_handler", "miku-zstd-negotiator", new ZstdPaperNegotiator());
         }
     }
 

@@ -61,6 +61,16 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
      */
     private volatile boolean holding;
 
+    /**
+     * 协商是否已经定案（激活成功或明确回落）。
+     *
+     * <p>⚠️ 定案后<b>不能</b>立刻把协商器摘掉：客户端对查询的应答可能在服务端已经
+     * 切进 CONFIGURATION 之后才到（Folia 上尤其明显）。这些迟到的应答若漏给
+     * {@code ServerLoginPacketListenerImpl}，它不认识我们自造的 txId，会直接以
+     * "unexpected query response" 断开 —— 本标志让协商器在定案后继续吞掉这类应答。</p>
+     */
+    private volatile boolean settled;
+
     /** 保护 {@link #holding} 的迁移与两个扣包列表：写线程与 eventLoop 线程都会碰。 */
     private final Object holdLock = new Object();
     private final List<Object> heldPackets = new ArrayList<>();
@@ -78,6 +88,17 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
 
     @Override
     public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+        if (settled) {
+            // 协商已定案，但协商器还要留一小段时间：客户端对查询的应答可能晚于服务端的
+            // 协议切换到达。这类应答必须被吞掉（见 settled 的注释），其余包原样下传。
+            if (isQueryAnswer(msg)) {
+                io.netty.util.ReferenceCountUtil.release(msg);
+            } else {
+                super.channelRead(ctx, msg);
+            }
+            return;
+        }
+
         ZstdPaperChannelManager mgr = ctx.channel().attr(ZstdPaperChannelManager.KEY).get();
 
         // 1) 握手包：必须区分「服务器列表 ping」与「登录」。
@@ -175,10 +196,14 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
     /** 发轻量 negotiate：只带协议版本与两个 dictId（字典字节按需另发，见 {@link #sendDictQuery}）。 */
     private void sendNegotiate(ChannelHandlerContext ctx) {
         ZstdPaperChannelManager mgr = ctx.channel().attr(ZstdPaperChannelManager.KEY).get();
-        if (mgr == null || mgr.getNegotiateTxId() != -1) return;
+        if (mgr == null) return;
 
         int txId = ThreadLocalRandom.current().nextInt(1, Integer.MAX_VALUE);
-        mgr.setNegotiateTxId(txId);
+        // ⚠️ 必须用原子抢占，不能"先读后写"：本方法有两条调用路径（入站看到握手包、
+        // 写包看到 SetCompression 的兜底），Folia 上这两条路径的线程天然分离。
+        // 重复发出会让客户端多回一个应答，而多出来的应答没人认领 ——
+        // 落到登录监听器就是 "unexpected query response" 断连。
+        if (!mgr.claimNegotiateTxId(txId)) return;
 
         ByteBuf buf = ctx.alloc().buffer();
         try {
@@ -231,7 +256,10 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
         if (dec != null && dec.length > 0) flags |= 2;
 
         int txId = ThreadLocalRandom.current().nextInt(1, Integer.MAX_VALUE);
-        mgr.setDictTxId(txId);
+        if (!mgr.claimDictTxId(txId)) {
+            // 已经在等字典应答：不重复推送（重复推送 = 多一个没人认领的应答 = 断连）
+            return true;
+        }
 
         ByteBuf buf = ctx.alloc().buffer();
         try {
@@ -260,6 +288,11 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
 
     @Override
     public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception {
+        if (settled) {
+            // 已定案：不再参与协商，也不扣包（激活后的编码由 zstd_encoder 负责）
+            super.write(ctx, msg, promise);
+            return;
+        }
         ZstdPaperChannelManager mgr = ctx.channel().attr(ZstdPaperChannelManager.KEY).get();
         if (mgr == null || mgr.isReplaced()) {
             super.write(ctx, msg, promise);
@@ -444,11 +477,10 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
         sendSwitchRequest(channel);
 
         releaseHeld(ctx);
-        // 激活后本处理器已无用：留在管线里会让**每个**出站包多一次 attr 查询、
-        // 每个入站包多一次 getSimpleName().contains(...) 判定，是永久税。
-        // 对齐 Velocity 端（激活即自移除）。顺序上必须先 releaseHeld 再移除 ——
-        // 移除后经该 ctx 写出的语义不再有保证，扣住的包就会发不出去。
-        removeSelf(ctx);
+        // 激活后协商器不再参与协商，但仍需短暂留驻：迟到的查询应答必须被吞掉
+        // （见 settled 注释）。顺序上必须先 releaseHeld 再退役 ——
+        // 退役后经该 ctx 写出的语义不再有保证，扣住的包就会发不出去。
+        retire(ctx);
     }
 
     /**
@@ -462,7 +494,31 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
      */
     private void finishVanilla(ChannelHandlerContext ctx) {
         releaseHeld(ctx);
-        removeSelf(ctx);
+        retire(ctx);
+    }
+
+    /**
+     * 协商定案后的退役：先置位 {@link #settled} 吞掉迟到应答，再延迟自移除。
+     *
+     * <p>延迟而不是立刻移除，是因为客户端对 {@code zstd:negotiate} / {@code zstd:dict}
+     * 的应答可能晚于服务端切进 CONFIGURATION 才到；这类应答漏给
+     * {@code ServerLoginPacketListenerImpl} 会被判为 "unexpected query response" 并断开。
+     * 10 秒足以覆盖登录与配置阶段的全部时序，之后自移除，避免热路径永久多一次判断。</p>
+     */
+    private void retire(ChannelHandlerContext ctx) {
+        settled = true;
+        try {
+            ctx.channel().eventLoop().schedule(() -> removeSelf(ctx), 10, TimeUnit.SECONDS);
+        } catch (Throwable t) {
+            removeSelf(ctx);
+        }
+    }
+
+    /** 是否是我们的查询应答（登录查询通道的应答；见 {@link #readSwitchTxId} 的同类判定）。 */
+    private static boolean isQueryAnswer(Object msg) {
+        if (msg == null) return false;
+        String cn = msg.getClass().getSimpleName();
+        return cn.contains("Query") || cn.contains("Plugin");
     }
 
     /** 从管线摘掉自身（幂等；已移除或通道已关时静默）。 */
