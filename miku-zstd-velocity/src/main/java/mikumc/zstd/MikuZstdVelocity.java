@@ -150,6 +150,12 @@ public class MikuZstdVelocity {
         } catch (Throwable t) {
             logger.warn("[Zstd] failed to shut down compress pool", t);
         }
+        // 上下文池同理：不清空会让重载后的代理继续持有旧的原生上下文
+        try {
+            mikumc.zstd.protocol.ZstdCtxPool.shutdown();
+        } catch (Throwable t) {
+            logger.warn("[Zstd] failed to shut down ctx pool", t);
+        }
         logger.info("[Zstd] Samples saved on shutdown");
     }
 

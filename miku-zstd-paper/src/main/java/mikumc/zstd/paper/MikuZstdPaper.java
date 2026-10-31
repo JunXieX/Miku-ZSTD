@@ -144,6 +144,11 @@ public class MikuZstdPaper extends JavaPlugin {
         } catch (Throwable t) {
             LOGGER.warn("[Zstd] 关闭压缩线程池时异常", t);
         }
+        try {
+            mikumc.zstd.protocol.ZstdCtxPool.shutdown();
+        } catch (Throwable t) {
+            LOGGER.warn("[Zstd] 关闭上下文池时异常", t);
+        }
         unregisterPermissions();
         LOGGER.info("[Zstd] Miku-ZSTD Paper 已停用");
     }

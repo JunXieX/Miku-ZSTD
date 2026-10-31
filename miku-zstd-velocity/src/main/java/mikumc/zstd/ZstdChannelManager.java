@@ -2,6 +2,7 @@ package mikumc.zstd;
 
 import com.github.luben.zstd.ZstdCompressCtx;
 import com.github.luben.zstd.ZstdDecompressCtx;
+import mikumc.zstd.protocol.ZstdCtxPool;
 import io.netty.channel.Channel;
 import io.netty.util.AttributeKey;
 import mikumc.zstd.protocol.ZstdCompressLock;
@@ -104,11 +105,11 @@ public class ZstdChannelManager {
 
     public ZstdChannelManager() {
         ZstdVelocityConfig cfg = ZstdVelocityConfig.INSTANCE;
-        this.compressCtx = new ZstdCompressCtx();
-        this.compressCtx.setLevel(cfg.level);
+        // 上下文从租借池取（见 ZstdCtxPool 的说明）：池内实例已被 reset，参数需重设。
+        this.compressCtx = ZstdCtxPool.borrowCompress(cfg.level);
         this.compressCtx.setWindowLog(cfg.windowLog);
         this.compressCtx.setLong(1); // LDM：提升区块级长距离重复的压缩率
-        this.decompressCtx = new ZstdDecompressCtx();
+        this.decompressCtx = ZstdCtxPool.borrowDecompress();
         applySlimFrameFormat();
         // 注意：字典不在这里加载——必须等 negotiate 应答确认客户端字典就绪后
         // 由 activateZstd 按门控结果显式调用 loadTrainerDicts()。
@@ -565,8 +566,9 @@ public class ZstdChannelManager {
         // 标志即可安全放弃；顺序反了（先 close 后立标志）等于没防（详见 ZstdCompressLock 注释）。
         synchronized (compressLock) {
             compressLock.markClosed();
-            compressCtx.close();
-            decompressCtx.close();
+            // 归还池（内部 reset）；池满/已停用时才真正 close
+            ZstdCtxPool.returnCompress(compressCtx);
+            ZstdCtxPool.returnDecompress(decompressCtx);
         }
         ZstdDictRegistry.Entry enc = encoderDictEntry;
         if (enc != null) {

@@ -76,8 +76,11 @@ public class ZstdBatchEncoder extends ZstdBatchEncoderBase {
      * 也不该在这里逐包拆分——那会把解析与过滤搬到 event loop 上。</p>
      */
     @Override
-    protected void onRawBatch(byte[] raw, int length) {
-        ZstdSampleTrainer.submitEncoderBatch(raw, length);
+    protected void onRawBatch(io.netty.buffer.ByteBuf raw, int length) {
+        // 训练器按 byte[] 处理，这里复制一份：只有开启训练/采样时才走到本方法
+        byte[] copy = new byte[length];
+        raw.getBytes(raw.readerIndex(), copy, 0, length);
+        ZstdSampleTrainer.submitEncoderBatch(copy, length);
     }
 
     @Override
