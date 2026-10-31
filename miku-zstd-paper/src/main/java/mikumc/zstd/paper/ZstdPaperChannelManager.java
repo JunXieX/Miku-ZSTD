@@ -30,7 +30,7 @@ public class ZstdPaperChannelManager {
     public static final AttributeKey<ZstdPaperChannelManager> KEY =
             AttributeKey.valueOf("miku-zstd:manager");
     /** 协商协议版本（三端必须一致）。版本不一致时客户端会干净回落原版，不会出现半 zstd。 */
-    public static final int PROTOCOL_VERSION = 5;
+    public static final int PROTOCOL_VERSION = mikumc.zstd.protocol.ZstdProtocolVersion.NEGOTIATE;
 
     /** 本连接的压缩统计（/mikuzstd top 用），close 时注销 */
     public final mikumc.zstd.protocol.ZstdConnStats stats = new mikumc.zstd.protocol.ZstdConnStats();
@@ -148,10 +148,6 @@ public class ZstdPaperChannelManager {
         return true;
     }
 
-    public void setDictTxId(int txId) {
-        this.dictTxId = txId;
-    }
-
     public ZstdDecompressCtx getDecompressCtx() {
         return decompressCtx;
     }
@@ -178,9 +174,7 @@ public class ZstdPaperChannelManager {
         return true;
     }
 
-    public void setNegotiateTxId(int txId) {
-        this.negotiateTxId = txId;
-    }
+
 
     /**
      * 回填协商结论。语义与另两端完全一致：

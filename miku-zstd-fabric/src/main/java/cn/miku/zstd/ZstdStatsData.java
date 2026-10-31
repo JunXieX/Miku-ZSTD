@@ -84,6 +84,14 @@ public final class ZstdStatsData {
         // <b>全部</b>累计字节"，除以 1 秒会得到一个虚高成百上千倍的速率，
         // 而且它会被写进 10 格平滑环，在接下来约 1 秒里持续把显示拉高。
         if (first || elapsed > intervalSec * 3000L) {
+            // 连同平滑环一起清掉：否则上一次运行留下的旧值（可能极高）会继续被平均进来，
+            // 表现为"重新打开 HUD 的头几秒速率明显偏高"。
+            java.util.Arrays.fill(RING_TX_RAW, 0);
+            java.util.Arrays.fill(RING_TX_WIRE, 0);
+            java.util.Arrays.fill(RING_RX_IN, 0);
+            java.util.Arrays.fill(RING_RX_OUT, 0);
+            ringIdx = 0;
+            ringCount = 0;
             return null;
         }
 

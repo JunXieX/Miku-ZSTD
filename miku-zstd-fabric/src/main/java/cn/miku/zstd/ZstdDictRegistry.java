@@ -53,7 +53,6 @@ public final class ZstdDictRegistry {
     public static final class Entry {
         private final long id;
         private final int level;
-        private final byte[] bytes;
         private final ZstdDictCompress compressDict;
         private final ZstdDictDecompress decompressDict;
 
@@ -65,7 +64,6 @@ public final class ZstdDictRegistry {
                       ZstdDictCompress compressDict, ZstdDictDecompress decompressDict) {
             this.id = id;
             this.level = level;
-            this.bytes = bytes;
             this.compressDict = compressDict;
             this.decompressDict = decompressDict;
         }

@@ -55,7 +55,7 @@ public class ZstdChannelManager {
             AttributeKey.valueOf("zstd:manager");
 
     /** 协商协议版本（三端必须一致）。版本不一致时客户端会干净回落原版，不会出现半 zstd。 */
-    public static final int PROTOCOL_VERSION = 5;
+    public static final int PROTOCOL_VERSION = mikumc.zstd.protocol.ZstdProtocolVersion.NEGOTIATE;
 
     /** 本连接的压缩统计（/mikuzstd top 用），close 时注销 */
     public final mikumc.zstd.protocol.ZstdConnStats stats = new mikumc.zstd.protocol.ZstdConnStats();
@@ -273,8 +273,19 @@ public class ZstdChannelManager {
      * 记下"客户端请求了字典"。协议 v4 在推完 {@code zstd:dict} 并拿到它的应答之前，
      * 都不能激活 zstd——见 ZstdHijacker 激活前的硬门控。
      */
-    public void markDictRequested() {
+    /**
+     * 记下"客户端请求了字典"，并返回本次是否是<b>第一次</b>请求。
+     *
+     * <p>⚠️ 必须能区分重复：同一条 negotiate 应答若被重传/重放，旧的 void 版本会让调用方
+     * 再推一遍整份字典（默认 2×128KB，配置上限 2×1MB），并覆盖 {@code dictTxId}，
+     * 使前一次的应答从此无人认领。</p>
+     *
+     * @return {@code true} 表示第一次请求，调用方应推送字典；{@code false} 表示已经在等应答
+     */
+    public synchronized boolean markDictRequested() {
+        if (this.dictRequested) return false;
         this.dictRequested = true;
+        return true;
     }
 
     /** 客户端是否报告过缺字典（决定激活前是否必须等到字典确认）。 */
@@ -411,11 +422,25 @@ public class ZstdChannelManager {
         // 确认嗅探器挂在压缩解码器之前（帧层）：确认包可能被原版压缩或直存
         if (p.get("zstd_switch_confirm") == null) {
             // ⚠️ 也要认 zstd_decoder：解码器可能已经被替换，原名字已不存在。
+            boolean installed = false;
             for (String anchor : new String[]{"compression-decoder", "decompress", "zstd_decoder"}) {
                 if (p.get(anchor) != null) {
                     p.addBefore(anchor, "zstd_switch_confirm", new ZstdSwitchConfirmSniffer());
+                    installed = true;
                     break;
                 }
+            }
+            // ⚠️ 装不上就不能继续：没有任何处理器能走到 {@code confirm()}，闸门会把扣住的
+            // 登录包一直扣到 5 秒超时才放行（每次登录固定卡 5 秒），而不是给出一条明确的
+            // 放弃日志。这里与上面 minecraft-encoder 缺失的分支对称处理。
+            if (!installed) {
+                LOGGER.warn("[Zstd] 确认嗅探器无法安装（压缩解码器锚点缺失）— 放弃激活; pipeline={}",
+                        p.names());
+                if (p.get("zstd_switch_gate") != null) {
+                    p.remove("zstd_switch_gate");
+                }
+                switchGate = null;
+                return false;
             }
         }
         return true;

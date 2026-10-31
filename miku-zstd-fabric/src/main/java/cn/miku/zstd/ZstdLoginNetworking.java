@@ -193,6 +193,13 @@ public final class ZstdLoginNetworking {
                 // 时的补发包全部解不开。
                 listenerConsumer.accept(operation ->
                         ZstdClientActivation.prepareForSwitch(channel));
+            } else {
+                // ⚠️ 字典装载失败：状态必须拉回 PLAIN 并请激活层拆掉上一轮残留的 zstd 管道。
+                // 否则重放登录（ViaFabricPlus / 同一条连接重新协商）时，本端会带着旧 zstd
+                // 处理器去连一个原版对端 —— 单侧 zstd，玩家进不去。
+                channel.attr(ZstdChannelManager.ZSTD_STATE)
+                        .set(ZstdChannelManager.TransportState.PLAIN);
+                ZstdClientActivation.onRoundDeclined(channel);
             }
             LOGGER.debug("[Zstd] dict delivered: encStatus={} decStatus={} -> {}",
                     encoderStatus, decoderStatus, ok ? "will activate zstd" : "staying vanilla");

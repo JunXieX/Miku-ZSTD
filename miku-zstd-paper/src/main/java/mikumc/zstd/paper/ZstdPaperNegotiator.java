@@ -116,7 +116,17 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
         if (settled) {
             // 协商已定案，但协商器还要留一小段时间：客户端对查询的应答可能晚于服务端的
             // 协议切换到达。这类应答必须被吞掉（见 settled 的注释），其余包原样下传。
+            // ⚠️ 但"切换确认"要先把 txId 回填给闸门再吞 —— 帧层嗅探器是主路径，这里是它
+            // 缺位时的包层兜底；若和普通应答一起吞掉，闸门只能白等 5 秒超时才放行扣包。
             if (isQueryAnswer(msg)) {
+                int switchTx = readSwitchTxId(msg);
+                if (switchTx > 0) {
+                    ZstdPaperChannelManager m = ctx.channel()
+                            .attr(ZstdPaperChannelManager.KEY).get();
+                    if (m != null && m.isReplaced()) {
+                        m.markSwitchConfirmed(switchTx);
+                    }
+                }
                 io.netty.util.ReferenceCountUtil.release(msg);
             } else {
                 super.channelRead(ctx, msg);
