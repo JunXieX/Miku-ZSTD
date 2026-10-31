@@ -198,4 +198,32 @@ class ZstdSwitchGateTest {
                 "多余字节必须拒绝");
         assertFalse(ZstdStepFrames.matchesMagic(null), "null 必须拒绝");
     }
+
+    @Test
+    @DisplayName("握手解析：询问包（txId + 长度 + 通道名 + 魔数）必须能读出 txId")
+    void readsQueryTxId() {
+        ByteBuf buf = Unpooled.buffer();
+        ZstdVarInts.write(buf, 12345);
+        ZstdVarInts.writeString(buf, ZstdSwitchGate.CHANNEL);
+        buf.writeInt(ZstdSwitchGate.MAGIC);
+        byte[] bare = new byte[buf.readableBytes()];
+        buf.readBytes(bare);
+
+        assertEquals(12345, ZstdStepFrames.readSwitchTxId(bare),
+                "询问包的 txId 与魔数之间隔着长度与通道名，不能要求紧贴");
+    }
+
+    @Test
+    @DisplayName("握手解析：确认包（txId + bool + 魔数）必须能读出 txId")
+    void readsConfirmTxId() {
+        ByteBuf buf = Unpooled.buffer();
+        ZstdVarInts.write(buf, 67890);
+        buf.writeBoolean(true);
+        buf.writeInt(ZstdSwitchGate.MAGIC);
+        byte[] bare = new byte[buf.readableBytes()];
+        buf.readBytes(bare);
+
+        assertEquals(67890, ZstdStepFrames.readSwitchTxId(bare),
+                "确认包的 txId 与魔数之间隔着 success 字节");
+    }
 }
