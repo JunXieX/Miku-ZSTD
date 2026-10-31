@@ -39,7 +39,7 @@ public class ZstdChannelManager {
     public static final AttributeKey<ZstdChannelManager> KEY = AttributeKey.valueOf("zstd:manager");
 
     /** 协商协议版本（三端必须一致）。版本不一致时本端会干净回落原版，不会出现半 zstd。 */
-    public static final int PROTOCOL_VERSION = 5;
+    public static final int PROTOCOL_VERSION = mikumc.zstd.protocol.ZstdProtocolVersion.NEGOTIATE;
 
     /**
      * 压缩/解压上下文。
@@ -50,8 +50,13 @@ public class ZstdChannelManager {
      */
     private ZstdCompressCtx compressCtx;
     private ZstdDecompressCtx decompressCtx;
-    /** 已取用的共享字典条目，连接关闭时归还引用 */
-    private ZstdDictRegistry.Entry encoderDictEntry;
+    /**
+     * 已取用的共享字典条目，连接关闭时归还引用。
+     *
+     * <p>⚠️ volatile：{@code hasCompressDict()} 会被<b>压缩池线程</b>调用（编码器据此选
+     * 小包跳过阈值），而装载发生在 event loop 上；非 volatile 时池线程可能一直读到 null。</p>
+     */
+    private volatile ZstdDictRegistry.Entry encoderDictEntry;
     private ZstdDictRegistry.Entry decoderDictEntry;
 
     /**

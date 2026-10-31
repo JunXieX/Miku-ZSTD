@@ -78,7 +78,8 @@ public class ZstdPaperConfig {
         //     21-bit" 并断连（不是"字典不生效"，是"进不去"）。详见 ZstdVarInts 的常量注释。
         this.trainerDictMaxBytes = clamp(getInt(t, "dict_max_bytes", 131072), 1024,
                 mikumc.zstd.protocol.ZstdVarInts.MAX_DICT_BYTES_PER_DIRECTION);
-        this.trainerSampleTargetBytes = clamp(getInt(t, "sample_target_bytes", 1048576), 1024, 1 << 30);
+        // 上限 64MB：1GB 会让样本环在极端配置下直接吃掉整个堆，而且训练用不到这么多样本。
+        this.trainerSampleTargetBytes = clamp(getInt(t, "sample_target_bytes", 1048576), 1024, 64 << 20);
         this.trainerMaxHistorySamples = clamp(getInt(t, "max_history_samples", 20000), 0, 10_000_000);
         this.trainerAdoptionThreshold = clampD(getDouble(t, "adoption_threshold", 0.01), 0.0, 1.0);
         this.trainerPruneMinPayload = clamp(getInt(t, "prune_min_payload", 16), 0, 4096);

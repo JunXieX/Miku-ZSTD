@@ -4,6 +4,8 @@ import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelInitializer;
 import io.papermc.paper.ServerBuildInfo;
+import org.bukkit.permissions.Permission;
+import org.bukkit.permissions.PermissionDefault;
 import net.kyori.adventure.key.Key;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.slf4j.Logger;
@@ -71,6 +73,7 @@ public class MikuZstdPaper extends JavaPlugin {
             return;
         }
 
+        registerPermissions();
         ZstdPaperTrainer.init(getDataFolder().toPath());
         ZstdCompressPool.init(ZstdPaperConfig.INSTANCE.compressThreads, 5);
         // onEnable 阶段 MC 的监听通道通常还没建立，等服务器就绪后再挂钩。
@@ -88,6 +91,32 @@ public class MikuZstdPaper extends JavaPlugin {
                         "mikuzstd", "查看 Miku-ZSTD 状态与字典训练情况", new ZstdPaperCommand()));
         LOGGER.info("[Zstd] Miku-ZSTD Paper 已启用（目标 Paper/Folia 26.2+，平台={}，无 Bukkit 兼容层）",
                 platformName());
+    }
+
+    /**
+     * 运行期注册权限节点。
+     *
+     * <p>⚠️ 不写进 {@code paper-plugin.yml} 的 {@code permissions} 段：那段在 reload 时
+     * 不会清理旧节点，而权限默认值（op）应当随插件生命周期严格成对出现。</p>
+     */
+    private void registerPermissions() {
+        try {
+            Permission permission = new Permission("mikuzstd.command",
+                    "使用 /mikuzstd 的 BossBar 监控开关（status / top 等只读子命令对所有人开放）",
+                    PermissionDefault.OP);
+            getServer().getPluginManager().addPermission(permission);
+        } catch (Throwable t) {
+            LOGGER.warn("[Zstd] 注册权限节点失败（/mikuzstd bar 将只按 OP 判定）", t);
+        }
+    }
+
+    /** 停用时摘掉本插件注册的权限节点，避免重载留下陈旧节点。 */
+    private void unregisterPermissions() {
+        try {
+            getServer().getPluginManager().removePermission("mikuzstd.command");
+        } catch (Throwable t) {
+            LOGGER.debug("[Zstd] 移除权限节点失败: {}", t.toString());
+        }
     }
 
     @Override
@@ -115,6 +144,7 @@ public class MikuZstdPaper extends JavaPlugin {
         } catch (Throwable t) {
             LOGGER.warn("[Zstd] 关闭压缩线程池时异常", t);
         }
+        unregisterPermissions();
         LOGGER.info("[Zstd] Miku-ZSTD Paper 已停用");
     }
 

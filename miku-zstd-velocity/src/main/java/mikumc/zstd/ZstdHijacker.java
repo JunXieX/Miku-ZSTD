@@ -235,18 +235,19 @@ public class ZstdHijacker extends ChannelDuplexHandler {
                     }
                     if (isNegotiate && needsDictPush(encStatus, decStatus)) {
                         // 协议 v4：客户端报告缺字典 —— 单独推送一次 zstd:dict，
-                        // 门控结论等这次推送的应答到达后再定（见 markDictResponse 调用点）
-                        mgr.markDictRequested();
+                        // 门控结论等这次推送的应答到达后再定（见 markDictResponse 调用点）。
+                        // ⚠️ 只有第一次请求才推：重放的应答若再推一遍，不仅白传整份字典
+                        //（默认 2×128KB，上限 2×1MB），还会把 dictTxId 覆盖成新值，
+                        // 让前一次的应答从此无人认领。
+                        if (!mgr.markDictRequested()) {
+                            return; // 已经在等字典应答
+                        }
                         if (!sendDictQuery(ctx.channel(), ZstdNegotiateStatus.needsDict(encStatus),
                                 ZstdNegotiateStatus.needsDict(decStatus))) {
                             // 推送没发出去（字典过大 / 锚点缺失）：立即回落原版，
                             // 不要白等满 10 秒的字典阶段预算。
                             LOGGER.warn("[Zstd] zstd:dict 未能发出 — 立即回落原版");
-                            releaseHeld(ctx);
-                            // 回落即收尾：不摘掉自身就会永久留在每个出站包的热路径上。
-                            if (ctx.pipeline().get(ZstdHijacker.class) != null) {
-                                ctx.pipeline().remove(this);
-                            }
+                            giveUp(ctx);
                             return;
                         }
                     } else {
@@ -823,7 +824,9 @@ public class ZstdHijacker extends ChannelDuplexHandler {
         // ⚠️ 从 zstd_encoder 的 ctx 写出，并<b>自己把内容编码成 zstd 直存帧</b>：
         //   · ctx.write 会跳过 zstd_encoder 本身，所以不能再让它编码一次；
         //   · 闸门位于压缩编码器<b>之前</b>，从它之后写出不会被自己扣住；
-        //   · 外层 bodyLen 由管线里更靠 head 的 frame-encoder 补齐（Velocity 无独立 prepender）。
+        //   · Velocity 没有独立 prepender / frame-encoder：外层 bodyLen 由本方法自己写
+        //     （见下面 writeBodyLen 那段），再往 head 走只剩帧长度处理器。
+        //     若照旧注释去"补 frame-encoder"，会写出双层长度前缀 —— 正是 2.0.0 的断连回归形态。
         // 几十字节远低于压缩阈值，直存即可。
         ChannelHandlerContext writeCtx = channel.pipeline().context("zstd_encoder");
         if (writeCtx == null) {

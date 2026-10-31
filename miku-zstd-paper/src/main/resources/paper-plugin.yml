@@ -1,6 +1,6 @@
 # Miku-ZSTD — Paper 端（纯 Paper，无 Bukkit/Spigot 兼容层；同一份产物也跑 Folia）
 name: Miku-ZSTD
-version: 5.0.5
+version: 5.0.6
 main: mikumc.zstd.paper.MikuZstdPaper
 api-version: 1.26
 # Folia 只加载显式声明的插件。本插件的调度全部走区域调度器（GlobalRegionScheduler /
@@ -9,8 +9,5 @@ folia-supported: true
 authors: [JunXieX]
 description: 用 zstd 替代原版 zlib 压缩玩家连接的网络流量（需客户端安装 Miku-ZSTD 模组）
 website: https://github.com/JunXieX/Miku-ZSTD
-
-permissions:
-  mikuzstd.command:
-    description: 使用 /mikuzstd 的 BossBar 监控开关（status / top 等只读子命令对所有人开放）
-    default: op
+# 权限节点在 onEnable 运行期注册（见 MikuZstdPaper#registerPermissions）：
+# 这里不声明 permissions —— 那段在 reload 时不会清理陈旧节点，且默认值应随插件生命周期成对出现。

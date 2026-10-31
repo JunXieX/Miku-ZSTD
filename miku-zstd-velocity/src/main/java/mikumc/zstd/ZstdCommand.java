@@ -170,10 +170,12 @@ public final class ZstdCommand {
         source.sendMessage(Component.text("Config reloaded.", NamedTextColor.GREEN));
         // ⚠️ 必须说清楚作用范围，否则管理员会以为 reload 没生效。三类参数都不会作用于已有连接：
         //   · level / window_log：连接建立时应用到该连接的 zstd 上下文（见 ZstdChannelManager 构造器）；
-        //   · threads：线程池是首次 init 时就固定下来的（ZstdCompressPool.init 幂等）；
+        //   · batch_window_ms / batch_max_packets：编码器 handlerAdded 时快照；
+        //   · threads / trainer.*：线程池只在首次 init 时固定，训练器参数在 init 构造器里快照。
         source.sendMessage(Component.text(
-                "注意：level / window_log / threads 只对【之后新建立的连接】（线程池则需重启代理）生效；"
-                        + "已有连接仍在用旧值。logging.debug 与 bossbar.format 已即时生效。",
+                "即时生效：logging.debug、bossbar.format、skip_compress_below_bytes*；"
+                        + "需新连接：level、window_log、batch_window_ms、batch_max_packets；"
+                        + "需重启代理：threads、trainer.*。已有连接仍在用旧值。",
                 NamedTextColor.YELLOW));
     }
 

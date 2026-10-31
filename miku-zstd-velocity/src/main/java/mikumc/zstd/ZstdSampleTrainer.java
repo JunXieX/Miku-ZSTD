@@ -531,14 +531,26 @@ public class ZstdSampleTrainer {
                 }
             }
 
-            // 先把未入库样本归档（无论采纳与否），再清空样本环
+            // 先把未入库样本归档（无论采纳与否），再移除"本轮已参与训练"的前缀。
+            // ⚠️ 不能直接 clear()：训练/评估期间 addBatch 仍在往环里追加，那些样本
+            // 既没参与本轮训练、也会被 clear 一起丢掉 —— 字典训练集于是永远只反映
+            // "训练开始那一刻之前"的流量，丢失量随训练时长增长。
             persist(adopted);
             synchronized (this) {
-                sampleRing.clear();
-                sampleBytes = 0;
+                int trained = Math.min(snapshot.size(), sampleRing.size());
+                if (trained > 0) {
+                    sampleRing.subList(0, trained).clear();
+                }
+                int remainingBytes = 0;
+                for (byte[] s : sampleRing) {
+                    remainingBytes += s.length;
+                }
+                sampleBytes = remainingBytes;
                 ringFull = false;
                 nextTrainCheckMs = 0;
-                savedCount = 0;
+                // persist 已把 savedCount 推到清空前的 size；剩下来的样本都已归档，
+                // 所以它应等于"剩余样本数"
+                savedCount = Math.max(0, savedCount - trained);
             }
         } catch (Exception e) {
             LOGGER.error("[Zstd] {} train task failed", name, e);

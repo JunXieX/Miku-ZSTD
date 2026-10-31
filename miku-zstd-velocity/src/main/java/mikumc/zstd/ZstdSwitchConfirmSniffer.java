@@ -34,10 +34,25 @@ public final class ZstdSwitchConfirmSniffer extends MessageToMessageDecoder<Byte
      * 单帧上限：确认包是 {@code [0][0x02][varint txId][bool][magic]} ≈ 12B（被原版压缩过也只有二三十字节），
      * 超过这个尺寸的帧一律不可能是它。
      *
-     * <p>⚠️ 本嗅探器是<b>常驻</b>的（确认到达后仍要留在管线里等极晚到达的重传），所以这个上限
-     * 同时是热路径开关：调大意味着更多入站帧要走 {@link ZstdStepFrames#asBarePacket} 的解析。</p>
+     * <p>⚠️ 本嗅探器只常驻到"切换窗口结束"：命中一次即自移除（闸门已放行，重传没有意义），
+     * 从未命中时由 {@code handlerAdded} 的 10 秒兜底移除。这个上限同时是热路径开关：
+     * 调大意味着更多入站帧要走 {@link ZstdStepFrames#asBarePacket} 的解析。</p>
      */
     private static final int MAX_FRAME_BYTES = 64;
+
+    /**
+     * 兜底自移除：闸门最多等 5 秒（{@code ZstdSwitchGate.RELEASE_TIMEOUT_MS}），
+     * 客户端从不确认时（旧版模组 / 应答丢失）本嗅探器若一直留在管线里，
+     * 就会在整场连接上为每个 ≤64B 的入站帧做一次帧形态解析。
+     */
+    @Override
+    public void handlerAdded(ChannelHandlerContext ctx) {
+        ctx.executor().schedule(() -> {
+            if (ctx.pipeline().context(this) != null) {
+                ctx.pipeline().remove(this);
+            }
+        }, 10, java.util.concurrent.TimeUnit.SECONDS);
+    }
 
     @Override
     protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) {
