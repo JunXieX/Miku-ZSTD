@@ -273,6 +273,19 @@ public class ZstdHijacker extends ChannelDuplexHandler {
                     msg.getClass().getSimpleName(), holding, pipelineActivated);
         }
 
+        // ⚠️ 服务器列表 ping 绝不能走协商：STATUS 协议里没有 LoginPluginRequest(0x04)，
+        // 客户端会把它当成未知包解析失败，服务器在列表里直接显示为离线。
+        // 事件兜底路径拿不到 nextState，这里用"首个出站包是不是 StatusResponse"来判 ——
+        // ping 连接的首包必然是它，而登录连接的首包是 EncryptionRequest / SetCompression。
+        if (mgr != null && !mgr.isNegotiationSent() && isStatusResponse(msg)) {
+            LOGGER.debug("[Zstd] first outbound is a status response — not a login connection, skipping zstd");
+            if (ctx.pipeline().get(ZstdHijacker.class) != null) {
+                ctx.pipeline().remove(this);
+            }
+            super.write(ctx, msg, promise);
+            return;
+        }
+
         // negotiate 兜底触发（主路径在握手注入时已发出，防重）
         if (mgr != null && !mgr.isNegotiationSent()) {
             sendNegotiateNow(ctx.channel());
@@ -412,6 +425,20 @@ public class ZstdHijacker extends ChannelDuplexHandler {
      * <p>调用时机必须是"管道已定型"之后：激活成功时 zstd 编解码器已就位，
      * 回落原版时原版压缩编码器仍在位——两种情形下都只需按原路径写出即可。</p>
      */
+    /**
+     * 回落原版 + 摘掉自身处理器。
+     *
+     * <p>⚠️ 回落分支<b>必须</b>走这里：只 releaseHeld 会让这个 duplex handler 永久留在
+     * 每个出站包的热路径上（attr 查询 + SetCompression 判定 + debug 日志），
+     * 并持续持有本插件的类加载器。类注释承诺的"激活后自移除"在回落路径上同样成立。</p>
+     */
+    private void giveUp(ChannelHandlerContext ctx) {
+        releaseHeld(ctx);
+        if (ctx.pipeline().get(ZstdHijacker.class) != null) {
+            ctx.pipeline().remove(this);
+        }
+    }
+
     private void releaseHeld(ChannelHandlerContext ctx) {
         holding = false;
         if (heldPackets.isEmpty()) return;
@@ -472,7 +499,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
                                 + "（字典已请求={} 字典已确认={}；字典已请求=false 表示连协商应答都没收到）",
                         RESPONSE_RETRY_MS * maxRetries,
                         mgr.isDictRequested(), mgr.isDictConfirmed());
-                releaseHeld(ctx); // 回落原版：补发扣下的包（原版压缩编码器仍在位）
+                giveUp(ctx); // 回落原版：补发扣下的包 + 摘掉自身
                 return;
             }
             channel.eventLoop().schedule(() -> tryActivate(ctx, attempt + 1),
@@ -482,7 +509,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
 
         if (mgr.isProtocolMismatch()) {
             LOGGER.warn("[Zstd] Protocol mismatch reported by client — skipping zstd (vanilla fallback)");
-            releaseHeld(ctx); // 回落原版：补发扣下的包
+            giveUp(ctx); // 回落原版：补发扣下的包 + 摘掉自身
             return;
         }
 
@@ -494,7 +521,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
         if (mgr.isDictRequested() && !mgr.isDictConfirmed()) {
             LOGGER.warn("[Zstd] 客户端请求了字典但未确认就绪（zstd:dict 应答缺失）"
                     + "— 放弃 zstd 并回落原版，避免单侧 zstd 断连");
-            releaseHeld(ctx);
+            giveUp(ctx); // 回落原版：补发扣下的包 + 摘掉自身
             return;
         }
 
@@ -544,14 +571,14 @@ public class ZstdHijacker extends ChannelDuplexHandler {
 
         if (p.get(MINECRAFT_DECODER) == null || p.get(MINECRAFT_ENCODER) == null) {
             LOGGER.warn("[Zstd] Cannot activate zstd — not a frontend Minecraft channel");
-            releaseHeld(ctx); // 不可激活：必须补发扣住的包，否则连接卡死
+            giveUp(ctx); // 不可激活：补发扣住的包 + 摘掉自身，否则连接卡死
             return false;
         }
         // 先确认两端都能替换，再动手——避免只装上一侧造成单侧 zstd 的必断连组合
         if (!hasEncoderAnchor(p) || !hasDecoderAnchor(p)) {
             LOGGER.error("[Zstd] Cannot activate zstd — pipeline anchors missing (encoder={}, decoder={}); "
                     + "pipeline={}", hasEncoderAnchor(p), hasDecoderAnchor(p), p.names());
-            releaseHeld(ctx); // 同上：不能把包一直扣着
+            giveUp(ctx); // 同上：不能把包一直扣着
             return false;
         }
 
@@ -594,7 +621,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
                 channel.close();
                 return false;
             }
-            releaseHeld(ctx); // 回落原版：把扣住的包按原路径补发（此时管线仍是完整原版）
+            giveUp(ctx); // 回落原版：补发扣住的包 + 摘掉自身（此时管线仍是完整原版）
             return false;
         }
 
@@ -846,6 +873,11 @@ public class ZstdHijacker extends ChannelDuplexHandler {
      * 以前帧层嗅探器少了这个分支，导致服务端跳过字典推送就直接激活，
      * 而客户端因为"等字典"停在 PLAIN 状态永不激活 → 单侧 zstd → 断连。</p>
      */
+    /** 是否是服务器列表 ping 的响应（STATUS 阶段唯一的出站包）。 */
+    private static boolean isStatusResponse(Object msg) {
+        return msg != null && msg.getClass().getName().endsWith("StatusResponse");
+    }
+
     static boolean needsDictPush(int encStatus, int decStatus) {
         return ZstdNegotiateStatus.needsDict(encStatus) || ZstdNegotiateStatus.needsDict(decStatus);
     }

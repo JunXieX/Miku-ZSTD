@@ -29,7 +29,7 @@ public class MixinHandshakeListener {
         // 压缩 handler 已在本方法内安装完毕；通过 eventLoop 排队激活，
         // 保证晚于任何在本轮登录压缩流程中后置安装的处理器。
         if (this.connection != null) {
-            cn.miku.zstd.ZstdClientActivation.activate(
+            cn.miku.zstd.ZstdClientActivation.prepareForSwitch(
                     ((cn.miku.zstd.mixin.ConnectionAccessor) this.connection).getChannel());
         }
     }

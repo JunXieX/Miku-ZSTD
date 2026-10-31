@@ -21,7 +21,7 @@ public class MixinConnectionSetup {
     @Inject(method = "setupCompression", at = @At("TAIL"))
     private void zstd$onSetupCompressionTail(int threshold, boolean validateDecompression, CallbackInfo ci) {
         if (this.channel != null) {
-            cn.miku.zstd.ZstdClientActivation.activate(this.channel);
+            cn.miku.zstd.ZstdClientActivation.prepareForSwitch(this.channel);
         }
     }
 }

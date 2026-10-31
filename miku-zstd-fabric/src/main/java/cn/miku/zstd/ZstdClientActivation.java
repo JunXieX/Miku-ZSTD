@@ -61,6 +61,34 @@ public final class ZstdClientActivation {
     }
 
     /**
+     * 原版 {@code setupCompression} 之后调用：<b>只装切换嗅探器，不替换编解码器</b>。
+     *
+     * <h2>为什么不在这里直接切</h2>
+     * <p>旧实现收到 SetCompression 就切 zstd。但服务端可能<b>回落原版</b>（协商超时、
+     * 锚点缺失、安装失败），此时它补发扣住登录包的路径仍是原版 zlib —— 客户端已经切了
+     * zstd，第一帧就解不开，玩家直接掉线（线上日志：两条 {@code activated} 后紧跟
+     * {@code lost connection}）。</p>
+     *
+     * <p>现在改成"等服务端的 {@code zstd:switch} 请求再切"：服务端只有在<b>真正激活</b>
+     * 时才发那条请求，而请求是 {@code [0][packet]} 直存帧——与原版未压缩帧逐字节同形，
+     * 客户端在<b>原版压缩</b>状态下也能正常收到并由 {@link ZstdSwitchSniffer} 识别。
+     * 于是"服务端回落"这条路径下客户端始终保持原版，不会再出现单侧 zstd。</p>
+     */
+    public static void prepareForSwitch(Channel channel) {
+        if (channel == null) return;
+        channel.eventLoop().execute(() -> {
+            if (!channel.isActive()) return;
+            if (deactivateIfStale(channel)) return;
+            ChannelPipeline p = channel.pipeline();
+            removeStaleVanillaHandlers(p);
+            // 嗅探器必须位于 decompress 之前：它处理的是帧（ByteBuf），
+            // 放在包层收不到、且裸询问会被原版压缩解码器丢弃。
+            installSwitchSniffer(p);
+            LOGGER.debug("[Zstd] client armed for switch handshake; pipeline={}", p.names());
+        });
+    }
+
+    /**
      * 登录查询应答<b>写出之后</b>调用（当前唯一调用点是 {@code zstd:dict}）：
      * 字典装载成功、状态刚变为 {@link ZstdChannelManager.TransportState#NEGOTIATING} 时补一次激活尝试。
      *

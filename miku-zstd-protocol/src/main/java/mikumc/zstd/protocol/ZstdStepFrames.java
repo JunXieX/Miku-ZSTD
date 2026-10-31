@@ -166,7 +166,11 @@ public final class ZstdStepFrames {
         if (!matchesMagic(magic)) return -1;
         int[] cursor = {0};
         int txId = ZstdVarInts.readOr(bare, cursor, -1);
-        return txId > 0 ? txId : -1;
+        if (txId <= 0) return -1;
+        // txId 之后必须恰好紧贴 4 字节魔数（与 readSwitchRejectTxId 的对称校验）：
+        // 否则"任意包尾恰好是魔数"的长帧会被误判成切换握手。
+        if (cursor[0] + 4 != bare.length) return -1;
+        return txId;
     }
 
     /**

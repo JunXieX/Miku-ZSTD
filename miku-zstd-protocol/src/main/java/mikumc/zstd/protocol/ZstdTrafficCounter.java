@@ -34,7 +34,13 @@ public final class ZstdTrafficCounter {
 
     /** 采集开关：由展示层（BossBar 监控）控制。关闭时 {@link #record} 只剩一次 volatile 读。 */
     private static volatile boolean enabled;
-    private static volatile long lastSampleMs;
+    /**
+     * 上次采样的单调时钟读数（{@link System#nanoTime()}）。
+     *
+     * <p>⚠️ 不能用 {@code currentTimeMillis}：NTP 校时回拨会让间隔变成负数/极小值，
+     * 速率被放大成几十上百 MB/s 的假尖峰（展示层看到的是"带宽爆了"）。</p>
+     */
+    private static volatile long lastSampleNanos;
     private static volatile long lastRaw;
     private static volatile long lastWire;
 
@@ -68,7 +74,7 @@ public final class ZstdTrafficCounter {
      * <p>只在持有展示层的锁时调用（两端都在各自的 toggle 里同步调用）。</p>
      */
     public static synchronized void resetBaseline() {
-        lastSampleMs = System.currentTimeMillis();
+        lastSampleNanos = System.nanoTime();
         lastRaw = TOTAL_RAW.sum();
         lastWire = TOTAL_WIRE.sum();
     }
@@ -91,14 +97,15 @@ public final class ZstdTrafficCounter {
 
     /** 取一次快照并推进基线（两端都只在展示层线程上调用）。 */
     public static synchronized Snapshot sample() {
-        long now = System.currentTimeMillis();
+        long now = System.nanoTime();
         long curRaw = TOTAL_RAW.sum();
         long curWire = TOTAL_WIRE.sum();
-        double sec = lastSampleMs == 0 ? 1.0 : Math.max((now - lastSampleMs) / 1000.0, 0.001);
+        double sec = lastSampleNanos == 0 ? 1.0
+                : Math.max((now - lastSampleNanos) / 1_000_000_000.0, 0.001);
 
         long dRaw = curRaw - lastRaw;
         long dWire = curWire - lastWire;
-        lastSampleMs = now;
+        lastSampleNanos = now;
         lastRaw = curRaw;
         lastWire = curWire;
 

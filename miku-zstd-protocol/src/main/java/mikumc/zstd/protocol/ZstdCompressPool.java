@@ -78,30 +78,43 @@ public final class ZstdCompressPool {
      * {@link #backlogged()} 就是把这个信号暴露给运维，让他们去降 level 或加线程。</p>
      */
     public static void execute(Runnable task) {
-        if (pool == null) {
+        ExecutorService p = pool;
+        if (p == null) {
             init(0, 0);
+            p = pool;
         }
-        ACTIVE.incrementAndGet();
         TOTAL_TASKS.increment();
-        try {
-            pool.execute(() -> {
-                long t0 = System.nanoTime();
-                try {
-                    task.run();
-                } finally {
-                    long dt = System.nanoTime() - t0;
-                    TOTAL_NANOS.add(dt);
-                    MAX_NANOS.accumulateAndGet(dt, Math::max);
-                    if (dt >= slowThresholdMs * 1_000_000L) {
-                        SLOW_TASKS.incrementAndGet();
-                    }
-                    ACTIVE.decrementAndGet();
+        // ACTIVE 只统计"正在执行"，排队中的任务不计入 —— 否则 summary() 的"活跃"会把
+        // 队列长度也算进去，与"CPU 是否打满"的判读混淆。
+        p.execute(() -> {
+            ACTIVE.incrementAndGet();
+            long t0 = System.nanoTime();
+            try {
+                task.run();
+            } finally {
+                long dt = System.nanoTime() - t0;
+                TOTAL_NANOS.add(dt);
+                MAX_NANOS.accumulateAndGet(dt, Math::max);
+                if (dt >= slowThresholdMs * 1_000_000L) {
+                    SLOW_TASKS.incrementAndGet();
                 }
-            });
-        } catch (Throwable t) {
-            // 池被关闭等极端情况：把计数还原，避免 ACTIVE 永久偏高
-            ACTIVE.decrementAndGet();
-            throw t;
+                ACTIVE.decrementAndGet();
+            }
+        });
+    }
+
+    /**
+     * 关闭池（插件停用/重载时调用）。
+     *
+     * <p>⚠️ 必须存在：{@link #init(int, long)} 是"只生效一次"的，没有 shutdown 的话
+     * 每次重载都换不掉旧线程池 —— 旧池里的 worker 一直活着并持有旧的类加载器。
+     * 关闭后 {@link #execute(Runnable)} 会按默认值重新建池。</p>
+     */
+    public static synchronized void shutdown() {
+        ExecutorService p = pool;
+        pool = null;
+        if (p != null) {
+            p.shutdownNow();
         }
     }
 

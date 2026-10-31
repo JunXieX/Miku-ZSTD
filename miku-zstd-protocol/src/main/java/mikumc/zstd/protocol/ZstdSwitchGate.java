@@ -188,6 +188,23 @@ public final class ZstdSwitchGate extends ChannelDuplexHandler {
 
     @Override
     public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) {
+        // ⚠️ 扣包与放行必须全部串行到 event loop：release() 在 event loop 上把扣住的包
+        // 逐条写出，而写包线程（Folia 上是区域线程）若在 released 置位后就地放行，
+        // 新包可能插到那批旧包之前 —— 登录期包顺序被打乱，客户端包解码器直接错位。
+        // 投递一次 event loop 任务换来的是"扣包序列与放行序列天然有序"。
+        if (!ctx.executor().inEventLoop()) {
+            ctx.executor().execute(() -> enqueueOrPass(ctx, msg, promise));
+            return;
+        }
+        enqueueOrPass(ctx, msg, promise);
+    }
+
+    private void enqueueOrPass(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) {
+        if (!ctx.channel().isActive()) {
+            ReferenceCountUtil.release(msg);
+            promise.tryFailure(new ClosedChannelException());
+            return;
+        }
         boolean pass;
         synchronized (heldLock) {
             pass = released || !mustHold(msg);
@@ -196,8 +213,6 @@ public final class ZstdSwitchGate extends ChannelDuplexHandler {
                 heldPromises.add(promise);
             }
         }
-        // 放行放在锁外：写操作会一路走到 netty 的 outbound buffer，持锁会让写线程与
-        // 释放线程互相等待。
         if (pass) {
             ctx.write(msg, promise);
         }

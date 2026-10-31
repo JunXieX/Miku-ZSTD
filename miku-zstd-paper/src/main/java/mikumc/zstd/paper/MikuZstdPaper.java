@@ -92,9 +92,29 @@ public class MikuZstdPaper extends JavaPlugin {
 
     @Override
     public void onDisable() {
-        ZstdPaperMonitor.stop();
-        ZstdPaperTrainer.shutdown(); // 内部会调 ZstdPaperDictRegistry.shutdown()，释放字典原生内存
-        uninstallHook();
+        // ⚠️ 三步必须各自兜住异常：任何一步抛出都不能让后面的收尾被跳过。
+        // 漏掉 Monitor 只是少一次发包；漏掉 Trainer 会残留 native 字典内存与训练线程；
+        // 漏掉 uninstallHook 会残留被包装的 childHandler（旧类加载器无法回收）与在线连接上的协商器。
+        try {
+            ZstdPaperMonitor.stop();
+        } catch (Throwable t) {
+            LOGGER.warn("[Zstd] 停用 BossBar 监控时异常（继续收尾）", t);
+        }
+        try {
+            ZstdPaperTrainer.shutdown(); // 内部会调 ZstdPaperDictRegistry.shutdown()，释放字典原生内存
+        } catch (Throwable t) {
+            LOGGER.warn("[Zstd] 停用训练器时异常（继续收尾）", t);
+        }
+        try {
+            uninstallHook();
+        } catch (Throwable t) {
+            LOGGER.warn("[Zstd] 还原挂钩时异常", t);
+        }
+        try {
+            ZstdCompressPool.shutdown();
+        } catch (Throwable t) {
+            LOGGER.warn("[Zstd] 关闭压缩线程池时异常", t);
+        }
         LOGGER.info("[Zstd] Miku-ZSTD Paper 已停用");
     }
 

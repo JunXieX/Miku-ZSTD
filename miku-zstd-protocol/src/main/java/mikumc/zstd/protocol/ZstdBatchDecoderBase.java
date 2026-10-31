@@ -116,8 +116,6 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
      * 保持对畸形输入的严格拒绝。</p>
      */
     private boolean sawZstdFrame;
-    /** 是否已经见过原版帧（仅用于诊断；不影响兼容窗口的退出条件）。 */
-    private boolean sawVanillaFrame;
     /** {@link #readVarIntAt} 的结束位置出参（避免热路径上每包一次 int[] 分配） */
     private int varintEnd;
     /** 传给 {@link ZstdVarInts#readAt} 的出参容器（复用，零分配） */
@@ -272,7 +270,6 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
             //（{@code [0][packet]}，见 ZstdBatchEncoderBase 的帧格式一节）：两种解释结果相同，
             // 因此不存在任何"看起来像不像 zstd 帧"的启发式判断（那正是残留风险的来源）。
             if (legacyFallbackAllowed()) {
-                sawVanillaFrame = true;
                 out.add(in.readRetainedSlice(remaining));
                 return;
             }
@@ -291,7 +288,6 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
         if (legacyFallbackAllowed()) {
             // 原版压缩帧：[varint dataLength][raw deflate(packet)]
             if (decompressVanillaFrame(ctx, in, rawSize, out)) {
-                sawVanillaFrame = true;
                 return;
             }
             protocolError(ctx, "vanilla frame rejected (dataLength=" + rawSize

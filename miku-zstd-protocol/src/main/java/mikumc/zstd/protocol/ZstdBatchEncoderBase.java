@@ -344,8 +344,8 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
             // 它们永远没人释放（引用计数泄漏），而且下一批会把这批残缺数据一并发出去，
             // 同时让 pendingPromises 与 pending 彻底失去对应关系。
             batchRaw = null; // 失败批次的缓冲也不再被本 handler 引用（大帧可立即回收）
+            // removePendingPrefix 现在自带 release，不能再额外 releasePackets（会双重释放）
             removePendingPrefix(batchCount);
-            releasePackets(batchPackets);
             failAll(promises, t);
             LOGGER.error("[Zstd] encoder batch concat failed", t);
             if (!removed && !pending.isEmpty()) {
@@ -534,7 +534,9 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
             off += n;
         }
         onRawBatch(raw, rawTotal); // 采样（必须在缓冲复用前）
-        releasePackets(packets);
+        // ⚠️ 这里<b>不</b>释放 packets：release 必须发生在 removePendingPrefix 读完长度之后。
+        // 旧顺序（先 release 再由 removePendingPrefix 读 readableBytes）读的是已释放的 buffer，
+        // pendingBytes 记账会漂移 —— 而 MAX_PENDING_BYTES 这道防 OOM 闸门唯一的输入就是它。
         return rawTotal;
     }
 
@@ -704,7 +706,10 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
      */
     private void removePendingPrefix(int count) {
         for (int i = 0; i < count; i++) {
-            pendingBytes -= pending.get(i).readableBytes();
+            ByteBuf b = pending.get(i);
+            // 读长度必须早于 release：release 之后 buffer 的索引不再可信
+            pendingBytes -= b.readableBytes();
+            ReferenceCountUtil.release(b);
         }
         pending.subList(0, count).clear();
         pendingPromises.subList(0, count).clear();

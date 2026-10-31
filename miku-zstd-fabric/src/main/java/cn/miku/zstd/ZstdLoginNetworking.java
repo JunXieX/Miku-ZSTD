@@ -188,8 +188,11 @@ public final class ZstdLoginNetworking {
                 // 而服务端收到本条应答后已开始发 zstd 帧 → 单侧 zstd → 必断连。
                 // 回调挂在"本条应答写出"之后：提前替换出站管道会让这条应答以 zstd 帧发出去，
                 // 而服务端此时还没有 zstd 解码器、帧层嗅探器也只认裸帧 → 协商直接失败。
+                // ⚠️ 只补装切换嗅探器，不提前替换编解码器：客户端要等服务端的
+                // zstd:switch 才切（见 prepareForSwitch 的说明）。提前切会让"服务端回落原版"
+                // 时的补发包全部解不开。
                 listenerConsumer.accept(operation ->
-                        ZstdClientActivation.activateAfterQueryResponseSent(channel));
+                        ZstdClientActivation.prepareForSwitch(channel));
             }
             LOGGER.debug("[Zstd] dict delivered: encStatus={} decStatus={} -> {}",
                     encoderStatus, decoderStatus, ok ? "will activate zstd" : "staying vanilla");

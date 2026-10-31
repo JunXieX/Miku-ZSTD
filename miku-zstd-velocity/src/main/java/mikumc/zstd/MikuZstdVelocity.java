@@ -143,6 +143,13 @@ public class MikuZstdVelocity {
         ZstdBossBarMonitor.stop();
         ZstdBandwidthProfiler.shutdown();
         ZstdSampleTrainer.shutdown();
+        // 压缩池必须显式关：init 是"只生效一次"的，留着旧池会让重载后的代理继续用
+        // 旧 worker 线程（并持有旧类加载器）。
+        try {
+            mikumc.zstd.protocol.ZstdCompressPool.shutdown();
+        } catch (Throwable t) {
+            logger.warn("[Zstd] failed to shut down compress pool", t);
+        }
         logger.info("[Zstd] Samples saved on shutdown");
     }
 
@@ -197,7 +204,10 @@ public class MikuZstdVelocity {
                         && channel.pipeline().get("handler") != null) {
                     channel.pipeline().addBefore("handler", "zstd_outbound_spy", new ZstdHijacker());
                 }
-                ZstdHijacker.sendNegotiateNow(channel);
+                // ⚠️ 这里<b>不</b>主动发 negotiate：ConnectionHandshakeEvent 触发时客户端
+                // 还没处理 login start，查询会被丢弃；统一交给 spy.write 的首次出站
+                //（与握手嗅探器主路径一致）。write 里还会用"首个出站是不是 StatusResponse"
+                // 挡掉服务器列表 ping，避免向 STATUS 连接写 LoginPluginRequest。
             } catch (Exception e) {
                 logger.error("[Zstd] Failed to activate zstd negotiation, falling back to vanilla", e);
             }

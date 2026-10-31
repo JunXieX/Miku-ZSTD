@@ -33,10 +33,35 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
     private static final Logger LOGGER = LoggerFactory.getLogger("miku-zstd");
 
     /** NMS 包接口（MC 26.x 未混淆）；用于区分"MC 包"与 netty 控制消息 */
-    private static final Class<?> NMS_PACKET = tryLoad("net.minecraft.network.protocol.Packet");
+    private static final Class<?> NMS_PACKET = loadNmsPacket();
+
+    /**
+     * 加载 NMS 包接口；失败时必须留下一条 WARN。
+     *
+     * <p>⚠️ 旧实现直接 {@code tryLoad(...)} 返回 null：{@link #isPacket} 从此恒为 false，
+     * 协商器<b>一个包都不扣</b>——zstd 仍然会激活，但登录期的包会以原版压缩发出，
+     * 客户端已切 zstd 就解不开，表现成"偶发进不去"且日志里什么都没有。</p>
+     */
+    private static Class<?> loadNmsPacket() {
+        Class<?> c = tryLoad("net.minecraft.network.protocol.Packet");
+        if (c == null) {
+            LOGGER.warn("[Zstd] 未找到 net.minecraft.network.protocol.Packet —— 协商器不会扣包，"
+                    + "登录期包将以原版压缩直发；请确认服务端版本与本插件匹配");
+        }
+        return c;
+    }
 
     private static final long RETRY_MS = 100;
-    private static final int MAX_RETRIES = 20;
+    /**
+     * 等"协商应答"的重试预算：5s（50 次）。
+     *
+     * <p>⚠️ 不能只给 2s：原版客户端也会回一条 {@code success=false} 的应答（立即走
+     * {@code isRefused} 回落，不耗预算），所以这里等的是<b>模组客户端</b>的应答。
+     * 客户端主线程卡顿（加载区块 / GC）超过 2s 很常见，而一旦超时走回落，
+     * 模组客户端那边已经切到 zstd —— 它会解不开我们按原版压缩补发的包，直接掉线。
+     * 预算放大到 5s 把这个窗口压低一个数量级。</p>
+     */
+    private static final int MAX_RETRIES = 50;
 
     /**
      * 「已推送 {@code zstd:dict}、正在等其应答」阶段的重试次数（合计约 10s）。
@@ -288,6 +313,25 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
 
     @Override
     public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception {
+        // ⚠️ 进入扣包窗口后，判定/扣包/放行必须与 releaseHeld 串行 —— 后者在 event loop
+        // 上把扣住的包逐条写出。若写包线程（Folia 上是区域线程）就地放行，新包会插到
+        // 那批旧包之前，登录期包顺序被打乱。
+        // 只在"窗口内"或"本包是 SetCompression"时才投递，正常出站路径没有额外开销。
+        if (!ctx.executor().inEventLoop() && (holding || isCompressionPacket(msg))) {
+            ctx.executor().execute(() -> {
+                try {
+                    writeInEventLoop(ctx, msg, promise);
+                } catch (Throwable t) {
+                    io.netty.util.ReferenceCountUtil.release(msg);
+                    promise.tryFailure(t);
+                }
+            });
+            return;
+        }
+        writeInEventLoop(ctx, msg, promise);
+    }
+
+    private void writeInEventLoop(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception {
         if (settled) {
             // 已定案：不再参与协商，也不扣包（激活后的编码由 zstd_encoder 负责）
             super.write(ctx, msg, promise);
@@ -305,8 +349,7 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
         boolean startHold = false;
         boolean held = false;
         synchronized (holdLock) {
-            if (!holding && isPacket(msg)
-                    && msg.getClass().getSimpleName().contains("ClientboundLoginCompression")) {
+            if (!holding && isCompressionPacket(msg)) {
                 holding = true;
                 startHold = true;
             } else if (holding && isPacket(msg)) {
@@ -409,6 +452,12 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
     private void installHandlers(ChannelHandlerContext ctx, ZstdPaperChannelManager mgr, int installAttempt) {
         Channel channel = ctx.channel();
         if (!channel.isActive()) return;
+        // ⚠️ 重试任务走的是本方法（不是 tryActivate0），所以这里必须自己判一次：
+        // 两条触发路径（SetCompression 写出 / 协商应答到达）都会起一条安装链，
+        // 先成功的那条已经 setReplaced 并发出 switch，晚到的重试若不加这道判断，
+        // 会再装一遍（各步都幂等）并<b>再发一次 switch 请求</b>——客户端收到两个
+        // 不同 txId 的切换请求，第二次确认无人认领。实测（模拟客户端）可稳定复现。
+        if (mgr.isReplaced()) return;
 
         if (!mgr.hasEncoderAnchor(channel) || !mgr.hasDecoderAnchor(channel)) {
             // 原版 compress/decompress 是在 SetCompression 写出之后才装的，首轮必然缺失。
@@ -674,6 +723,12 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
 
     private static boolean isPacket(Object msg) {
         return NMS_PACKET != null && NMS_PACKET.isInstance(msg);
+    }
+
+    /** 是否是原版下发的 {@code SetCompression}（进入扣包窗口的唯一触发点）。 */
+    private static boolean isCompressionPacket(Object msg) {
+        return isPacket(msg)
+                && msg.getClass().getSimpleName().contains("ClientboundLoginCompression");
     }
 
     /**
