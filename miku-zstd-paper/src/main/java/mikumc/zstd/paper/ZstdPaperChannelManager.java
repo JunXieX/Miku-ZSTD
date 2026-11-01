@@ -341,6 +341,7 @@ public class ZstdPaperChannelManager {
         // ⚠️ 且必须**先立标志再关上下文**：标志与 close 在同一段持锁区内，池线程在锁内读到
         // 标志即可安全放弃；顺序反了（先 close 后立标志）等于没防（详见 ZstdCompressLock 注释）。
         synchronized (compressLock) {
+            if (compressLock.isClosed()) return;
             compressLock.markClosed();
             // 归还而非关闭：池内部会 reset（清字典与参数），池满或已停用时才真正 close
             ZstdCtxPool.returnCompress(compressCtx);

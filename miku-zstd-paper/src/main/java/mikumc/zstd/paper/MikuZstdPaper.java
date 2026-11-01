@@ -2,6 +2,7 @@ package mikumc.zstd.paper;
 
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelInitializer;
 import io.papermc.paper.ServerBuildInfo;
 import org.bukkit.permissions.Permission;
@@ -44,6 +45,10 @@ import mikumc.zstd.protocol.ZstdCompressPool;
 public class MikuZstdPaper extends JavaPlugin {
 
     private static final Logger LOGGER = LoggerFactory.getLogger("miku-zstd");
+    private static final ChannelFutureListener CLOSE_MANAGER = future -> {
+        ZstdPaperChannelManager mgr = future.channel().attr(ZstdPaperChannelManager.KEY).getAndSet(null);
+        if (mgr != null) mgr.close();
+    };
 
     /**
      * 挂钩现场，供 {@link #onDisable()} 还原。
@@ -199,11 +204,13 @@ public class MikuZstdPaper extends JavaPlugin {
                     LOGGER.debug("[Zstd] 摘除协商器失败（忽略）: {}", t.toString());
                 }
             }
-            ZstdPaperChannelManager mgr = channel.attr(ZstdPaperChannelManager.KEY).get();
+            ZstdPaperChannelManager mgr = channel.attr(ZstdPaperChannelManager.KEY).getAndSet(null);
+            channel.closeFuture().removeListener(CLOSE_MANAGER);
             if (mgr == null) return;
             // ⚠️ 先记下是否已激活：uninstallZstd 内部会把该状态清成 false。
             boolean activated = mgr.isReplaced();
             mgr.uninstallZstd(channel);
+            mgr.close();
             if (activated) {
                 // 对端此刻仍按 zstd 收发，原版管线发过去它只会解不开；断开让客户端重连，
                 // 重连后插件已停用，自然走原版 zlib。
@@ -472,8 +479,7 @@ public class MikuZstdPaper extends JavaPlugin {
                     + "该连接保持原版 zlib", t);
             return;
         }
-        channel.attr(ZstdPaperChannelManager.KEY).set(mgr);
-        channel.closeFuture().addListener(f -> mgr.close());
+        bindManager(channel, mgr);
 
         // 注：不再安装帧层应答嗅探器 —— 应答改由协商器在包层拦截（见 ZstdPaperNegotiator.channelRead），
         // 这样不依赖 "splitter" 等 handler 名在注入时刻是否已存在。
@@ -481,6 +487,12 @@ public class MikuZstdPaper extends JavaPlugin {
         if (p.get("miku-zstd-negotiator") == null) {
             p.addBefore("packet_handler", "miku-zstd-negotiator", new ZstdPaperNegotiator());
         }
+    }
+
+    /** 通道持有管理器；停用时解除同一监听器，避免保留旧插件类加载器。 */
+    private static void bindManager(Channel channel, ZstdPaperChannelManager mgr) {
+        channel.attr(ZstdPaperChannelManager.KEY).set(mgr);
+        channel.closeFuture().addListener(CLOSE_MANAGER);
     }
 
     private static Object readQuietly(Field f, Object target) {
