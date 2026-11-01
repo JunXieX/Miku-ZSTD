@@ -17,6 +17,10 @@ MikuMC plugin community group: **1105054380**
 
 MikuMC 系列插件交流群：1105054380
 
+Looking to modify or maintain the code? See [DEVELOPMENT.md](DEVELOPMENT.md) for the protocol spec, threading model and the list of past incidents.
+
+需要改代码或接手维护，见 [DEVELOPMENT.md](DEVELOPMENT.md)：协议规格、线程模型、历史事故清单。
+
 ---
 
 ## Why it matters
@@ -174,9 +178,9 @@ First launch creates `Miku-ZSTD/config.yml` in your game directory.
 ## How it works
 **工作原理**
 
-Protocol version v5, identical across Velocity, Paper and Fabric (frame format v4).
+Protocol version v6, identical across Velocity, Paper and Fabric (frame format v5).
 
-协议版本 v5（Velocity / Paper / Fabric 三端的协议版本常量一致；帧格式 v4）。
+协议版本 v6（Velocity / Paper / Fabric 三端的协议版本常量一致；帧格式 v5）。
 
 ```text
 Client --handshake (marker "\0ZSTD\0" appended to hostname)--> Server
@@ -205,18 +209,24 @@ Client --handshake (marker "\0ZSTD\0" appended to hostname)--> Server
 
 > 为什么字典在 v4 改成按需推送：v3 把字典字节内联进 negotiate，于是所有连接都要吃这几百 KB，无论客户端是否支持 zstd、本地是否已有缓存。拆成两段后，重连（缓存命中）与非 zstd 客户端都是零字典流量。
 
-### Frame format (v4)
-**帧格式（v4）**
+### Frame format (v5)
+**帧格式（v5）**
 
 ```text
-Server -> Client   [varint bodyLen?][varint rawSize][zstd(payload) | packet]
-Client -> Server   [varint rawSize][zstd(payload) | packet]
-compressed frame (rawSize > 0)  payload = [varint pktLen][pkt] [varint pktLen][pkt] ...  <- one or more packets
+Server -> Client   [varint bodyLen?][varint rawSize][varint blockCount][block]...
+Client -> Server   [varint rawSize][varint blockCount][block]...
+block              [varint blockRawLen][varint chunkLen][chunk]
 stored frame (rawSize == 0)     exactly one packet [0][packet], byte-identical to a vanilla uncompressed frame
 ```
 
+> Frames above 256 KB are split into 2 to 4 independently compressed blocks so they can be compressed in parallel. Small frames use a single block, which is why `blockCount` is almost always 1.
+
+> 超过 256 KB 的帧会被切成 2 到 4 个独立压缩块并行处理；小帧只有一块，所以 `blockCount` 绝大多数时候为 1。
+
 - `rawSize == 0` means stored uncompressed: the frame body is exactly one packet (`[0][packet]`), byte-identical to a vanilla uncompressed frame, so both the vanilla `CompressionDecoder` and the packet decoder read it directly. Stored frames therefore carry no inner length prefix — one extra `[varint pktLen]` would be read as the packet id by the packet decoder (`Unknown packet`), and the player could not join
     - `rawSize == 0` 表示未压缩直存：帧体恰好是一个包（`[0][packet]`），与原版未压缩帧逐字节同形，原版解码器与包解码器都能直接读懂。因此直存帧不带任何内层长度前缀——多写一层 `[varint pktLen]` 会被包解码器当成包 id（`Unknown packet`），玩家将无法进入服务器
+- Blocks are split on byte boundaries, not packet boundaries: the raw payload is `[varint pktLen][pkt]...`, blocks are concatenated back verbatim before packet splitting, so a packet may span two blocks
+    - 分块按**字节**边界切，不按包边界：原始负载是 `[varint pktLen][pkt]...` 的连续字节，块解压后按序拼回再切包，因此一个包可以横跨两块
 - Multi-packet framing happens only for compressed frames: packets inside the batching window share one frame, amortizing header and entropy-table cost. Stored frames are by definition too small to be worth batching
     - 一帧多包只发生在压缩帧：批处理窗口内的包合成一帧压缩，帧头与熵表开销被摊薄；直存帧按定义都是"小到不值得压缩"的包
 - Magicless zstd frame: saves the 4-byte magic and omits contentSize and dictID, since the size comes from `rawSize` and the dictionary is loaded explicitly by both sides
@@ -432,3 +442,28 @@ Q：CPU 占用变高？
 Look at the compression thread pool line in `/mikuzstd status`. If the queue depth stays above 0, compression cannot keep up, so lower `level` or add threads instead of tuning the batching window.
 
 看 `/mikuzstd status` 的压缩线程池一行。若「队列」持续大于 0，说明压缩跟不上流量，此时应降低 `level` 或增加线程，而不是继续调批处理窗口。
+
+---
+
+## A player cannot get in
+**玩家进不去**
+
+Three cases, three different fixes — check the server log first, it states which one you are in.
+
+三种情况，三种修法。先看服务端日志，它会明确告诉你属于哪一种。
+
+| Log line | Meaning | Fix |
+|---|---|---|
+| `anchors 未出现（compress/decompress 缺失）` | That connection had no vanilla compression layer, so the plugin fell back to vanilla. The player still joins normally | Make sure `network-compression-threshold` is 0 or higher |
+| `客户端保持原版 zlib，本端不激活` | The client explicitly declined (no mod, or version mismatch) | Install the client mod, and keep it on the same version as the server |
+| `zstd transport activated` present, but the player drops anyway | Negotiation succeeded; look at the client log | See below |
+
+| 日志 | 含义 | 处理 |
+|---|---|---|
+| `anchors 未出现（compress/decompress 缺失）` | 这条连接没有原版压缩层，插件回落原版。玩家仍能正常进服 | 确认 `network-compression-threshold` ≥ 0 |
+| `客户端保持原版 zlib，本端不激活` | 客户端明确拒绝（没装模组或版本不一致） | 安装客户端模组，并与服务端保持同一版本 |
+| 有 `zstd transport activated` 但仍掉线 | 协商成功了，看客户端日志 | 见下 |
+
+On the client side, `frame rejected` or `illegal inner packet length` means a frame format problem — report it with the exact line. A bare "connection lost" with nothing else is usually the network layer, not this plugin.
+
+客户端侧若出现 `frame rejected` 或 `illegal inner packet length`，属于帧格式问题，请带上原样日志反馈。只有一句「连接中断」而没有任何 zstd 相关行，通常是网络层断开，与本插件无关。
