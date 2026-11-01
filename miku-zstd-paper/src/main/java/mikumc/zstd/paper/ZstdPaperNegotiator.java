@@ -372,6 +372,11 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
         }
 
         if (startHold) {
+            // 这条日志是"该连接到底有没有压缩层"的唯一一手证据：
+            // 有它 = setupCompression 已执行（客户端即将切压缩）；没有它却回落原版，
+            // 说明这条连接的 SetCompression 压根没发出（阈值 <0 或 isMemoryConnection）。
+            LOGGER.info("[Zstd] SetCompression 写出（remote={}, pipeline={}）",
+                    ctx.channel().remoteAddress(), ctx.channel().pipeline().names());
             sendNegotiate(ctx); // 兜底（写操作放在锁外，避免持锁进 netty）
             super.write(ctx, msg, promise);
             ctx.channel().eventLoop().execute(() -> tryActivate(ctx, 0));
@@ -486,8 +491,9 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
             // 拉长，setupCompression 还没跑到），本端回落原版、玩家照常进服，只是拿不到 zstd。
             // 带 remote 是为了能把这条记录和具体玩家对上（同一个服里 6 次激活 / 11 次回落时，
             // 没有地址就分不清是哪条连接）。
-            LOGGER.info("[Zstd] anchors 未出现（compress/decompress 缺失）— 该连接回落原版; remote={}, pipeline={}",
-                    channel.remoteAddress(), channel.pipeline().names());
+            LOGGER.info("[Zstd] anchors 未出现（compress/decompress 缺失）— 该连接回落原版; "
+                            + "remote={}, setCompressionSeen={}, pipeline={}",
+                    channel.remoteAddress(), holding, channel.pipeline().names());
             finishVanilla(ctx);
             return;
         }
