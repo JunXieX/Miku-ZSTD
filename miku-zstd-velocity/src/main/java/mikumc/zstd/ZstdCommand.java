@@ -142,6 +142,9 @@ public final class ZstdCommand {
                 + " dictId=" + dictId
                 + " dictSize=" + (dict != null ? dict.length : 0) + "B",
                 NamedTextColor.GRAY));
+        // 现有字典 vs 不装字典的<b>绝对</b>收益（训练日志里的 -1.3% 是"候选 vs 现有"，别混）
+        source.sendMessage(Component.text("  " + label + " dict-vs-no-dict: " + trainer.dictAblation(),
+                NamedTextColor.GRAY));
     }
 
     /** 各连接的压缩统计排行 —— 定位"是谁在拖后腿"。 */

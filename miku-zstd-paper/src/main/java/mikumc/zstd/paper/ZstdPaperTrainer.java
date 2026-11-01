@@ -213,6 +213,62 @@ public final class ZstdPaperTrainer {
         return currentDict;
     }
 
+    /** status 里那次对照最多用多少个样本（几十毫秒量级，可放在命令里同步跑）。 */
+    private static final int ABLATION_SAMPLES = 300;
+
+    /**
+     * 按需跑一次「现有字典 vs 完全不装字典」的对照，供 status 命令随时读。
+     *
+     * <p>为什么需要它：训练时的 evaluation 报的是「<b>候选</b> vs <b>现有</b>」——相对值，
+     * 看到 -1.3% 很容易被读成"字典没用了"（实际只是候选打不过现有）。真正该看的是<b>绝对值</b>：
+     * 现有字典相对"不装字典"到底省了多少字节。这里用当前样本环里的真实样本把它直接算出来。</p>
+     *
+     * <p>代价：每样本压两遍（L3），300 个样本约几十毫秒；只读快照，不改任何状态。</p>
+     */
+    public String dictAblation() {
+        byte[] dict = currentDict;
+        List<byte[]> snapshot;
+        synchronized (this) {
+            if (ring.isEmpty()) {
+                return "无样本（刚训练完会清空，过一会儿再查）";
+            }
+            snapshot = new ArrayList<>(ring.subList(0, Math.min(ABLATION_SAMPLES, ring.size())));
+        }
+        if (dict == null || dict.length == 0) {
+            return "未启用字典";
+        }
+        ZstdCompressCtx with = new ZstdCompressCtx();
+        ZstdCompressCtx without = new ZstdCompressCtx();
+        ZstdDictCompress dictObj = null;
+        try {
+            for (ZstdCompressCtx c : new ZstdCompressCtx[]{with, without}) {
+                c.setLevel(runtimeLevel);
+                c.setMagicless(true);
+                c.setContentSize(false);
+                c.setDictID(false);
+            }
+            dictObj = new ZstdDictCompress(dict, runtimeLevel);
+            with.loadDict(dictObj);
+            long a = 0;
+            long b = 0;
+            for (byte[] s : snapshot) {
+                a += with.compress(s).length;
+                b += without.compress(s).length;
+            }
+            if (b == 0) return "无样本";
+            return String.format("%.1f%%（%d 样本；字典 %dB / 无字典 %dB）",
+                    (1.0 - (double) a / b) * 100, snapshot.size(), a, b);
+        } catch (Throwable t) {
+            return "对照失败: " + t;
+        } finally {
+            // ⚠️ 先关 ctx 再关字典：ctx 还引用着它，顺序反了会抛 close while in use
+            with.close();
+            without.close();
+            if (dictObj != null) dictObj.close();
+        }
+    }
+
+
     public long getCurrentDictId() {
         return currentDictId;
     }

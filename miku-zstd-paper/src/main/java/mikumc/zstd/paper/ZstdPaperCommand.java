@@ -146,5 +146,7 @@ public final class ZstdPaperCommand implements BasicCommand {
                 + " bytes=" + t.getSampleBytes()
                 + " dictId=" + t.getCurrentDictId()
                 + " dictSize=" + (dict == null ? 0 : dict.length) + "B");
+        // 现有字典 vs 不装字典的【绝对】收益（训练日志里的 -1.3% 是"候选 vs 现有"，别混）
+        sender.sendMessage("§7  " + label + " 字典-vs-无字典: " + t.dictAblation());
     }
 }
