@@ -548,9 +548,17 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
                                ZstdCompressCtx useCtx) {
         ByteBuf dst = ctx.alloc().directBuffer(length + (length >>> 8) + 64);
         try {
+            // ⚠️ srcOffset 必须是<b>缓冲内绝对偏移</b>（readerIndex + 块起点），不能传 0。
+            // zstd-jni 的 native 实现是 GetDirectBufferAddress(src) + srcOffset：
+            // GetDirectBufferAddress 返回的是整块内存的基址，**它不看 ByteBuffer 的 position**，
+            // 所以 internalNioBuffer(index, len) 这个"视图"只服务于 Java 侧的 limit 校验。
+            // 传 0 的后果是每块都压"缓冲开头那一段"，解压后拼起来等于第一块重复 N 次 ——
+            // 表现为真实大帧（>256KB，例如 limbo/进服的 Registry）在块边界附近报
+            // "illegal inner packet length"（实测 offset 恰好落在 512KB 附近）。
             int produced = useCtx.compressDirectByteBuffer(
                     dst.internalNioBuffer(0, dst.capacity()), 0, dst.capacity(),
-                    raw.internalNioBuffer(raw.readerIndex() + offset, length), 0, length);
+                    raw.internalNioBuffer(0, raw.capacity()),
+                    raw.readerIndex() + offset, length);
             dst.writerIndex(produced);
             return new Block(length, dst);
         } catch (Throwable t) {
