@@ -28,6 +28,11 @@ import java.util.List;
  */
 public final class ZstdSwitchConfirmSniffer extends MessageToMessageDecoder<ByteBuf> {
 
+    /** "客户端未回切换确认"提示的只报一次闸门（旧版模组每条连接都会命中）。 */
+    private static final java.util.concurrent.atomic.AtomicBoolean UNCONFIRMED_LOGGED =
+            new java.util.concurrent.atomic.AtomicBoolean();
+
+
     private static final Logger LOGGER = LoggerFactory.getLogger("miku-zstd");
 
     /**
@@ -90,7 +95,8 @@ public final class ZstdSwitchConfirmSniffer extends MessageToMessageDecoder<Byte
         if (accepted) {
             ctx.pipeline().remove(this);
             LOGGER.debug("[Zstd] switch confirmation received (txId={}) — releasing gate", txId);
-        } else {
+        } else if (UNCONFIRMED_LOGGED.compareAndSet(false, true)) {
+            // 旧版模组客户端每条连接都会走到这里：只提示一次，否则开服/重载会刷屏
             LOGGER.info("[Zstd] 客户端未回切换确认（不带魔数的应答）——旧版模组的正常行为，"
                     + "服务端将按兜底放行；本条只提示一次");
         }
