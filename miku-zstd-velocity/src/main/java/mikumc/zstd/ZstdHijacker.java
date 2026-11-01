@@ -287,10 +287,25 @@ public class ZstdHijacker extends ChannelDuplexHandler {
             return;
         }
 
-        // negotiate 兜底触发（主路径在握手注入时已发出，防重）
-        if (mgr != null && !mgr.isNegotiationSent()) {
-            sendNegotiateNow(ctx.channel());
-            mgr = ctx.channel().attr(ZstdChannelManager.KEY).get();
+        // ⚠️ 只在 SetCompression（且阈值 >= 0）时发 negotiate，不能对"任意首个出站包"发。
+        // 后者会把 LoginPluginRequest 发给不支持登录插件通道的极简服务端（limbo 登录服就是
+        // 这样：它只实现 handshake + login start，收到 0x04 直接断连），表现为玩家进 limbo
+        // 两秒后被踢、而两端日志里都没有异常。真实服务端在登录阶段必发 SetCompression，
+        // 阈值 < 0 表示它已禁用压缩，也就不需要 zstd。
+        if (C_SET_COMPRESSION != null && C_SET_COMPRESSION.isInstance(msg)) {
+            int threshold = readThresholdValue(msg);
+            if (threshold < 0) {
+                LOGGER.debug("[Zstd] peer disabled compression (threshold<0) — not negotiating");
+                if (ctx.pipeline().get(ZstdHijacker.class) != null) {
+                    ctx.pipeline().remove(this);
+                }
+                super.write(ctx, msg, promise);
+                return;
+            }
+            if (mgr != null && !mgr.isNegotiationSent()) {
+                sendNegotiateNow(ctx.channel());
+                mgr = ctx.channel().attr(ZstdChannelManager.KEY).get();
+            }
         }
 
         if (mgr == null || mgr.isReplaced()) {
