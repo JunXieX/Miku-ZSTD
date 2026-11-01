@@ -80,6 +80,38 @@ public final class ZstdClientActivation {
      * 客户端在<b>原版压缩</b>状态下也能正常收到并由 {@link ZstdSwitchSniffer} 识别。
      * 于是"服务端回落"这条路径下客户端始终保持原版，不会再出现单侧 zstd。</p>
      */
+    /**
+     * 压缩阈值变化回调（{@code setupCompression} 每次都走这里，含同一条连接的第二次）。
+     *
+     * <p>阈值 &lt; 0 表示对端要关掉压缩（limbo 登录服把连接降回明文就是这样做的）。
+     * 此时必须把 zstd 编解码器摘掉：原版 {@code setupCompression(-1)} 只移除
+     * {@code compress}/{@code decompress} 这两个名字，而我们的处理器叫
+     * {@code zstd_encoder}/{@code zstd_decoder}——不摘的话客户端继续用 zstd 发帧，
+     * 对端却按明文读，第一帧就错乱。</p>
+     */
+    public static void onCompressionThreshold(Channel channel, int threshold) {
+        if (channel == null) return;
+        if (threshold < 0) {
+            channel.eventLoop().execute(() -> deactivateQuietly(channel));
+            return;
+        }
+        prepareForSwitch(channel);
+    }
+
+    /** 摘掉 zstd 编解码器并回到 PLAIN（明文）。 */
+    private static void deactivateQuietly(Channel channel) {
+        if (!channel.isActive()) return;
+        ChannelPipeline p = channel.pipeline();
+        for (String name : new String[]{"zstd_encoder", "zstd_decoder", "zstd_switch_sniffer"}) {
+            if (p.get(name) != null) {
+                p.remove(name);
+            }
+        }
+        channel.attr(ACTIVATED).set(Boolean.FALSE);
+        channel.attr(ZstdChannelManager.ZSTD_STATE).set(ZstdChannelManager.TransportState.PLAIN);
+        LOGGER.info("[Zstd] 压缩被对端禁用（threshold<0）——客户端退回明文; pipeline={}", p.names());
+    }
+
     public static void prepareForSwitch(Channel channel) {
         if (channel == null) return;
         // ⚠️ 必须在<b>当前线程</b>就切换：本方法由 {@code setupCompression} 的 TAIL 调用，
