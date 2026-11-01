@@ -4,7 +4,7 @@ plugins {
 }
 
 group = 'mikumc.zstd'
-version = '5.1.2'
+version = '6.0.0'
 
 repositories {
     mavenCentral()
@@ -44,6 +44,7 @@ dependencies {
     // test 作用域再声明一次——共享基类在 <clinit> 里就取 Logger，
     // 缺 slf4j 会让每个用例以 NoClassDefFoundError 失败（TestEncoder/TestDecoder
     // "Could not initialize class" 的根因就是它）。
+    testImplementation("com.velocitypowered:velocity-api:4.2.0")
     testImplementation("io.netty:netty-all:4.2.16.Final")
     testImplementation("org.slf4j:slf4j-api:2.0.17")
     // ⚠️ 这里必须用 slf4j-simple（会打到 stderr），不能用 slf4j-nop：

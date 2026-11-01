@@ -87,8 +87,7 @@ public class ZstdVelocityConfig {
         this.skipCompressBelowBytes = clamp(getInt(c, "skip_compress_below_bytes", 48), 0, 65536);
 
         Map<String, Object> l = getMap(map, "logging");
-        // ⚠️ 5.0.36 起默认开启（与 Paper 端一致）：登录期问题只有 debug 日志能定位。
-        this.debug = getBool(l, "debug", true);
+        this.debug = getBool(l, "debug", false);
 
         Map<String, Object> bb = getMap(map, "bossbar");
         this.bossbarFormat = getString(bb, "format", mikumc.zstd.protocol.ZstdBossBarFormat.DEFAULT_FORMAT);
@@ -240,8 +239,8 @@ public class ZstdVelocityConfig {
 
                     logging:
                       # 调试日志开关：输出逐包诊断信息（协商、切换确认、扣包/放行、安装锚点）
-                      # 5.0.36 起默认 true —— 登录期的问题只有这些日志能定位；排查完可以改回 false。
-                      debug: true
+                      # 默认关闭；排查问题时再开启，已有配置不会被自动覆盖。
+                      debug: false
                     """;
             Files.writeString(configPath, yaml, StandardCharsets.UTF_8);
         } catch (IOException e) {

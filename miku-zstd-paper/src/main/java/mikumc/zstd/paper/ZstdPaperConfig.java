@@ -54,10 +54,7 @@ public class ZstdPaperConfig {
         this.skipCompressBelowBytes = clamp(getInt(c, "skip_compress_below_bytes", 48), 0, 65536);
 
         Map<String, Object> l = section(map, "logging");
-        // ⚠️ 5.0.36 起默认 <b>开启</b>：登录期的问题（协商 / 切换 / 回落 / 扣包）只有 debug
-        // 日志能定位，而"让服主改配置再复现一次"的成本远高于多几十行日志。稳定后可改回 false
-        //（关掉后 INFO 级别的激活/回落摘要仍然保留）。
-        this.debug = getBool(l, "debug", true);
+        this.debug = getBool(l, "debug", false);
 
         Map<String, Object> bb = section(map, "bossbar");
         this.bossbarFormat = getString(bb, "format", DEFAULT_BOSSBAR_FORMAT);
@@ -196,8 +193,8 @@ public class ZstdPaperConfig {
 
                     logging:
                       # 调试日志开关：输出逐包诊断信息（协商、切换确认、扣包/放行、安装锚点）
-                      # 5.0.36 起默认 true —— 登录期的问题只有这些日志能定位；排查完可以改回 false。
-                      debug: true
+                      # 默认关闭；排查问题时再开启，已有配置不会被自动覆盖。
+                      debug: false
                     """;
             Files.writeString(configPath, yaml, StandardCharsets.UTF_8);
         } catch (IOException e) {

@@ -3,6 +3,7 @@ package mikumc.zstd;
 import com.mojang.brigadier.tree.LiteralCommandNode;
 import com.velocitypowered.api.command.BrigadierCommand;
 import com.velocitypowered.api.command.CommandSource;
+import com.velocitypowered.api.proxy.Player;
 import com.velocitypowered.api.proxy.ProxyServer;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
@@ -57,15 +58,22 @@ public final class ZstdCommand {
                             showTop(ctx.getSource());
                             return 1;
                         }))
-                // ⚠️ bar 有权限门槛：它看起来只是"开个显示"，实际是<b>全局</b>状态
-                //（单人持有、且开关时会连带启停 ZstdTrafficCounter 采集）。
-                // 以前它和只读子命令一样对所有人开放，于是任何玩家都能把管理员
-                // 正在看的监控关掉，并顺带让统计归零——这是状态变更，不是一个视图开关。
+                // bar 保留在客户端命令树中：后端 OP 不等于代理授权。
+                // 代理全局监控仍验代理权限，其余已连后端的玩家交后端自行鉴权。
                 .then(BrigadierCommand.literalArgumentBuilder("bar")
-                        .requires(ZstdCommand::hasPermission)
                         .executes(ctx -> {
-                            ctx.getSource().sendMessage(ZstdBossBarMonitor.toggle(ctx.getSource()));
-                            return 1;
+                            CommandSource source = ctx.getSource();
+                            if (hasPermission(source)) {
+                                source.sendMessage(ZstdBossBarMonitor.toggle(source));
+                                return 1;
+                            }
+                            if (source instanceof Player player && player.getCurrentServer().isPresent()) {
+                                return BrigadierCommand.FORWARD;
+                            }
+                            source.sendMessage(Component.text(
+                                    "你没有代理监控权限（mikuzstd.command 或 zstd.command），且没有可转发的后端服务器。",
+                                    NamedTextColor.RED));
+                            return 0;
                         }))
                 // 重载配置会改动服务端状态，保留权限门槛：
                 // 装了权限插件后授予 mikuzstd.command（或 zstd.command）即可。
