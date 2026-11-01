@@ -6,10 +6,15 @@ import mikumc.zstd.protocol.ZstdBatchEncoderBase;
 import mikumc.zstd.protocol.ZstdCompressLock;
 
 /**
- * Miku-ZSTD 编码器（Paper → 客户端）帧格式 v4（协商版本 v5）。
+ * Miku-ZSTD 编码器（Paper → 客户端）帧格式 v6（协商版本 v7）。
  *
  * <p>⚠️ 与 Velocity 端唯一的协议差异：服务端管线<b>有 prepender</b>，外层长度由它负责，
- * 因此本编码器<b>不写</b> bodyLen（与 Fabric 客户端一致；Velocity 端才需要写）。</p>
+ * 因此本编码器<b>不写</b> bodyLen（与 Fabric 客户端一致；Velocity 端才需要写）。
+ * 这条差异没有因为"改成插入"而改变：我们只是绕开了原版 {@code compress}，
+ * {@code prepender} 仍在写帧路径的下游。</p>
+ *
+ * <p>安装位置：原版 {@code compress} 之后，成帧结果从<b>它的 context</b> 往下写
+ *（见 {@link #downstream(ChannelHandlerContext)}）。</p>
  */
 public class ZstdPaperEncoder extends ZstdBatchEncoderBase {
 
@@ -65,6 +70,26 @@ public class ZstdPaperEncoder extends ZstdBatchEncoderBase {
         return false;
     }
 
+    /**
+     * 成帧结果从<b>原版压缩处理器的 context</b> 继续往下写：跳过它，但不拆它。
+     *
+     * <p>原版 {@code compress} 一直留在管线里（见
+     * {@link ZstdPaperChannelManager#installEncoder(io.netty.channel.Channel)}），
+     * 我们从它的 context 写出，只绕开它自己，后面的 {@code prepender} / 加密 / socket
+     * 照常经过——外层长度因此仍由 prepender 补，{@link #writeBodyLen()} 保持 false。</p>
+     *
+     * <p>⚠️ 候选名要与安装时的锚点一致：常规是 {@code compress}，装了别的压缩实现时是
+     * {@code compression-encoder}。两个都查不到（管线被第三方拆改过）就返回 {@code null}，
+     * 交给基类退回自己的 ctx：那一帧会多经一次原版压缩、对端多半解不开，但<b>不会丢包</b>
+     * ——丢包会让包解码器错位，比丢一帧难查得多。</p>
+     */
+    @Override
+    protected ChannelHandlerContext downstream(ChannelHandlerContext ctx) {
+        var p = ctx.pipeline();
+        ChannelHandlerContext vanilla = p.context("compress");
+        return vanilla != null ? vanilla : p.context("compression-encoder");
+    }
+
     @Override
     protected void onFrame(int rawBytes, int wireBytes, boolean compressed) {
         ZstdPaperMonitor.record(rawBytes, wireBytes);
@@ -80,8 +105,9 @@ public class ZstdPaperEncoder extends ZstdBatchEncoderBase {
      */
     @Override
     protected void onRawBatch(io.netty.buffer.ByteBuf raw, int length) {
-        // ⚠️ 先问训练器要不要，再决定拷不拷：这份拷贝跑在 event loop 上，
-        // 默认 2ms 一批、每条连接数百批/秒，环满之后全额白做。
+        // ⚠️ 先问训练器要不要，再决定拷不拷：这份拷贝跑在 event loop 上，而攒批以 flush
+        // 为界（tick 末尾、区块发送完成都会 flush），高流量时每条连接每秒成百批，
+        // 训练环满了之后这些拷贝就是全额白做。
         if (!ZstdPaperTrainer.wantsEncoderSample()) {
             return;
         }

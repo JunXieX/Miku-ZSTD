@@ -35,7 +35,15 @@ public class ZstdVelocityConfig {
     public final int compressThreads;
     public final boolean debug;
 
-    /** 帧格式 v3 的批处理窗口（毫秒）：窗口内发往同一玩家的多个包合成一帧 */
+    /**
+     * 兜底成帧窗口（毫秒）。
+     *
+     * <p>⚠️ 自协议 v7 起<b>不再是"攒批窗口"</b>：攒批边界就是上游的 {@code flush()}，
+     * 一次 flush 成一帧（服务端在 tick 末尾、区块发送完成、登录期写包时都会 flush）。
+     * 这个值只在"上游只 {@code write()}、始终不 flush"时才会真正触发——到点强制成帧，
+     * 免得包无限期滞留；正常流量下 flush 一定先到，定时器随即被取消。
+     * 所以它不再等价于"每包固定延迟"，调大它也不会攒到更多包。</p>
+     */
     public final int batchWindowMs;
     /** 单帧最多合并多少个包（防止延迟与内存失控） */
     public final int batchMaxPackets;
@@ -89,7 +97,7 @@ public class ZstdVelocityConfig {
         this.level = clamp(getInt(c, "level", 3), 1, 22);
         this.windowLog = clamp(getInt(c, "window_log", 20), 10, 27);
         this.compressThreads = clamp(getInt(c, "threads", 0), 0, 256);
-        this.batchWindowMs = clamp(getInt(c, "batch_window_ms", 2), 0, 1000);
+        this.batchWindowMs = clamp(getInt(c, "batch_window_ms", 50), 0, 1000);
         this.batchMaxPackets = clamp(getInt(c, "batch_max_packets", 64), 1, 4096);
         this.skipCompressBelowBytes = clamp(getInt(c, "skip_compress_below_bytes", 48), 0, 65536);
         this.skipCompressBelowBytesWithDict =
@@ -109,7 +117,8 @@ public class ZstdVelocityConfig {
         this.trainerPruneMinPayload = clamp(getInt(t, "prune_min_payload", 16), 0, 4096);
 
         Map<String, Object> l = getMap(map, "logging");
-        this.debug = getBool(l, "debug");
+        // ⚠️ 5.0.36 起默认开启（与 Paper 端一致）：登录期问题只有 debug 日志能定位。
+        this.debug = getBool(l, "debug", true);
 
         Map<String, Object> bb = getMap(map, "bossbar");
         this.bossbarFormat = getString(bb, "format", mikumc.zstd.protocol.ZstdBossBarFormat.DEFAULT_FORMAT);
@@ -180,8 +189,13 @@ public class ZstdVelocityConfig {
     }
 
     private static boolean getBool(Map<String, Object> map, String key) {
+        return getBool(map, key, false);
+    }
+
+    /** 带默认值的布尔读取（缺失键时用它，而不是硬编码 false）。 */
+    private static boolean getBool(Map<String, Object> map, String key, boolean def) {
         Object o = map.get(key);
-        return o instanceof Boolean ? (Boolean) o : false;
+        return o instanceof Boolean ? (Boolean) o : def;
     }
 
     // ------------------------------------------------------------------
@@ -235,18 +249,22 @@ public class ZstdVelocityConfig {
                       # 才需要考虑加线程或降低 level；盲目调到核心数会让服务端掉 TPS。
                       threads: 0
 
-                      # ── 批处理（帧格式 v3 引入）──
-                      # 把时间窗内发往同一玩家的多个包合成一帧再压缩。
-                      # 实测收益很大：每包单独成帧时，帧头与熵表的重复发送几乎吃掉小包的全部收益
-                      #（小包甚至会膨胀到 105%，只能直存）；合批后可再省约 34% 线路字节。
+                      # ── 批处理（协议 v7 起：攒批边界 = flush）──
+                      # 一次 flush 之前攒下的包合成一帧再压缩。实测收益很大：每包单独成帧时，
+                      # 帧头与熵表的重复发送几乎吃掉小包的全部收益（小包甚至会膨胀到 105%，
+                      # 只能直存）；帧边界对齐 flush 之后，跨帧的滚动历史字典再把这一帧接回
+                      # 上一帧的匹配（协议内自动维护，这里没有对应配置项）。
                       #
-                      # batch_window_ms 是"攒包"的时长，代价是等量的延迟。
-                      # ⚠️ 这是【每个包都要等】的固定开销，而 ping 往返会翻倍计：
-                      #     3ms → 往返 +6ms；1ms → 往返 +2ms。
-                      # 同一 tick 内写的包间隔通常只有几十微秒，1ms 足够把它们合并，
-                      # 所以取 1 几乎不损失带宽收益。
-                      # ⚠️ 不要设 0：那等于关闭批处理（每包一帧），带宽收益会消失。
-                      batch_window_ms: 2
+                      # 攒批边界用的是上游本来就在发生的 flush（tick 末尾、区块发送完成、
+                      # 登录期写包时服务端都会 flush），所以合批本身【不额外增加延迟】。
+                      #
+                      # batch_window_ms 因此只是【兜底】：只有"上游只 write、始终不 flush"的
+                      # 调用方才轮得到它——包不能无限期滞留，到点强制成帧。正常流量下 flush
+                      # 一定比它先到，定时器随即被取消，一次也不会触发。
+                      # ⚠️ 不要为了"多攒一点"把它调大：那只会把兜底变成常态延迟，而 flush
+                      # 路径根本读不到这个值。
+                      # 0 = 写即成帧（连兜底都不要），仅在确认上游都会 flush 时才可设。
+                      batch_window_ms: 50
 
                       # 单帧最多合并多少个包（防止极端流量下内存与延迟失控）。
                       # 批次越大单次压缩越久：实测 32×256B 的批次约 15μs（level 3）。
@@ -312,8 +330,9 @@ public class ZstdVelocityConfig {
                       format: "&a%players% &7人在用 &8| &f%raw% &7\u2192 &a%wire% &8| 压缩率 &e%ratio%"
 
                     logging:
-                      # 调试日志开关：输出逐包诊断信息（仅在排查问题时开启）
-                      debug: false
+                      # 调试日志开关：输出逐包诊断信息（协商、切换确认、扣包/放行、安装锚点）
+                      # 5.0.36 起默认 true —— 登录期的问题只有这些日志能定位；排查完可以改回 false。
+                      debug: true
                     """;
             Files.writeString(configPath, yaml, StandardCharsets.UTF_8);
         } catch (IOException e) {

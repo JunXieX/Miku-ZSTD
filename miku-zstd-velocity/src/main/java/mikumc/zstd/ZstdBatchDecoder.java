@@ -5,11 +5,15 @@ import io.netty.channel.ChannelHandlerContext;
 import mikumc.zstd.protocol.ZstdBatchDecoderBase;
 
 /**
- * Miku-ZSTD 解码器（客户端 → 服务端）帧格式 <b>v4</b>（协商版本 v5）。
+ * Miku-ZSTD 解码器（客户端 → 服务端）帧格式 <b>v6</b>（协商版本 v7）。
  *
  * <p>帧解析、内层切包、两道防护（压缩比上限 / scratch 上限）、fail-fast 协议
  * 全部在共享基类 {@link ZstdBatchDecoderBase} 中（两端同一份源码）；
  * 本类只声明解压上下文的来源。</p>
+ *
+ * <p>⚠️ <b>安装位置</b>：由 {@code ZstdChannelManager#installDecoder} 以 {@code addBefore}
+ * 插在原版压缩解码器的<b>上游</b>，解出的每个包以原版未压缩帧 {@code [0][packet]} 交出，
+ * 由原版 {@code decompress} 原样透传 —— 原版处理器留在管线里，我们不替换它。</p>
  *
  * <p>服务端不做入站统计——带宽剖析（{@code ZstdBandwidthProfiler}）只统计出站，
  * 因为"降带宽"关心的就是服务端发给玩家的字节量。</p>

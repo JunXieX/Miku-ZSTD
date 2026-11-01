@@ -45,22 +45,26 @@ import java.util.concurrent.TimeUnit;
  * 交给下游编码器，所以放行瞬间的编码器就是"当前生效"的那个。</p>
  *
  * <h2>为什么切换请求不会把自己扣住</h2>
- * <p>切换请求由服务端经 {@code zstd_encoder} 的 context 写出 —— 那是本闸门的<b>下游</b>，
- * 出站事件不会回到上游的本闸门。这是安装位置（编码器之前）带来的直接保证。</p>
+ * <p>切换请求由服务端经<b>原版压缩处理器</b>（{@code compress} / {@code compression-encoder}）
+ * 的 context 写出 —— 那是本闸门的<b>下游</b>，出站事件不会回到上游的本闸门。这也是安装位置
+ * （包层编码器之后）带来的直接保证。</p>
+ *
+ * <p>⚠️ 不能改从 {@code zstd_encoder} 的 context 写（协议 v7 起它插在原版压缩处理器之前）：
+ * 那样请求帧会先经过原版 {@code compress} 被再压一遍，对端把 zlib 头当成 {@code dataLength} 读；
+ * 而且它会经过本闸门自己（闸门在更靠 tail 的一侧），可能被自己扣住。</p>
  *
  * <h2>兜底：任何"停止扣包"的理由都按<b>已提交</b>处理</h2>
  * <p>确认到达、超时（{@link #RELEASE_TIMEOUT_MS}）、客户端回了一条<b>不带魔数</b>的应答、
  * 或本处理器被外部摘除 —— 这四种情形本闸门都只是"把扣住的包按当前管线放行"，并置位
  * {@link #isConfirmed()}。理由：</p>
  * <ul>
- *   <li>服务端在<b>激活那一刻</b>就已经把编解码器换成了 zstd。客户端则在收到
- *       SetCompression 时也切换了（客户端与 SetCompression 的处理顺序决定），
- *       因此"退回原版"既<b>做不到</b>，也会制造"出站 zstd / 入站原版"的必断连组合；</li>
- *   <li><b>"退回原版"做不到</b>：原版压缩处理器实例在激活时已被 {@code pipeline.replace}
- *       移除过一次，而 Netty 对非 {@code @Sharable} handler 的 {@code added} 标志
- *       <b>永不重置</b>（{@code DefaultChannelPipeline#checkMultiplicity} 只置真、从不清零），
- *       把同一个实例重新放回管线必然抛 {@code ChannelPipelineException}。所以本闸门
- *       不提供任何"回滚"动作；</li>
+ *   <li>服务端在<b>激活那一刻</b>就已经让出站走 zstd。客户端则在收到 SetCompression 时
+ *       也切换了（由客户端与 SetCompression 的处理顺序决定），因此"退回原版"必然制造
+ *       "一端 zstd / 一端原版"的必断连组合；</li>
+ *   <li>⚠️ 注意这里的"不提供回滚"是<b>本闸门</b>的范围限定，不等于整条连接不能回滚。
+ *       协议 v7 起原版 {@code compress}/{@code decompress} 从未被摘除，回落仍然成立——
+ *       但那是"整条连接一起放弃"的动作（由协商器在激活<b>之前</b>判定，或由插件停用时
+ *       摘掉自己的处理器并断开），而不是"切换窗口中途退回去"；</li>
  *   <li>客户端回的那条"不带魔数"的应答（{@code [0x02][varint txId][0]}）<b>无法区分</b>
  *       "装了模组但没切换"与"旧版客户端（没有切换嗅探器，收到询问后按原版规则回了一个
  *       空应答）"。而旧版客户端<b>其实是 zstd</b>（它同样在 SetCompression 时切换了），
@@ -86,8 +90,8 @@ public final class ZstdSwitchGate extends ChannelDuplexHandler {
      * 就自行放行，握手形同虚设。</p>
      *
      * <p>超时后<b>仍按已确认处理</b>（见 {@link #release}）：客户端在收到 SetCompression
-     * 时就已经切换，超时通常只是确认包丢了。退回原版反而会制造混合模式，而且原版处理器
-     * 实例已无法重新插入管线（见类注释）。</p>
+     * 时就已经切换，超时通常只是确认包丢了。此时"停下来等确认"只会让登录多卡 5 秒，
+     * 而"退回原版"会立刻制造一端 zstd、一端原版的必断连组合（见类注释）。</p>
      */
     public static final long RELEASE_TIMEOUT_MS = 5000;
 

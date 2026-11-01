@@ -76,7 +76,7 @@ MikuMC 系列插件交流群：1105054380
 
 ## 工作原理
 
-协议版本 **v5**（Velocity / Paper / Fabric 三端的 `PROTOCOL_VERSION` 常量一致；帧格式 **v4**）。
+协议版本 **v7**（Velocity / Paper / Fabric 三端的 `ZstdProtocolVersion.NEGOTIATE` 一致；帧格式 **v6**）。
 
 ```
 客户端 ──握手(主机名末尾附 \0ZSTD\0 标记)──▶ 服务端
@@ -85,7 +85,7 @@ MikuMC 系列插件交流群：1105054380
         ◀── zstd:dict(仅当回 1 时，按需推字典字节)──
         ── answer(0 / 2) ──▶
         ◀── SetCompression(必须未压缩)──
-        ═══ 双端替换管线，之后全部走 zstd 帧 ═══
+        ═══ 双端接管管线（插入 zstd 处理器，原版压缩处理器保留），之后全部走 zstd 帧 ═══
 ```
 
 1. 客户端在握手包主机名末尾附加 `\0ZSTD\0` 标记；服务端嗅探器只认登录连接（`nextState == 2`），
@@ -96,31 +96,39 @@ MikuMC 系列插件交流群：1105054380
 4. 版本不匹配 / 协商失败 → **双方一致回落原版 zlib**，不会断连
 5. 原版发出 `SetCompression`（**必须未压缩**——否则客户端尚未切换就会解析失败）后，
    服务端进入 hold 窗口，扣住后续待发包
-6. 双端各自把 `compress` / `decompress` 替换为 zstd 实现，再按定型后的编码路径释放扣住的包
+6. 双端各自在压缩处理器旁边插入 zstd 实现（原版 `compress` / `decompress` 保留在管线里，
+   只是被绕过：出站从它的 context 往下写、入站把包封成 `[0][packet]` 让它透传），
+   再按定型后的编码路径释放扣住的包
 
 > **为什么字典改成按需推送（v3 → v4）**：v3 把字典字节内联进 negotiate，于是**所有连接都要吃这几百 KB**，
 > 无论客户端是否支持 zstd、本地是否已有缓存。拆成两段后，重连（缓存命中）与非 zstd 客户端都是零字典流量。
 
-### 帧格式（v4）
+### 帧格式（v6）
 
 ```
-服务端 → 客户端   [varint bodyLen?][varint rawSize][zstd(payload) | packet]
-客户端 → 服务端   [varint rawSize][zstd(payload) | packet]
-压缩帧（rawSize > 0）  payload = [varint pktLen][pkt] [varint pktLen][pkt] ...   ← 一个或多个包
-直存帧（rawSize == 0） 帧体恰好是一个包 [0][packet]，与原版未压缩帧逐字节同形
+服务端 → 客户端   [varint bodyLen?][varint rawSize][varint dictGen][varint blockCount] + block...
+客户端 → 服务端   [varint rawSize][varint dictGen][varint blockCount] + block...
+block              [varint blockRawLen][varint chunkLen][chunk]
+压缩帧（rawSize > 0）  解压后 = [varint pktLen][pkt] [varint pktLen][pkt] ...   ← 一个或多个包
+直存帧（rawSize == 0） 帧体恰好是一个包 [0][packet]，与原版未压缩帧逐字节同形（无 dictGen）
 ```
 
 - **`rawSize == 0` 表示未压缩直存**，帧体**恰好是一个包**（`[0][packet]`），与原版未压缩帧
   逐字节同形 —— 原版解码器（`CompressionDecoder`）与包解码器都能直接读懂。
-  **因此直存帧必须一帧一包、且不带任何内层长度前缀**：多写一层 `[varint pktLen]` 时，
-  包解码器读到的"包 id"就是那个长度值 → `Unknown packet` → 玩家进不去服务器
-- **一帧多包只发生在压缩帧**：批处理窗口内的包合成一帧压缩，帧头与熵表开销被摊薄；
-  直存帧按定义都是"小到不值得压缩"的包，一帧一包多摊的 2~3 字节可以忽略
+  **因此直存帧必须一帧一包、且不带任何内层长度前缀、也不带 `dictGen`**：多写一层
+  `[varint pktLen]` 时，包解码器读到的"包 id"就是那个长度值 → `Unknown packet` → 玩家进不去服
+- **一帧多包只发生在压缩帧**：同一个 flush 边界内的包合成一帧压缩，帧头与熵表开销被摊薄
+- **`dictGen` 是滚动历史字典的代数**（协议 v7 新增）：两端各自维护最近 64KB 原始字节，
+  每喂满 256KB 重建一次字典并让代数 +1，**字典本身不传输**；代数对不上即按协议错乱关连接
+  （这是一致性校验，不是优化开关）
+- **分块**：大帧（>256KB）按字节均分成最多 4 块并行压缩，每块自带原文字节数；
+  解压后按序拼回再切包，一个包可以横跨两块
 - **magicless zstd 帧**：省 4 字节 magic，且不写 contentSize / dictID
   （解压尺寸由 `rawSize` 提供，字典由双方显式加载，帧内不必重复写）
-- **`bodyLen` 只由 Velocity 写**（4.x 管线无独立 frame-encoder，编码器自带外层长度）；
-  客户端侧由 prepender 负责——这是刻意设计，缺层或双层都会导致对端解码失败
-- 小包（无字典 <48B / 有字典 <24B）压缩后反而膨胀，直接走直存路径
+- **`bodyLen` 只由 Velocity 写**（4.x 管线的压缩编码器把"外层长度 + 压缩"合在同一个处理器里，
+  跳过它就必须自带长度）；Paper / Fabric 侧由 prepender 负责——这是刻意设计，缺层或双层都会
+  导致对端解码失败
+- 小包（无字典 <48B / 有字典 <24B，下限 16B）压缩后反而膨胀，直接走直存路径
 
 ### 协商载荷
 
@@ -162,9 +170,12 @@ compression:
   window_log: 20
 
   # ── 批处理（压缩帧）──
-  # 把同一时间窗内发往同一玩家的多个包合成一帧。代价是等量延迟。
-  # 2ms 是"批更大、压缩率更高"与"多等 2ms"之间的折中；调到 0 表示立刻成帧。
-  batch_window_ms: 2
+  # 攒批边界是上游本来就发生的 flush（tick 末尾、区块发送完成、登录期写包），
+  # 一次 flush 出一帧，所以合批本身不额外增加延迟。
+  # 这个值是【兜底】：只有"上游只 write、始终不 flush"的调用方才轮得到它，
+  # 到点强制成帧；正常流量下 flush 一定先到，定时器随即被取消，一次也不触发。
+  # 调大它不会攒到更多包，只会把兜底变成常态延迟；0 = 写即成帧（连兜底都不要）。
+  batch_window_ms: 50
   batch_max_packets: 64
 
   # ── 小包跳过压缩（实测阈值，别凭感觉改）──
@@ -192,8 +203,9 @@ logging:
 
 - **`level`**：默认 3。若大包（区块数据）占比高、CPU 也富余，可调到 6 捡回几个百分点；
   再往上只会让压缩线程池排队，那是延迟抖动的真正来源。
-- **`batch_window_ms`**：默认 1ms。同一 tick 内写的包间隔通常只有几十微秒，1ms 足够把它们合并，
-  所以取 1 几乎不损失带宽收益。**不要设 0**——那等于关闭批处理（每包一帧），带宽收益会消失。
+- **`batch_window_ms`**：默认 50ms，语义是**兜底窗口**而非攒批窗口——攒批边界是上游的 flush。
+  正常流量下它永远不会触发（flush 先到并把它取消），所以调大它既不会提高压缩率、也不会减少延迟，
+  只是让"只写不发"的调用方等得更久。**不要设 0**：没有兜底时，不发 flush 的调用方会让包无限期滞留。
 - **`adoption_threshold`**：字典收益按总字节加权通常只有 1~3%，**不要调到 0.03 以上**，否则字典永远不会被采纳。
 
 ---

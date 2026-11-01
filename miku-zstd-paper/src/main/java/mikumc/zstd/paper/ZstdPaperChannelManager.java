@@ -268,27 +268,41 @@ public class ZstdPaperChannelManager {
     /** 本连接的切换闸门（未安装时为 null，此时按"未确认"处理）。 */
     private volatile mikumc.zstd.protocol.ZstdSwitchGate switchGate;
 
+    /**
+     * 安装出站编码器：插在原版 {@code compress} <b>之后</b>（出站方向上先经过我们）。
+     *
+     * <p>⚠️ 这里<b>不换掉</b>原版处理器。协议 v7 起编码器只负责"把攒下的包合成一帧"，
+     * 成帧结果从 {@code ZstdBatchEncoderBase#downstream(ChannelHandlerContext)} 指的位置
+     * 写出——也就是原版 {@code compress} 的 context：绕过它，但不拆它。留下它换回三件事：
+     * 按名字查找 {@code compress}/{@code prepender} 的插件（ViaVersion / PacketEvents /
+     * Grim 这类）照常工作；回落原版只是"把自己摘掉"（见 {@link #uninstallZstd(Channel)}），
+     * 不存在"非 {@code @Sharable} 的实例被移除后再也放不回去"的死局；也不会再出现
+     * "只装上一半"的必断连中间态。</p>
+     *
+     * <p>⚠️ 时机同样不能提前：曾经为了让 {@code threshold=-1} 也能工作而在这里
+     * {@code addBefore("encoder")}，结果应答一到就激活（早于原版 SetCompression），
+     * 于是 SetCompression 包被 zstd 压缩发出、客户端却还没切换 → 解析失败 → 进不了服。
+     * 本方法只负责"原版装好之后挂到它旁边"，不创造时机。</p>
+     *
+     * @return {@code false} 表示锚点还没出现，调用方应按 {@code RETRY_MS} 重试
+     */
     public boolean installEncoder(Channel channel) {
         var p = channel.pipeline();
         if (p.get("zstd_encoder") != null) return true;
         for (String anchor : new String[]{"compress", "compression-encoder"}) {
             if (p.get(anchor) != null) {
-                p.replace(anchor, "zstd_encoder", new ZstdPaperEncoder());
+                p.addAfter(anchor, "zstd_encoder", new ZstdPaperEncoder());
                 return true;
             }
         }
-        // ⚠️ 绝不"提前插入"。曾经为了让 threshold=-1 也能工作而在此处 addBefore("encoder")，
-        // 结果：应答一到就激活（早于原版 SetCompression），于是原版的 SetCompression 包被
-        // zstd 压缩发出，而客户端还没切换 → 解析失败 → 无法进入服务器。
-        // 正确做法是**只替换**原版装好的 compress，即等原版流程走到那一步。
         return false;
     }
 
     /**
-     * 出站方向是否已有可替换的锚点（原版 {@code compress} 或其别名）。
+     * 出站方向是否已有可插入的锚点（原版 {@code compress} 或其别名）。
      *
-     * <p>用途：激活前先确认<b>两个方向都可替换</b>再动手，避免"只装上编码器"造成
-     * 单侧 zstd 的必断连组合（见 {@code ZstdPaperNegotiator.tryActivate0}）。</p>
+     * <p>用途：激活前先确认<b>两个方向都插得进去</b>再动手。只装上一侧会构成单侧 zstd，
+     * 而单侧 zstd 必定断连（见 {@code ZstdPaperNegotiator.tryActivate0}）。</p>
      */
     public boolean hasEncoderAnchor(Channel channel) {
         var p = channel.pipeline();
@@ -298,9 +312,9 @@ public class ZstdPaperChannelManager {
     }
 
     /**
-     * 入站方向是否已有可替换的锚点（原版 {@code decompress} 或其别名）。
+     * 入站方向是否已有可插入的锚点（原版 {@code decompress} 或其别名）。
      *
-     * <p>同上：必须在任何替换动作之前与出站方向一起校验。</p>
+     * <p>同上：必须在任何插入动作之前与出站方向一起校验。</p>
      */
     public boolean hasDecoderAnchor(Channel channel) {
         var p = channel.pipeline();
@@ -309,17 +323,68 @@ public class ZstdPaperChannelManager {
                 || p.get("compression-decoder") != null;
     }
 
+    /**
+     * 安装入站解码器：插在原版 {@code decompress} 的<b>上游</b>。
+     *
+     * <p>入站是从 head 往 tail 走的，{@code addBefore} 让我们的解码器先拿到帧；解出来的
+     * 每个包都包成原版未压缩帧 {@code [0][packet]} 交给紧跟其后的原版 {@code decompress}
+     * ——它对 {@code dataLength == 0} 是<b>原样透传</b>，等于借它把包送到包解码器，
+     * 而它自己什么都不做。原版处理器因此可以一直留在管线里。</p>
+     *
+     * <p>⚠️ 位置一旦换到它下游就会乱码：原版 {@code decompress} 会把我们的输出当成
+     * {@code [dataLength][deflate]} 再解一次，帧头里的 {@code rawSize} 被当成长度读。</p>
+     */
     public boolean installDecoder(Channel channel) {
         var p = channel.pipeline();
         if (p.get("zstd_decoder") != null) return true;
         for (String anchor : new String[]{"decompress", "compression-decoder"}) {
             if (p.get(anchor) != null) {
-                p.replace(anchor, "zstd_decoder", new ZstdPaperDecoder());
+                p.addBefore(anchor, "zstd_decoder", new ZstdPaperDecoder());
                 return true;
             }
         }
-        // 同上：绝不提前插入，只替换原版装好的 decompress
         return false;
+    }
+
+    /**
+     * 摘掉本插件装在管线上的<b>全部</b>处理器（幂等）：编码器、解码器、确认嗅探器、切换闸门。
+     *
+     * <p>⚠️ 只摘自己的名字，原版 {@code compress} / {@code decompress} / {@code prepender}
+     * 一律不动。协议 v7 起我们本来就是"插进去"的，所以摘干净之后管线就是一条标准的原版
+     * 连接——这正是回落路径第一次可以真正回滚、而不必关连接的原因（旧实现用
+     * {@code pipeline.replace} 把原版处理器拿走过，非 {@code @Sharable} 的实例再也放不回去，
+     * 只能拉倒重连）。</p>
+     *
+     * <p>⚠️ 必须在 event loop 上调用：摘处理器会与在途的成帧/写帧抢同一条线程，
+     * 而编码器的 {@code downstream()} 在每一帧上按名字查原版锚点。</p>
+     *
+     * @return 是否真的摘掉了至少一个处理器（{@code false} = 本来就没装，调用方可直接跳过）
+     */
+    public boolean uninstallZstd(Channel channel) {
+        if (channel == null) return false;
+        var p = channel.pipeline();
+        boolean changed = removeIfPresent(p, "zstd_encoder");
+        changed |= removeIfPresent(p, "zstd_decoder");
+        changed |= removeIfPresent(p, ZstdPaperSwitchConfirmSniffer.NAME);
+        changed |= removeIfPresent(p, "zstd_switch_gate");
+        if (changed) {
+            switchGate = null;
+            // 归还"激活"计数（内部幂等）：否则监控面板会把已经回落的连接一直算作 zstd 通道。
+            setReplaced(false);
+        }
+        return changed;
+    }
+
+    /** 幂等摘除：名字不存在时静默（{@code remove} 对不存在的名字会抛异常）。 */
+    private static boolean removeIfPresent(io.netty.channel.ChannelPipeline p, String name) {
+        if (p.get(name) == null) return false;
+        try {
+            p.remove(name);
+            return true;
+        } catch (Throwable t) {
+            LOGGER.debug("[Zstd] 摘除管线处理器 {} 失败（忽略）: {}", name, t.toString());
+            return false;
+        }
     }
 
     /**
@@ -353,11 +418,16 @@ public class ZstdPaperChannelManager {
      * 在压缩解码器之前安装确认嗅探器（帧层）。
      *
      * <p>⚠️ 必须在帧层：包层看到它时已经被原版解码器按"未知包 id"处理掉了。</p>
+     *
+     * <p>⚠️ 锚点顺序同样是协议要求：{@code zstd_decoder} 优先。嗅探器必须排在<b>我们的
+     * 解码器上游</b>，否则它看到的是我们解出来的 {@code [0][packet]}，而不是客户端真正
+     * 发出的那一帧——被原版压缩过的确认（阈值很小时会走压缩帧）就此认不出来，闸门只能
+     * 白等满超时才放行。平时它先装在 {@code decompress} 之前，之后解码器再插到
+     * {@code decompress} 前面，两条路径的最终顺序相同：嗅探器 → 我们的解码器 → 原版。</p>
      */
     private void installConfirmSniffer(io.netty.channel.ChannelPipeline p) {
         if (p.get(ZstdPaperSwitchConfirmSniffer.NAME) != null) return;
-        // ⚠️ 必须同时认 zstd_decoder：如果解码器已经被替换，原来的 decompress 名字就不存在了。
-        for (String anchor : new String[]{"decompress", "compression-decoder", "zstd_decoder"}) {
+        for (String anchor : new String[]{"zstd_decoder", "decompress", "compression-decoder"}) {
             if (p.get(anchor) != null) {
                 p.addBefore(anchor, ZstdPaperSwitchConfirmSniffer.NAME,
                         new ZstdPaperSwitchConfirmSniffer());
