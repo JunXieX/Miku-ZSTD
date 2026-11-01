@@ -6,11 +6,14 @@ import org.junit.jupiter.api.Test;
 import java.lang.reflect.Field;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class ZstdCompressPoolTest {
 
@@ -60,6 +63,10 @@ class ZstdCompressPoolTest {
             assertEquals(before + 9, ZstdCompressPool.totalTasks(), "每个完成任务恰好计数一次");
             assertEquals(0, ZstdCompressPool.active());
             assertEquals(0, ZstdCompressPool.queueDepth());
+            ZstdCompressPool.shutdown();
+            assertThrows(RejectedExecutionException.class, () -> ZstdCompressPool.execute(() -> { }));
+            assertNull(poolField.get(null), "提交被拒后不得自动重建池");
+            assertEquals(before + 9, ZstdCompressPool.totalTasks(), "拒绝任务不得计入完成数");
         } finally {
             release.countDown();
             ZstdCompressPool.shutdown();

@@ -40,6 +40,7 @@ public final class ZstdHudRenderer {
     /** 上一次诊断的"类别"，类别变化时立即输出（避免周期性刷屏） */
     private static String lastDiagKey;
     private static String lastLine;
+    private static int lastWidth;
 
     private ZstdHudRenderer() {
     }
@@ -63,6 +64,7 @@ public final class ZstdHudRenderer {
             String stats = ZstdStatsData.captureTabStats(1);
             lastLine = stats;
             if (stats != null) {
+                lastWidth = mc.font.width(stripFormatting(stats)) + 4;
                 diag("drawing", "HUD 正在显示下行统计");
             } else {
                 diag("waiting", "HUD 正在采集下行流量");
@@ -96,8 +98,7 @@ public final class ZstdHudRenderer {
         if (line == null) return;
         int x = 4;
         int y = 4;
-        int width = font.width(stripFormatting(line)) + 4;
-        g.fill(x - 2, y - 2, x + width, y + LINE_HEIGHT, 0x80000000);
+        g.fill(x - 2, y - 2, x + lastWidth, y + LINE_HEIGHT, 0x80000000);
         g.text(font, line, x, y, TEXT_COLOR);
     }
 

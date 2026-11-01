@@ -72,7 +72,7 @@ public class ZstdBatchDecoder extends ZstdBatchDecoderBase {
 
     @Override
     protected void onCompressedFrame(int inBytes, int outBytes) {
-        // 同上：线路侧补上 rawSize 标记（它同样在线上），解压侧也含入该标记。
-        ZstdStatsData.addRxBatch(1 + inBytes, 1 + outBytes);
+        // 线路侧已含完整帧头；原始侧保持一字节直存标记的既有比较基线。
+        ZstdStatsData.addRxBatch(inBytes, 1 + outBytes);
     }
 }

@@ -140,12 +140,16 @@ MikuMC 服务器与作者 JunXieX 享有项目著作权。
 
 ## 命令
 
-| 命令 | 说明 | 权限 |
-|---|---|---|
-| `/mikuzstd status` | 查看压缩率、跨帧历史代数、压缩线程池 | `mikuzstd.admin` |
-| `/mikuzstd reload` | 重载配置 | `mikuzstd.admin` |
+| 命令 | 可用端 | 说明 | 权限 |
+|---|---|---|---|
+| `/mikuzstd status` | Paper / Velocity | 查看压缩配置、在线玩家与线程池 | 无需额外权限 |
+| `/mikuzstd top` | Paper / Velocity | 查看各连接的下行压缩统计 | 无需额外权限 |
+| `/mikuzstd bar` | Paper / Velocity | 切换 BossBar 监控 | 见权限节点表 |
+| `/mikuzstd reload` | Velocity | 重载配置 | 见权限节点表 |
 
-客户端：**F8** 切换统计 HUD（无需权限）。
+Paper 端仅支持 `status`、`top`、`bar`；修改配置后重启服务端生效。
+
+客户端：**F8** 切换下行统计 HUD（无需权限）。
 
 ---
 
@@ -153,7 +157,8 @@ MikuMC 服务器与作者 JunXieX 享有项目著作权。
 
 | 节点 | 说明 | 默认 |
 |---|---|---|
-| `mikuzstd.admin` | 允许使用 `/mikuzstd` 全部子命令 | OP |
+| `mikuzstd.command` | Paper 的 `bar`；Velocity 的 `bar` / `reload` | Paper 默认 OP；Velocity 由权限插件授予 |
+| `zstd.command` | Velocity 的 `bar` / `reload`，与 `mikuzstd.command` 等价 | 由权限插件授予 |
 
 ---
 
@@ -182,7 +187,7 @@ MikuMC 服务器与作者 JunXieX 享有项目著作权。
 小包（<128B）压缩率接近 100% 是**正常现象**：帧头与 varint 开销在这么小的包上占比极高，
 压不动就直接直存，不会让线路变差。真正决定整体压缩率的是大包（区块/注册表）那几档。
 
-再看带宽剖析，确认字节主要花在哪个包长区间。
+再看带宽剖析，确认字节主要花在哪个原始帧长区间；分档按合批后的原始负载统计，不代表单个游戏包的长度分布。
 
 **Q：CPU 占用变高？**
 

@@ -2,6 +2,7 @@ package mikumc.zstd.protocol;
 
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -70,7 +71,7 @@ public final class ZstdCompressPool {
     }
 
     /**
-     * 提交一个压缩任务（未初始化时按默认值自动初始化）。
+     * 提交一个压缩任务；由平台启用入口显式初始化，停用后拒绝新提交。
      *
      * <p><b>队列无界，但实际有界</b>：编码器对每条连接最多只允许一个在途压缩任务
      *（{@code ZstdBatchEncoderBase} 的 {@code compressing} 门），所以积压上限 ≈ 连接数。
@@ -80,8 +81,7 @@ public final class ZstdCompressPool {
     public static void execute(Runnable task) {
         ExecutorService p = pool;
         if (p == null) {
-            init(0, 0);
-            p = pool;
+            throw new RejectedExecutionException("压缩线程池未初始化或已停用");
         }
         // ACTIVE 只统计"正在执行"，排队中的任务不计入 —— 否则 summary() 的"活跃"会把
         // 队列长度也算进去，与"CPU 是否打满"的判读混淆。
@@ -104,17 +104,14 @@ public final class ZstdCompressPool {
     }
 
     /**
-     * 关闭池（插件停用/重载时调用）。
-     *
-     * <p>⚠️ 必须存在：{@link #init(int, long)} 是"只生效一次"的，没有 shutdown 的话
-     * 每次重载都换不掉旧线程池 —— 旧池里的 worker 一直活着并持有旧的类加载器。
-     * 关闭后 {@link #execute(Runnable)} 会按默认值重新建池。</p>
+     * 停用后拒绝新提交，已接收任务继续执行原有codec回调，完成原文与分块缓冲回收。
+     * 再次启用由平台显式调用init；停用路径不等待eventLoop。
      */
     public static synchronized void shutdown() {
         ExecutorService p = pool;
         pool = null;
         if (p != null) {
-            p.shutdownNow();
+            p.shutdown();
         }
     }
 

@@ -14,6 +14,11 @@ import org.junit.jupiter.api.Test;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.lang.reflect.Field;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.fail;
@@ -22,6 +27,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
  * 帧格式的<b>跨端黄金不变量</b>测试。
@@ -61,6 +67,7 @@ class FrameLayoutTest {
 
     @BeforeEach
     void setUp() {
+        ZstdCompressPool.init(2, 5);
         compressCtx = new ZstdCompressCtx();
         compressCtx.setLevel(3);
         compressCtx.setMagicless(true);
@@ -1059,6 +1066,101 @@ class FrameLayoutTest {
         ch.finishAndReleaseAll();
     }
 
+    @Test
+    @DisplayName("停用池：已接收的真实codec任务仍须回调并归还临时原文")
+    void shutdownDrainsQueuedCodecAndReleasesRaw() throws Exception {
+        Field poolField = ZstdCompressPool.class.getDeclaredField("pool");
+        poolField.setAccessible(true);
+        ExecutorService executor = (ExecutorService) poolField.get(null);
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        TestEncoder encoder = new TestEncoder(true, 0, 1);
+        EmbeddedChannel out = new EmbeddedChannel(encoder);
+        ByteBuf raw = null;
+        try {
+            ZstdCompressPool.shutdown();
+            assertTrue(executor.awaitTermination(10, TimeUnit.SECONDS));
+            ZstdCompressPool.init(1, 5);
+            executor = (ExecutorService) poolField.get(null);
+            ZstdCompressPool.execute(() -> {
+                started.countDown();
+                try {
+                    if (!release.await(10, TimeUnit.SECONDS)) throw new AssertionError("等待放行超时");
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError("工作线程被中断", e);
+                }
+            });
+            assertTrue(started.await(10, TimeUnit.SECONDS));
+            io.netty.channel.ChannelFuture sent = out.write(packet(repetitive(600 * 1024)));
+            out.flush();
+            raw = encoder.lastRawBuffer;
+            assertNotNull(raw);
+            assertEquals(1, raw.refCnt());
+            assertEquals(1, ZstdCompressPool.queueDepth(), "真实codec任务必须仍排在阻塞任务后");
+
+            ZstdCompressPool.shutdown();
+            out.pipeline().remove(encoder);
+            assertThrows(RejectedExecutionException.class, () -> ZstdCompressPool.execute(() -> { }));
+            assertNull(poolField.get(null), "停用后提交不得自动重建池");
+            release.countDown();
+            assertTrue(executor.awaitTermination(10, TimeUnit.SECONDS), "已接收codec任务须完成wrapper");
+            out.runPendingTasks();
+            assertEquals(0, raw.refCnt(), "移除handler延期归还的原文必须由真实回调释放");
+            assertTrue(sent.isDone());
+            assertFalse(sent.isSuccess(), "处理器移除后的在途写须失败收尾");
+            assertNull(out.readOutbound(), "移除后的codec不得向活pipeline写出帧");
+        } finally {
+            release.countDown();
+            ZstdCompressPool.shutdown();
+            boolean terminated = executor.awaitTermination(10, TimeUnit.SECONDS);
+            out.runPendingTasks();
+            synchronized (encoder.lock) {
+                encoder.lock.markClosed();
+            }
+            out.finishAndReleaseAll();
+            if (terminated && raw != null && raw.refCnt() > 0) raw.release();
+            assertTrue(terminated, "测试工作线程必须退出");
+        }
+    }
+
+    @Test
+    @DisplayName("压缩帧统计：多字节rawSize头必须计入完整帧体")
+    void compressedFrameCountsActualRawSizeHeader() {
+        for (int size : new int[]{200, 20_000}) {
+            TestEncoder encoder = new TestEncoder(false, 0, 1);
+            TestDecoder decoder = new TestDecoder(decompressCtx);
+            EmbeddedChannel out = new EmbeddedChannel(encoder);
+            EmbeddedChannel in = new EmbeddedChannel(decoder);
+            ByteBuf frame = null;
+            byte[] payload = repetitive(size);
+            try {
+                io.netty.channel.ChannelFuture sent = out.write(packet(payload));
+                out.flush();
+                awaitWrite(out, sent);
+                frame = readFrame(out);
+                assertNotNull(frame);
+                int frameBodyBytes = frame.readableBytes();
+                ByteBuf probe = frame.duplicate();
+                int rawSize = ZstdVarInts.tryRead(probe, Integer.MAX_VALUE);
+                assertTrue(rawSize > 0 && probe.readerIndex() > 1, "必须实际覆盖多字节原长头");
+                feed(in, frame);
+                List<byte[]> got = drainInbound(in);
+                assertEquals(1, got.size());
+                assertArrayEquals(fullPacket(payload), got.get(0));
+                assertEquals(1, decoder.compressedFrames);
+                assertEquals(frameBodyBytes, decoder.lastCompressedFrameBytes);
+            } finally {
+                if (frame != null) frame.release();
+                synchronized (encoder.lock) {
+                    encoder.lock.markClosed();
+                }
+                out.finishAndReleaseAll();
+                in.finishAndReleaseAll();
+            }
+        }
+    }
+
     // ────────────────────────────────────────────────────────────────
     // 辅助
     // ────────────────────────────────────────────────────────────────
@@ -1096,6 +1198,15 @@ class FrameLayoutTest {
             if (before != null) assertTrue(before.isSuccess(), "B 的 promise 必须成功");
             assertTrue(task.isSuccess(), "屏障的 promise 必须成功");
             assertEquals(compressedA ? 1 : 0, encoder.frames.get(0)[2], "覆盖指定的压缩/直存路径");
+            if (compressedA && a.length > 512 * 1024) {
+                assertTrue(ZstdCompressPool.threads() >= 2, "临时原文回归必须有至少两个压缩线程");
+                ByteBuf probe = ((ByteBuf) out.outboundMessages().peek()).duplicate();
+                int bodyLen = ZstdVarInts.tryRead(probe, Integer.MAX_VALUE);
+                assertEquals(probe.readableBytes(), bodyLen);
+                assertTrue(ZstdVarInts.tryRead(probe, Integer.MAX_VALUE) > 0);
+                ZstdVarInts.tryRead(probe, Integer.MAX_VALUE); // dictGen
+                assertTrue(ZstdVarInts.tryRead(probe, 64) > 1, "真实产出帧必须含多个压缩块");
+            }
             assertNextPacket(out, in, a);
             if (b != null) assertNextPacket(out, in, b);
             assertEquals(barrier, out.readOutbound(), "屏障须位于所有前序包之后、C之前");
@@ -1398,6 +1509,7 @@ class FrameLayoutTest {
         Throwable lastError;
 
         int compressedFrames;
+        int lastCompressedFrameBytes;
 
         TestDecoder(ZstdDecompressCtx ctx) {
             this.ctx = ctx;
@@ -1421,6 +1533,7 @@ class FrameLayoutTest {
         @Override
         protected void onCompressedFrame(int inBytes, int outBytes) {
             compressedFrames++;
+            lastCompressedFrameBytes = inBytes;
         }
     }
 }

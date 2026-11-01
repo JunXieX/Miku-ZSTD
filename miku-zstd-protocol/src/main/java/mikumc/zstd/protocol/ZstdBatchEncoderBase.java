@@ -90,8 +90,7 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
     /**
      * 复用缓冲的初始容量。
      *
-     * <p>取 8KB 而非 64KB：典型批次只有 2~8KB，而这两个缓冲是<b>每连接</b>各一份——
-     * 64KB 初值意味着每连接白占 128KB 堆。扩容均摊 O(1)，不值得为省几次 arraycopy 常驻大数组。</p>
+     * <p>典型批次只有2~8KB，每连接的原文缓冲从小容量增长，大帧另用临时缓冲。</p>
      */
     private static final int INITIAL_BUFFER = 8 * 1024;
 
@@ -99,24 +98,14 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
      * 常驻缓冲上限。超过此尺寸的批次改用临时数组（用完即弃），对齐解码侧
      * {@link ZstdBatchDecoderBase} 的同名策略。
      *
-     * <p>进服阶段的区块/注册表大帧会把这两块缓冲顶到几十 MB；若常驻，200 人在线
+     * <p>进服阶段的区块/注册表大帧会把原文缓冲顶到几十 MB；若常驻，200 人在线
      * 仅此一项就是 GB 级。大帧只在进服时出现，临时分配的代价可忽略。</p>
      */
     private static final int SCRATCH_KEEP_LIMIT = 512 * 1024;
 
     private ZstdCompressCtx compressCtx;
 
-    /**
-     * 压缩目标缓冲（池化直存缓冲，渐进扩容复用）。
-     *
-     * <p>⚠️ 从 {@code byte[]} 改为 {@link ByteBuf}：zstd-jni 的
-     * {@code compressDirectByteBuffer} 只在 direct 缓冲上才走 native 直压路径，
-     * 堆数组必须先由 JNI 复制一份。用 Netty 的池化直存缓冲后，这份复制省掉，
-     * 并且分配由 PooledByteBufAllocator 复用——不再每批 new 一个 byte[]。</p>
-     */
-    private ByteBuf dstBuf;
-
-    /** 原始负载拼接缓冲（同上：池化直存，按需增长复用）。 */
+    /** 原始负载拼接缓冲：池化直存，按需增长复用。 */
     private ByteBuf rawBuf;
 
     /**
@@ -533,7 +522,7 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
         if (pending.isEmpty()) {
             return;
         }
-        // ⚠️ 有压缩任务在途时绝不开始新一批：compressCtx / rawBuf / dstBuf 都是
+        // ⚠️ 有压缩任务在途时绝不开始新一批：compressCtx / rawBuf 都是
         // 「每连接独占」的资源，被两个线程同时用会直接损坏数据；同时这也是保持写出
         // 顺序的关键。积压的数据不会滞留——在途任务完成后的回调会重新检查 pending。
         if (compressing) {
@@ -1241,40 +1230,12 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
         }
         pending.subList(0, count).clear();
         pendingPromises.subList(0, count).clear();
-        if (pendingBytes < 0) pendingBytes = 0; // 防御性归零（不应发生）
     }
 
     private static void releasePackets(List<ByteBuf> packets) {
         for (ByteBuf b : packets) {
             ReferenceCountUtil.release(b);
         }
-    }
-
-    /**
-     * 压缩目标缓冲（按需增长复用）。
-     *
-     * <p>初值刻意取得小（8KB）而不是 64KB：实际批次通常只有 2~8KB，而 64KB 初值是
-     * <b>每连接</b>两份（本缓冲 + rawBuf），200 连接光初值就白占 25MB。
-     * 扩容是均摊 O(1)，大流量下多几次 arraycopy 远比常驻大数组划算。</p>
-     */
-    /**
-     * 取压缩目标缓冲：小批次复用常驻的池化直存缓冲，大帧临时分配（用完即弃）。
-     *
-     * <p>容量按 {@code compressBound} 预留（{@code n + n/256 + 64}），
-     * 与 zstd 的最坏膨胀量一致——目标不够时 zstd 会报 Destination buffer is too small。</p>
-     */
-    private ByteBuf ensureCompressDstCapacity(ChannelHandlerContext ctx, int srcSize) {
-        int needed = srcSize + (srcSize >>> 8) + 64;
-        if (needed > SCRATCH_KEEP_LIMIT) {
-            return ctx.alloc().directBuffer(needed);
-        }
-        if (dstBuf == null || dstBuf.capacity() < needed) {
-            if (dstBuf != null) {
-                dstBuf.release();
-            }
-            dstBuf = ctx.alloc().directBuffer(Math.max(needed, INITIAL_BUFFER));
-        }
-        return dstBuf;
     }
 
     /**
@@ -1344,19 +1305,12 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
     }
 
     /**
-     * 释放在本 handler 上常驻的两块池化缓冲。
-     *
-     * <p>⚠️ 只释放<b>常驻</b>的那两份：本批若用临时缓冲（大帧），它已在
-     * {@link #backToEventLoop} 里单独释放，字段里不会留引用。</p>
+     * 仅释放本handler常驻的原文缓冲；临时原文由{@link #completeBatch}单独归还。
      */
     private void releaseScratch() {
         if (rawBuf != null) {
             rawBuf.release();
             rawBuf = null;
-        }
-        if (dstBuf != null) {
-            dstBuf.release();
-            dstBuf = null;
         }
     }
 

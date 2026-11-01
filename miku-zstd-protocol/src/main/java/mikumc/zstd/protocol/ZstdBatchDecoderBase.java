@@ -102,28 +102,7 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
      */
     private static final int SCRATCH_KEEP_LIMIT = 512 * 1024;
 
-    /**
-     * 大帧（超过 {@link #SCRATCH_KEEP_LIMIT}）的临时分配统计。
-     *
-     * <p>刻意<b>不做池化</b>：这类帧只在进服阶段出现（Registry 等一次性大数据），
-     * 频率极低，而池化需要一个跨连接的共享缓冲——那就要加锁，反而把 event loop
-     * 拖进争用。所以这里只把「发生了多少次、共多少字节」记下来，
-     * 让"要不要调大常驻上限"有据可依，而不是凭感觉改。</p>
-     */
-    private static final java.util.concurrent.atomic.LongAdder TRANSIENT_ALLOCS =
-            new java.util.concurrent.atomic.LongAdder();
-    private static final java.util.concurrent.atomic.LongAdder TRANSIENT_BYTES =
-            new java.util.concurrent.atomic.LongAdder();
-
-    /** 大帧临时分配统计（命令层用）。 */
-    public static String scratchStats() {
-        long n = TRANSIENT_ALLOCS.sum();
-        long bytes = TRANSIENT_BYTES.sum();
-        return String.format("常驻上限 %dKB | 大帧临时分配 %,d 次 / 共 %.1fMB",
-                SCRATCH_KEEP_LIMIT / 1024, n, bytes / 1048576.0);
-    }
-
-    /** 字典代数上限：仅用于 varint 越界判定（滑窗最多几秒轮换一次，远小于此）。 */
+    /** 代数入口接受完整非负int范围；一致性由后续相等校验保证。 */
     private static final int MAX_DICT_GEN = Integer.MAX_VALUE;
 
     private ZstdDecompressCtx decompressCtx;
@@ -181,50 +160,15 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
     }
 
     /**
-     * 直存帧的统计回调（{@code frameBodyBytes} = 帧体字节数）。
+     * 直存帧的统计回调（{@code frameBodyBytes} = 单包字节数，不含rawSize=0标记）。
      * 服务端无统计，空实现即可。
      */
     protected abstract void onStoredFrame(int frameBodyBytes);
 
     /**
-     * 解压帧的数据采样回调（供字典训练使用）。
-     *
-     * <p>默认空实现。传入的 {@code data} 是本帧独占的新数组，采样方可直接持有引用。</p>
-     *
-     * <p><b>实现建议</b>：整帧一次性交给采样方（格式与直存帧相同，都是
-     * {@code [varint pktLen][pkt]...}），由采样方在锁外解析、只为真正入库的样本拷贝。
-     * 早期实现在这里逐包 {@code new byte[]} + {@code arraycopy}，等于给每个入站包
-     * 都加了一次堆分配——而编码侧早已改成整批提交。</p>
-     */
-    protected void onDecodedPayload(byte[] data) {
-    }
-
-    /**
-     * 直存帧的负载采样回调（{@code data} 的格式与解压帧相同：{@code [varint pktLen][pkt]...}）。
-     *
-     * <p>默认空实现。<b>直存帧恰恰是字典收益的主战场</b>——按定义它们都是"小到不值得压缩"
-     * 的包。早期实现只对解压帧采样，于是入站训练集里只有大包，字典在最该发力的地方
-     * 反而没有样本。只对服务端两侧有意义（客户端不训练字典）。</p>
-     *
-     * <p>需要采样的子类必须同时覆写 {@link #wantsStoredPayload()} 返回 {@code true}，
-     * 否则本方法不会被调用——这样不需要采样的一端不必为此付出一次拷贝。</p>
-     */
-    protected void onStoredPayload(byte[] data) {
-    }
-
-    /**
-     * 是否需要直存帧的负载采样。
-     *
-     * <p>默认 {@code false}：不需要采样的一端（Fabric 客户端）连拷贝都不会发生。</p>
-     */
-    protected boolean wantsStoredPayload() {
-        return false;
-    }
-
-    /**
      * 压缩帧的统计回调。
      *
-     * @param inBytes  收到的压缩字节数
+     * @param inBytes  完整帧体字节数，含rawSize实际头跨度，不含MC外层长度
      * @param outBytes 解压后的字节数
      */
     protected abstract void onCompressedFrame(int inBytes, int outBytes);
@@ -269,6 +213,7 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
         }
 
         int remaining = in.readableBytes();
+        int frameBodyBytes = remaining + in.readerIndex() - frameStart;
         if (remaining <= 0) {
             protocolError(ctx, "empty frame body (rawSize=" + rawSize + ")");
             return;
@@ -281,11 +226,7 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
             // 因此不存在任何"看起来像不像 zstd 帧"的启发式判断（那正是残留风险的来源）。
             onStoredFrame(remaining);
             // 历史记账的形态是 {@code [varint pktLen][pkt]}，与编码器喂进去的完全一致；
-            // 直存帧按定义一定不大，这一次拷贝可忽略（采样顺手复用同一个数组）。
             byte[] batch = singlePacketBatch(in, remaining);
-            if (wantsStoredPayload()) {
-                onStoredPayload(batch);
-            }
             feedHistory(batch);
             emit(ctx, in.readRetainedSlice(remaining));
             return;
@@ -377,8 +318,7 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
                 }
                 off += blockRaw;
             }
-            onCompressedFrame(remaining, data.length);
-            onDecodedPayload(data); // 采样（data 为本帧独占数组，可安全持有）
+            onCompressedFrame(frameBodyBytes, data.length);
             // 历史记账：与编码器同一帧、同一份字节、同样一次喂入
             feedHistory(data);
             splitAndEmit(ctx, data, out);
@@ -388,13 +328,7 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
         }
     }
 
-    /**
-     * 把"未压缩帧的帧体"（恰好一个包）包装成采样方要求的批格式
-     * {@code [varint pktLen][pkt]}。
-     *
-     * <p>采样器（{@code ZstdSampleTrainer}）对压缩帧与直存帧用<b>同一套</b>拆包逻辑，
-     * 所以单包这一侧必须补上长度前缀——否则采样器会把包 id 当成"包长"读。</p>
-     */
+    /** 直存单包补成[pktLen][packet]，与编码侧滚动历史逐字节对称。 */
     private static byte[] singlePacketBatch(ByteBuf in, int len) {
         byte[] out = new byte[ZstdVarInts.length(len) + len];
         int off = ZstdVarInts.writeTo(out, 0, len);
@@ -513,8 +447,6 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
     private byte[] acquireScratch(int size) {
         if (size > SCRATCH_KEEP_LIMIT) {
             // 超大帧：临时分配，用完即弃（不常驻——否则"连过的最大包"会永久占住缓冲）
-            TRANSIENT_ALLOCS.increment();
-            TRANSIENT_BYTES.add(size);
             return new byte[size];
         }
         if (scratch.length < size) {
