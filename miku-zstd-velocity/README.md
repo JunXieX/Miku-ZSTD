@@ -79,7 +79,7 @@ MikuMC 系列插件交流群：1105054380
 
 ## 工作原理
 
-协议版本 **v7**（Velocity / Paper / Fabric 三端的 `ZstdProtocolVersion.NEGOTIATE` 一致；帧格式 **v6**）。
+协议版本 **v8**（Velocity / Paper / Fabric 三端的 `ZstdProtocolVersion.NEGOTIATE` 一致；帧格式 **v6**）。
 
 ```
 客户端 ──握手(主机名末尾附 \0ZSTD\0 标记)──▶ 服务端
@@ -150,14 +150,14 @@ block              [varint blockRawLen][varint chunkLen][chunk]
 `plugins/Miku-ZSTD/config.yml`（首次运行生成，**之后不会被覆盖**；删除可重新生成）
 
 > 目录名与插件显示名一致（Velocity 的 plugin id 只允许小写，故取注入路径的父目录再拼 `Miku-ZSTD`）。
-> 从旧版本升级时，原有的 `plugins/miku-zstd/`（含 `config.yml` 与已训练的 `zstd_dicts/`）
-> 会在首次启动时自动迁移到新目录，不会丢配置与字典。
+> 从旧版本升级时，原有的 `plugins/miku-zstd/`（含 `config.yml`）会在首次启动时自动迁移到
+> 新目录，不会丢配置。5.0.42 起训练字典已删除，旧目录里的 `zstd_dicts/` 不再被读写。
 
 ```yaml
 compression:
   # zstd 压缩等级 (1-22)。
-  # 默认 3。实测（带 128KB 字典、按批处理形态）：
-  #   小包是字典收益的主战场，而高等级在这里反而更差——
+  # 默认 3。实测（按批处理形态）：
+  #   小包是收益的主战场，而高等级在这里反而更差——
   #   单包 64B：L3 压到 45.3%，L9 只能压到 57.8%，L3 好 12.5 个百分点；
   #   数据越长高等级才越有优势（8KB 批次上 L9 好约 4 个百分点），
   #   但代价悬殊：L9 的压缩耗时是 L3 的 8~12 倍，而解压耗时与等级无关。
