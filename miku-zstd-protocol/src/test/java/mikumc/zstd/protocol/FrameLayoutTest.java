@@ -1021,7 +1021,7 @@ class FrameLayoutTest {
                 }
             }
         }
-        assertNotNull(frame, "兜底定时器必须把"只写不 flush"的数据送出去");
+        assertNotNull(frame, "兜底定时器必须把「只写不 flush」的数据送出去");
         frame.release();
         ch.finishAndReleaseAll();
     }
