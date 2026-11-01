@@ -964,7 +964,9 @@ class FrameLayoutTest {
         EmbeddedChannel in = new EmbeddedChannel(decoder);
 
         byte[] chunk = repetitive(8 * 1024);
-        for (int i = 0; i < 48; i++) { // 48 × 8KB ≈ 384KB > 256KB 轮换阈值
+        // 5.0.38 起轮换阈值是 1MB（原 256KB），所以这里要喂够 >1MB 才会真的轮换：
+        // 160 × 8KB ≈ 1.28MB
+        for (int i = 0; i < 160; i++) {
             out.writeOutbound(packet(chunk));
             ByteBuf frame = readFrame(out, 5000);
             assertNotNull(frame, "第 " + i + " 帧应产出");

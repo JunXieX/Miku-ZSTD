@@ -142,8 +142,9 @@ class DictAblationTest {
                 }
             }
         } finally {
-            if (dictObj != null) dictObj.close();
+            // ⚠️ 顺序不能反：ctx 还引用着字典，先关字典会抛 "Attempt to close while in use"。
             ctx.close();
+            if (dictObj != null) dictObj.close();
         }
         return r;
     }
