@@ -978,7 +978,13 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
         failInflight(new ClosedChannelException());
         inflightPromises = null;
         compressing = false;
-        releaseScratch();
+        // ⚠️ 必须在压缩锁内释放：置 compressing=false 只是"不再开新批"，池线程可能仍读着
+        // rawBuf 在压缩。此时把它还给 PooledByteBufAllocator，同一块内存会立刻被别的连接
+        // 取走改写 —— 池线程读到的是别人的数据（产物随后被丢弃，不会污染对端，但这是一次
+        // 跨线程的未定义读写）。加锁等它退出，代价是最多一次批压缩的时间。
+        synchronized (compressLock()) {
+            releaseScratch();
+        }
     }
 
     /**
