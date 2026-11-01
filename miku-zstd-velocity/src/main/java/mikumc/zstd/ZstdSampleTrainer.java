@@ -135,6 +135,13 @@ public class ZstdSampleTrainer {
         } catch (IOException ignored) {
         }
         ZstdVelocityConfig cfg = ZstdVelocityConfig.INSTANCE;
+        // ⚠️ 5.0.41 起默认关闭（trainer.enabled=false）。关掉之后：不建实例、不建线程、
+        // 不采样、不训练、也不下发字典 —— 连接上只剩协议内建的滚动历史。
+        // 依据：实机 /mikuzstd status 显示字典相对"不装字典"差 3.7%，而采样常驻 25MB。
+        if (!cfg.trainerEnabled) {
+            LOGGER.debug("[Zstd] 字典训练器已禁用（trainer.enabled=false）— 只使用滚动历史");
+            return;
+        }
         trainExecutor = Executors.newSingleThreadExecutor(r -> {
             Thread t = new Thread(r, "miku-zstd-trainer");
             t.setDaemon(true);

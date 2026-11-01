@@ -60,6 +60,9 @@ public class ZstdVelocityConfig {
      */
     public final int skipCompressBelowBytesWithDict;
 
+    /** 是否启用字典训练（采样 + 训练 + 下发）。默认 false，见构造函数里的实测依据。 */
+    public final boolean trainerEnabled;
+
     public final int trainerMaxSamples;
     public final int trainerMinSamples;
     public final long trainerCooldownMs;
@@ -104,6 +107,11 @@ public class ZstdVelocityConfig {
                 clamp(getInt(c, "skip_compress_below_bytes_with_dict", 24), 0, 65536);
 
         Map<String, Object> t = getMap(map, "trainer");
+        // ⚠️ 5.0.41 起默认 <b>关闭</b>：实机 /mikuzstd status 显示字典相对"不装字典"
+        // 反而差 3.7%（字典 350394B / 无字典 337767B），而它只可能帮到的小包
+        // 只占 0.1% 的总字节；采样却常驻 25MB 样本并周期训练。默认关掉，
+        // 想要字典的服主可以显式打开（打开后首部字典按 -2% 容差采纳）。
+        this.trainerEnabled = getBool(t, "enabled", false);
         this.trainerMaxSamples = clamp(getInt(t, "max_samples", 10000), 16, 10_000_000);
         // min_samples 不能超过环容量，否则训练永远不会触发（环已满也到不了门槛）
         this.trainerMinSamples = clamp(getInt(t, "min_samples", 2000), 1, this.trainerMaxSamples);
@@ -282,6 +290,10 @@ public class ZstdVelocityConfig {
                       skip_compress_below_bytes_with_dict: 24
 
                     trainer:
+                      # 5.0.41 起默认 false：实机对照显示字典相对"不装字典"差 3.7%
+                      #（字典 350394B / 无字典 337767B），而它能帮到的小包只占总字节 0.1%，
+                      # 采样却常驻 25MB 样本并周期训练。滚动的跨帧历史（gen≥1）不受此开关影响。
+                      enabled: false
                       # ── 字典自动训练 ──
                       # 字典是【小包收益的主要来源】：实测单包 64B 在无字典时压缩后膨胀到 107.8%，
                       # 带上字典后能压到 45.3%。插件会持续采样真实流量并自动训练字典，

@@ -138,7 +138,7 @@ public final class ZstdPaperCommand implements BasicCommand {
 
     private static void showTrainer(CommandSender sender, String label, ZstdPaperTrainer t, int minSamples) {
         if (t == null) {
-            sender.sendMessage("§7  " + label + ": §c未初始化");
+            sender.sendMessage("§7  " + label + ": §7已禁用（trainer.enabled=false）");
             return;
         }
         byte[] dict = t.getCurrentDict();

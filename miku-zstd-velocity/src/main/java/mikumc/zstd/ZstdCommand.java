@@ -132,7 +132,8 @@ public final class ZstdCommand {
 
     private void showTrainerStatus(Audience source, String label, ZstdSampleTrainer trainer) {
         if (trainer == null) {
-            source.sendMessage(Component.text("  " + label + ": not initialized", NamedTextColor.RED));
+            source.sendMessage(Component.text("  " + label + ": 已禁用（trainer.enabled=false）",
+                    NamedTextColor.GRAY));
             return;
         }
         long dictId = trainer.getCurrentDictId();

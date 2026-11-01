@@ -99,6 +99,12 @@ public final class ZstdPaperTrainer {
             // 目录已存在
         }
         ZstdPaperConfig cfg = ZstdPaperConfig.INSTANCE;
+        // ⚠️ 5.0.41 起默认关闭（trainer.enabled=false）：见构造函数里的实测依据。
+        // 关掉后不建实例/线程、不采样、不训练、不下发字典；滚动历史不受影响。
+        if (!cfg.trainerEnabled) {
+            LOGGER.debug("[Zstd] 字典训练器已禁用（trainer.enabled=false）— 只使用滚动历史");
+            return;
+        }
         trainExecutor = Executors.newSingleThreadExecutor(r -> {
             Thread t = new Thread(r, "miku-zstd-paper-trainer");
             t.setDaemon(true);

@@ -39,6 +39,9 @@ public class ZstdPaperConfig {
     public final String bossbarFormat;
 
     // ── 字典训练（与 Velocity 端同默认值）──
+    /** 是否启用字典训练（采样 + 训练 + 下发）。默认 false。 */
+    public final boolean trainerEnabled;
+
     public final int trainerMaxSamples;
     public final int trainerMinSamples;
     public final long trainerCooldownMs;
@@ -67,6 +70,8 @@ public class ZstdPaperConfig {
         this.skipCompressBelowBytesWithDict =
                 clamp(getInt(c, "skip_compress_below_bytes_with_dict", 24), 0, 65536);
         Map<String, Object> t = section(map, "trainer");
+        // ⚠️ 5.0.41 起默认关闭，依据同上（实机对照为负收益）。滚动历史不受影响。
+        this.trainerEnabled = getBool(t, "enabled", false);
         this.trainerMaxSamples = clamp(getInt(t, "max_samples", 10000), 16, 10_000_000);
         this.trainerMinSamples = clamp(getInt(t, "min_samples", 2000), 1, this.trainerMaxSamples);
         // ⚠️ 5.0.38 起默认 30 分钟（原 5 分钟）：实机日志显示字典已收敛，每 5 分钟拿 30MB 样本
@@ -231,6 +236,10 @@ public class ZstdPaperConfig {
                       skip_compress_below_bytes_with_dict: 24
 
                     trainer:
+                      # 5.0.41 起默认 false：实机对照显示字典相对"不装字典"差 3.7%，
+                      # 而它能帮到的小包只占总字节 0.1%，采样却常驻 25MB 样本。
+                      # 滚动历史（协议 v7 的内建能力）不受这个开关影响。
+                      enabled: false
                       # ── 字典自动训练 ──
                       # 字典是【小包收益的主要来源】：实测单包 64B 在无字典时压缩后膨胀到 107.8%，
                       # 带上字典后能压到 45.3%。插件会持续采样真实流量并自动训练字典，
