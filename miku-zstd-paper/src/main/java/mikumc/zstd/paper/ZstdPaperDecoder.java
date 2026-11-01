@@ -102,5 +102,5 @@ public class ZstdPaperDecoder extends ZstdBatchDecoderBase {
 
     // 注：基类的 onStoredPayload / onDecodedPayload / wantsStoredPayload 三个钩子只服务于
     // 已删除的训练字典，本端不覆写（默认 wantsStoredPayload=false，采样回调一次都不会被调）。
-    // 直存帧那次 singlePacketBatch 拷贝仍会发生——它是滚动历史 feedHistory 的输入，与训练无关。
+    // 上行改成存储批帧后，连 singlePacketBatch / feedHistory 那一步也不再走（见 storedBatchFrames）。
 }

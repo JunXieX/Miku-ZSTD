@@ -371,9 +371,13 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
             //（{@code [0][packet]}，见 ZstdBatchEncoderBase 的帧格式一节）：两种解释结果相同，
             // 因此不存在任何"看起来像不像 zstd 帧"的启发式判断（那正是残留风险的来源）。
             if (legacyFallbackAllowed()) {
-                // 窗口内收到的就是原版帧：<b>原样</b>交给下游的原版 decompress（本处理器在它上游）。
-                // 注意这里不能用 emit()：这条路径本该由原版解压器处理，跳过它反而是错的。
-                ctx.fireChannelRead(in.readRetainedSlice(remaining));
+                // 窗口内收到的就是原版未压缩帧：必须<b>带着 [0] 前缀</b>交给下游的原版 decompress。
+                // ⚠️ 这里曾经直接 fire 掉帧体（前缀已被本类读走），下游 CompressionDecoder 会把
+                // 包首字节当成 dataLength 读 —— 只要那个字节不是 0，包就被截断/错解。
+                // 之所以一直没炸，是因为窗口内客户端几乎不发包（闸门扣着 LoginSuccess），属于
+                // "靠时序侥幸"。补回 1 字节前缀才是与原版逐字节同形，也才会被 Krypton 接受
+                // （它校验的是 actualUncompressedSize < threshold，而不是"不许有前缀"）。
+                ctx.fireChannelRead(Unpooled.wrappedBuffer(new byte[]{0}, in.readRetainedSlice(remaining)));
                 return;
             }
 
