@@ -93,7 +93,11 @@ public class ZstdBatchEncoder extends ZstdBatchEncoderBase {
      */
     @Override
     protected void onRawBatch(io.netty.buffer.ByteBuf raw, int length) {
-        // 训练器按 byte[] 处理，这里复制一份：只有开启训练/采样时才走到本方法
+        // ⚠️ 先问训练器要不要：这份拷贝跑在 event loop 上，环满后（到下一轮训练之间
+        // 是分钟级）每批都会白拷一份。代理是所有玩家流量的汇聚点，量级比单实例大得多。
+        if (!ZstdSampleTrainer.wantsEncoderSample()) {
+            return;
+        }
         byte[] copy = new byte[length];
         raw.getBytes(raw.readerIndex(), copy, 0, length);
         ZstdSampleTrainer.submitEncoderBatch(copy, length);

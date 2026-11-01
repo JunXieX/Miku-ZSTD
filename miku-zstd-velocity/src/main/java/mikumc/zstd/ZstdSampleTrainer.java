@@ -212,6 +212,12 @@ public class ZstdSampleTrainer {
      * 依赖的 {@code addSample} 已删除——编码侧改成批量化后就没人调用了，
      * 解码侧也在 3.1.0 补齐成批量提交。</p>
      */
+    /** 编码侧是否还需要样本（未启用 / 环已满 时为 false，调用方据此跳过整批拷贝）。 */
+    public static boolean wantsEncoderSample() {
+        ZstdSampleTrainer t = encoderInstance;
+        return t != null && !t.ringFull;
+    }
+
     public static void submitEncoderBatch(byte[] raw, int length) {
         ZstdSampleTrainer t = encoderInstance;
         if (t != null) t.addBatch(raw, length);

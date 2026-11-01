@@ -164,7 +164,12 @@ public class ZstdNegotiateAnswerSniffer extends MessageToMessageDecoder<ByteBuf>
         if (isNegotiate && ZstdHijacker.needsDictPush(encStatus, decStatus)) {
             // 协议 v4：客户端缺字典。推一次 zstd:dict，**先不下结论**——
             // 门控必须等这次推送的应答，否则服务端会先于客户端激活（单侧 zstd）。
-            mgr.markDictRequested();
+            // ⚠️ 必须用返回值去重：客户端对同一条 negotiate 可能回两次（帧层与包层各捕获一次），
+            // 重复推送会把整份字典再发一遍并覆盖 dictTxId，让先前的应答从此无人认领。
+            if (!mgr.markDictRequested()) {
+                LOGGER.debug("[Zstd] 重复的字典请求，已推过 — 忽略");
+                return true;
+            }
             if (!ZstdHijacker.sendDictQuery(ctx.channel(),
                     ZstdNegotiateStatus.needsDict(encStatus), ZstdNegotiateStatus.needsDict(decStatus))) {
                 // 推送没发出去（字典过大 / 锚点缺失）：按"客户端保持原版"回填结论，
