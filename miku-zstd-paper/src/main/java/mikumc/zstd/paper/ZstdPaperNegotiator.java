@@ -786,9 +786,6 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
      * {@code ClientIntention}，避免把 status ping 误判成登录。</p>
      */
     private static boolean isLoginStartPacket(Object msg) {
-        if (msg == null) {
-            return false;
-        }
         String cn = msg.getClass().getSimpleName();
         return cn.contains("HelloPacket") || cn.contains("LoginStart") || cn.contains("ServerboundKey");
     }
