@@ -1059,6 +1059,12 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
             LOGGER.debug("[Zstd] packet cancelled by another plugin: {}", cause.toString());
             return;
         }
+        // 连接层 I/O 异常（对端 RST、网络中断）不是编码问题，不打 ERROR 堆栈。
+        if (cause instanceof java.io.IOException) {
+            LOGGER.debug("[Zstd] connection I/O error on write: {}", cause.toString());
+            ctx.close();
+            return;
+        }
         // 通道已关闭时的异常一律是收尾噪音（本插件在断线时会失败化挂起的写 promise，
         // 那些 promise 的监听器会把异常广播回 pipeline），降为 debug，
         // 避免关服/退服时刷 ERROR + 堆栈。
