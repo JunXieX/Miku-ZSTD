@@ -501,6 +501,14 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
      */
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+        // ⚠️ 别的插件用"抛异常"来取消某一条出站包（CraftEngine 的 CancelPacketException
+        // 就是这样：它在 encoder 里 throw，靠异常短路 pipeline）。这不是连接错误，
+        // 更不该关连接 —— 实测玩家执行 /spawn 触发取消包时被我们按"解码异常"踢下线。
+        if (isPacketCancellation(cause)) {
+            LOGGER.debug("[Zstd] packet cancelled by another plugin (remote={}): {}",
+                    ctx.channel().remoteAddress(), cause.toString());
+            return;
+        }
         if (!ctx.channel().isActive()) {
             LOGGER.debug("[Zstd] decoder exception after channel closed (remote={}): {}",
                     ctx.channel().remoteAddress(), cause.toString());
@@ -511,5 +519,15 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
         if (ctx.channel().isOpen()) {
             ctx.close();
         }
+    }
+
+    /** 是否为"发包被其它插件取消"的控制流异常（不是连接错误）。 */
+    private static boolean isPacketCancellation(Throwable cause) {
+        for (Throwable t = cause; t != null; t = t.getCause()) {
+            if (t.getClass().getSimpleName().contains("CancelPacket")) {
+                return true;
+            }
+        }
+        return false;
     }
 }
