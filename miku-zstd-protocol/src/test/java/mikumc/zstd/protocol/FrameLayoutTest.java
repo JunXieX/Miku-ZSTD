@@ -239,6 +239,28 @@ class FrameLayoutTest {
     }
 
     @Test
+    @DisplayName("其它插件用异常取消发包时不得关闭连接；真正的异常仍要关")
+    void packetCancellationMustNotCloseChannel() {
+        // 回归用例：CraftEngine 用 throw CancelPacketException 来短路 pipeline 取消一条
+        // 出站包。这个异常的 FIRE_EXCEPTION_ON_FAILURE 会从 pipeline 头部广播，
+        // 正好撞在编解码器上；旧实现按"解码异常 — closing channel"处理，玩家被踢下线
+        // （实测触发点是执行 /spawn）。
+        EmbeddedChannel ch = new EmbeddedChannel(new TestEncoder(true, 0, 1),
+                new TestDecoder(decompressCtx));
+
+        ch.pipeline().fireExceptionCaught(new io.netty.handler.codec.EncoderException(
+                new net.momirealms.craftengine.bukkit.plugin.network.CancelPacketException()));
+        ch.runPendingTasks();
+        assertTrue(ch.isOpen(), "取消发包不是连接错误，通道必须保持打开");
+
+        // 对照：普通异常仍必须 fail-fast，否则真故障会被静默吞掉
+        ch.pipeline().fireExceptionCaught(new IllegalStateException("boom"));
+        ch.runPendingTasks();
+        assertFalse(ch.isOpen(), "非取消类异常必须关闭连接");
+        ch.finishAndReleaseAll();
+    }
+
+    @Test
     @DisplayName("大帧（>256KB，触发分块并行）往返：解压后必须逐字节还原")
     void largeFrameMultiBlockRoundTrip() throws InterruptedException {
         // 回归用例：分块并行的 srcOffset 曾传 0，导致每块都压"缓冲开头那一段"，
