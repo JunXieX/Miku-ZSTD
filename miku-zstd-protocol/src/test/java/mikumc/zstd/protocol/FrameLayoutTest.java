@@ -238,6 +238,36 @@ class FrameLayoutTest {
         assertArrayEquals(fullPacket(p3), got.get(2), "第 3 个包");
     }
 
+    @Test
+    @DisplayName("大帧（>256KB，触发分块并行）往返：解压后必须逐字节还原")
+    void largeFrameMultiBlockRoundTrip() throws InterruptedException {
+        // 回归用例：分块并行的 srcOffset 曾传 0，导致每块都压"缓冲开头那一段"，
+        // 解压后拼起来是第一块重复 N 次 —— 实机在块边界处报 illegal inner packet length。
+        // 这里用 1MB（> PARALLEL_MIN_BYTES 的 4 倍，必然切成多块）真实往返一次。
+        int payloadLen = 1 << 20;
+        byte[] payload = new byte[payloadLen];
+        for (int i = 0; i < payloadLen; i++) {
+            payload[i] = (byte) (i % 251); // 可压缩但非全零，块间内容各不相同
+        }
+
+        TestEncoder encoder = new TestEncoder(true, 0 /* 一律压缩 */, 1);
+        EmbeddedChannel ch = new EmbeddedChannel(encoder);
+        ch.writeOutbound(packet(payload));
+
+        ByteBuf frame = readFrame(ch, 8000);
+        assertNotNull(frame, "大帧压缩走线程池，需要等待回到 event loop");
+        assertTrue(encoder.lastCompressed, "大帧应当走压缩路径");
+
+        EmbeddedChannel in = new EmbeddedChannel(new TestDecoder(decompressCtx));
+        feed(in, frame);
+        List<byte[]> got = drainInbound(in);
+        assertEquals(1, got.size(), "大帧必须还原成 1 个包");
+        assertArrayEquals(fullPacket(payload), got.get(0),
+                "分块并行后解压结果必须与原包逐字节相同");
+        ch.finishAndReleaseAll();
+        in.finishAndReleaseAll();
+    }
+
     // ────────────────────────────────────────────────────────────────
     // 原生上下文生命周期：关闭后池线程绝不能再碰 compressCtx
     // ────────────────────────────────────────────────────────────────
