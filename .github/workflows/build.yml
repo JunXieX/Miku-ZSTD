@@ -206,6 +206,7 @@ jobs:
           sock.sendall(varint(len(ls)) + ls)
 
           seen = {"set_compression": False, "negotiate": False, "switch": False, "frame": False}
+          frames = 0
           compressed = False
           zstd_mode = False
           deadline = time.time() + 40
@@ -221,8 +222,18 @@ jobs:
                   else:
                       raw, pos = dv(body, 0)
                       if raw == 0:
+                          # 直存帧同样是 v7 帧（与原版未压缩帧逐字节同形）：小包本来就该走这条路径。
+                          # 只认压缩帧会让用例在"首个包很小"时误判失败。
                           packet = body[pos:]
-                          print("  stored frame, %d bytes" % len(packet))
+                          pid2, _ = dv(packet, 0)
+                          print("  stored frame, %d bytes, packet id=%d" % (len(packet), pid2))
+                          seen["frame"] = True
+                          frames += 1
+                          if frames >= 5:
+                              rc = 0
+                              print("E2E_PASS stored_frames_ok")
+                              break
+                          continue
                       else:
                           # 压缩帧：[rawSize][dictGen][blockCount] + 每块 [blockRawLen][chunkLen][chunk]
                           gen, pos = dv(body, pos)
