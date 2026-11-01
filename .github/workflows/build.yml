@@ -53,7 +53,7 @@ jobs:
           gradle-version: '9.6.0'
       - name: Build
         working-directory: miku-zstd-paper
-        run: gradle shadowJar --no-daemon
+        run: gradle test shadowJar --no-daemon
       - uses: actions/upload-artifact@v4
         with:
           name: Miku-ZSTD-Paper
@@ -155,9 +155,10 @@ jobs:
       - name: Run protocol client
         run: |
           set -euo pipefail
-          pip install --quiet zstandard || true
+          python3 -m pip install --quiet zstandard
           python3 - <<'PY'
           import socket, struct, sys, time, zlib
+          import zstandard as zstd
 
           HOST, PORT = "127.0.0.1", 25600
           MAGIC = 0x5A535743
@@ -278,16 +279,12 @@ jobs:
                               br, pos = dv(body, pos)
                               cl, pos = dv(body, pos)
                               chunk = body[pos:pos + cl]; pos += cl
-                              total += br
-                              try:
-                                  import zstandard as zstd
-                                  dec = zstd.ZstdDecompressor(format=zstd.FORMAT_ZSTD1_MAGICLESS)
-                                  out = dec.decompress(chunk, max_output_size=br)
-                                  assert len(out) == br, "块 %d 解压长度不符 %d != %d" % (i, len(out), br)
-                              except ImportError:
-                                  print("    (zstandard 未安装，跳过解压校验)")
-                              except Exception as e:
-                                  print("    (解压校验跳过: %s)" % type(e).__name__)
+                              assert br > 0 and cl > 0 and len(chunk) == cl, "压缩块长度或边界非法"
+                              dec = zstd.ZstdDecompressor(format=zstd.FORMAT_ZSTD1_MAGICLESS)
+                              out = dec.decompress(chunk, max_output_size=br, allow_extra_data=False)
+                              assert len(out) == br, "块 %d 解压长度不符 %d != %d" % (i, len(out), br)
+                              total += len(out)
+                          assert pos == len(body), "压缩帧存在截断或尾随字节"
                           assert total == raw, "块合计 %d != rawSize %d" % (total, raw)
                           seen["frame"] = True
                           print("E2E_PASS frame_ok")
@@ -457,8 +454,10 @@ jobs:
       - name: Run protocol client
         run: |
           set -euo pipefail
+          python3 -m pip install --quiet zstandard
           python3 - <<'PY'
           import socket, struct, sys, time, zlib
+          import zstandard as zstd
           HOST, PORT = "127.0.0.1", 25565
           MAGIC = 0x5A535743
           PROTOCOL = 776
@@ -554,7 +553,13 @@ jobs:
                       total = 0
                       for i in range(blocks):
                           br, pos = dv(body, pos); cl, pos = dv(body, pos)
-                          pos += cl; total += br
+                          chunk = body[pos:pos + cl]; pos += cl
+                          assert br > 0 and cl > 0 and len(chunk) == cl, "压缩块长度或边界非法"
+                          dec = zstd.ZstdDecompressor(format=zstd.FORMAT_ZSTD1_MAGICLESS)
+                          out = dec.decompress(chunk, max_output_size=br, allow_extra_data=False)
+                          assert len(out) == br, "块 %d 解压长度不符 %d != %d" % (i, len(out), br)
+                          total += len(out)
+                      assert pos == len(body), "压缩帧存在截断或尾随字节"
                       assert total == raw, "块合计 %d != rawSize %d" % (total, raw)
                       seen["frame"] = True
                       print("E2E_PASS compressed_frame_ok"); rc = 0; break

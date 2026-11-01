@@ -64,22 +64,21 @@ public final class ZstdPaperCommand implements BasicCommand {
         // Folia 上则按区域/实体分派，同一个秒级任务在两边的触发时机完全不同。
         sender.sendMessage("§7  服务端: §b" + MikuZstdPaper.platformName()
                 + (MikuZstdPaper.isFolia()
-                        ? "§7（区域化多线程：BossBar 任务绑玩家实体）"
+                        ? "§7（区域化多线程：监控任务跟随玩家实体）"
                         : "§7（单主线程）"));
         sender.sendMessage(threshold < 0
                 ? "§c  原版压缩阈值 = " + threshold + "（已关闭）→ 本插件会自动停用"
                 : "§a  原版压缩阈值 = " + threshold + " → zstd 可接管");
-        sender.sendMessage("§7  压缩等级=" + cfg.level + " 窗口=" + cfg.windowLog
+        sender.sendMessage("§e── 运行概况 ──");
+        sender.sendMessage("§7  压缩等级=" + cfg.level + " 窗口指数=" + cfg.windowLog
                 + " 下行批处理=" + cfg.batchWindowMs + "ms/" + cfg.batchMaxPackets + "包"
                 + " 直存阈值=" + cfg.skipCompressBelowBytes + "B");
 
-        sender.sendMessage("§e── 压缩线程池 ──");
-        sender.sendMessage("§7  " + ZstdCompressPool.summary());
+        sender.sendMessage("§7  在线玩家：" + org.bukkit.Bukkit.getOnlinePlayers().size());
+        sender.sendMessage("§7  线程池：" + ZstdCompressPool.summary());
         if (ZstdCompressPool.backlogged()) {
-            sender.sendMessage("§c  队列积压：压缩跟不上流量 → 优先降低 level，其次调大 threads");
+            sender.sendMessage("§c  队列积压：压缩跟不上流量，请优先降低压缩等级，其次增加线程数");
         }
-
-        sender.sendMessage("§7  上行保持原版压缩/解压；带宽与压缩统计仅覆盖下行");
 
         sender.sendMessage("§e── 跨帧历史 ──");
         sender.sendMessage("§7  滚动历史：§a自动§7（每帧把最近 64KB 原始字节当字典，每 256KB 轮换一次）"

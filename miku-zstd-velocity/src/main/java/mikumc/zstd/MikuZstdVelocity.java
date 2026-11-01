@@ -41,10 +41,8 @@ public class MikuZstdVelocity {
         Path dataDir = resolveDataDir(dataDirectory);
         ZstdVelocityConfig.load(dataDir.resolve("config.yml"));
         ZstdCompressPool.init(ZstdVelocityConfig.INSTANCE.compressThreads, 5);
-        if (ZstdVelocityConfig.INSTANCE.debug) {
-            applyDebugLogLevel();
-        }
-        // 带宽剖析：用真实流量回答"字节花在哪个包长区间"，debug 关闭时零开销
+        applyDebugFromConfig();
+        // 带宽剖析：用真实流量回答"字节花在哪个帧长区间"，debug 关闭时零开销
         ZstdBandwidthProfiler.start(ZstdVelocityConfig.INSTANCE.debug, 60);
         logger.info("Miku-ZSTD Velocity plugin initialized");
         ZstdBossBarMonitor.init(proxy, this);
@@ -221,49 +219,41 @@ public class MikuZstdVelocity {
         });
     }
 
-    /**
-     * 按当前配置应用 debug 日志等级。
-     *
-     * <p>启动时调一次，{@code /mikuzstd reload} 后再调一次——否则改完配置 reload 会显示
-     * {@code debug: true} 而日志一条都不多，比不提供这个开关更糟。</p>
-     *
-     * <p>只处理"开启"：关闭需要人工改日志框架，插件不去重置等级（会误伤其它插件）。</p>
-     */
+    /** 启动与reload只设置本插件命名logger：开启为DEBUG，关闭为INFO。 */
     void applyDebugFromConfig() {
-        if (ZstdVelocityConfig.INSTANCE.debug) {
-            applyDebugLogLevel();
-        }
+        applyDebugLogLevel();
     }
 
     private void applyDebugLogLevel() {
-        boolean ok = tryLog4j2() || tryLogback();
+        boolean debug = ZstdVelocityConfig.INSTANCE.debug;
+        boolean ok = tryLog4j2(debug) || tryLogback(debug);
         if (ok) {
-            logger.info("[Zstd] Debug logging enabled");
+            logger.info("[Zstd] Debug logging {}", debug ? "enabled" : "disabled");
         } else {
             logger.warn("[Zstd] Could not set debug log level — configure the logging framework manually");
         }
     }
 
-    private boolean tryLog4j2() {
+    private boolean tryLog4j2(boolean debug) {
         try {
             Class<?> configuratorClass = Class.forName("org.apache.logging.log4j.core.config.Configurator");
             Class<?> levelClass = Class.forName("org.apache.logging.log4j.Level");
-            Object debugLevel = levelClass.getField("DEBUG").get(null);
+            Object configuredLevel = levelClass.getField(debug ? "DEBUG" : "INFO").get(null);
             configuratorClass.getMethod("setLevel", String.class, levelClass)
-                    .invoke(null, "miku-zstd", debugLevel);
+                    .invoke(null, "miku-zstd", configuredLevel);
             return true;
         } catch (Exception ignored) {
             return false;
         }
     }
 
-    private boolean tryLogback() {
+    private boolean tryLogback(boolean debug) {
         try {
             Class<?> levelClass = Class.forName("ch.qos.logback.classic.Level");
-            Object debugLevel = levelClass.getField("DEBUG").get(null);
+            Object configuredLevel = levelClass.getField(debug ? "DEBUG" : "INFO").get(null);
             Class<?> loggerClass = Class.forName("ch.qos.logback.classic.Logger");
             Object logbackLogger = org.slf4j.LoggerFactory.getLogger("miku-zstd");
-            loggerClass.getMethod("setLevel", levelClass).invoke(logbackLogger, debugLevel);
+            loggerClass.getMethod("setLevel", levelClass).invoke(logbackLogger, configuredLevel);
             return true;
         } catch (Exception ignored) {
             return false;

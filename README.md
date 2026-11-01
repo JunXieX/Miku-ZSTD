@@ -113,7 +113,7 @@ MikuMC 服务器与作者 JunXieX 享有项目著作权。
 
 把 `Miku-ZSTD-<版本>-Fabric.jar` 放入 `.minecraft/mods/`。
 
-进入游戏后按 **F8** 可切换统计 HUD，实时显示下行的压缩前后速率与压缩率；上行标记为原版。
+进入游戏后按 **F8** 可切换统计 HUD，实时显示下行的压缩前后速率与压缩率。
 
 首次启动会在游戏目录下生成 `Miku-ZSTD/config.yml`。
 

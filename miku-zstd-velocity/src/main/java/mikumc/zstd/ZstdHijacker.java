@@ -190,7 +190,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
     @Override
     public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
         ZstdChannelManager mgr = ctx.channel().attr(ZstdChannelManager.KEY).get();
-        if (LOGGER.isDebugEnabled()) {
+        if (LOGGER.isDebugEnabled() && mgr != null && mgr.isNegotiationSent()) {
             // 登录阶段的入站包诊断：定位"应答没被拦到"这类问题时非常有用。
             // 激活后本处理器会自移除，因此这里的量级只限于登录阶段的少量包。
             LOGGER.debug("[Zstd] spy inbound: {} (mgr={}, txId={})",
@@ -225,7 +225,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
     @Override
     public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception {
         ZstdChannelManager mgr = ctx.channel().attr(ZstdChannelManager.KEY).get();
-        if (LOGGER.isDebugEnabled() && mgr != null && !mgr.isReplaced()) {
+        if (LOGGER.isDebugEnabled() && mgr != null && mgr.isNegotiationSent() && !mgr.isReplaced()) {
             // 出站诊断：定位"激活窗口内的包走了哪条编码路径"
             LOGGER.debug("[Zstd] spy outbound: {} (holding={}, activated={})",
                     msg.getClass().getSimpleName(), holding, pipelineActivated);

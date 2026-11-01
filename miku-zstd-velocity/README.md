@@ -187,3 +187,9 @@ compression:
   # ≤32B 压缩后反而膨胀到 102~113%，48B 起才有收益。
   # 5.0.42 删除训练字典后只剩这一档（原来的 _with_dict 已移除）。
   skip_compress_below_bytes: 48
+
+logging:
+  debug: true
+```
+
+`logging.debug` 开启时使用本插件的 DEBUG 日志并启用每 60 秒一次的下行帧带宽剖析；关闭时使用 INFO 日志并停止剖析。修改后执行 `/mikuzstd reload` 即时生效。剖析按合批后的原始帧大小分档，不代表单个游戏包的长度分布。

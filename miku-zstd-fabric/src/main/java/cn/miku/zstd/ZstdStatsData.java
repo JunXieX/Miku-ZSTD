@@ -27,7 +27,7 @@ public final class ZstdStatsData {
         ACCUM_RX_OUT.add(outBytes);
     }
 
-    /** 数据不足或无下行流量时返回 null；上行只显示原版标记。 */
+    /** 数据不足或无下行流量时返回 null。 */
     public static synchronized String captureTabStats(int intervalSec) {
         long now = System.currentTimeMillis();
         boolean first = lastCaptureTime == 0;
@@ -61,19 +61,13 @@ public final class ZstdStatsData {
 
         long avgRxIn = avg(RING_RX_IN);
         long avgRxOut = avg(RING_RX_OUT);
-        if (avgRxIn == 0) return null;
         double rxRatio = avgRxOut > 0 ? 100.0 * avgRxIn / avgRxOut : 100.0;
-        return String.format("\u00a7lTX:\u00a7r Vanilla  |  \u00a7lRX:\u00a7r %s \u2192 %s %s",
+        return String.format("\u00a7l下行：\u00a7r %s \u2192 %s %s",
                 fmtBytes(avgRxOut), fmtBytes(avgRxIn), colorRatio(rxRatio));
     }
 
     private static String fmtBytes(long bps) {
         return String.format("%7s", mikumc.zstd.protocol.ZstdBossBarFormat.rate(bps));
-    }
-
-    public static synchronized String debugSummary() {
-        return String.format("samples=%d upstream=vanilla rxIn=%d rxOut=%d",
-                samples, ACCUM_RX_IN.sum(), ACCUM_RX_OUT.sum());
     }
 
     private static String colorRatio(double ratio) {

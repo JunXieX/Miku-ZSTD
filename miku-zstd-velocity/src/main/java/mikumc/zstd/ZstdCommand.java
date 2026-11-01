@@ -87,29 +87,19 @@ public final class ZstdCommand {
     private void showStatus(CommandSource source) {
         ZstdVelocityConfig cfg = ZstdVelocityConfig.INSTANCE;
 
-        source.sendMessage(Component.text("═══ Miku-ZSTD Status ═══", NamedTextColor.GOLD));
-        source.sendMessage(Component.text("Version: " + BuildConstants.VERSION, NamedTextColor.GRAY));
-
-        source.sendMessage(Component.text("── Compression ──", NamedTextColor.YELLOW));
-        source.sendMessage(Component.text("  Level: " + cfg.level + "  WindowLog: " + cfg.windowLog,
-                NamedTextColor.GRAY));
-
-        source.sendMessage(Component.text("── Connections ──", NamedTextColor.YELLOW));
-        source.sendMessage(Component.text("  Online players: " + proxy.getPlayerCount(), NamedTextColor.GRAY));
-
-        source.sendMessage(Component.text("── 压缩线程池 ──", NamedTextColor.YELLOW));
-        source.sendMessage(Component.text("  " + ZstdCompressPool.summary(), NamedTextColor.GRAY));
-
-        source.sendMessage(Component.text(
-                "  上行保持原版压缩/解压；带宽与压缩统计仅覆盖下行", NamedTextColor.GRAY));
+        source.sendMessage(Component.text("═══ Miku-ZSTD 状态 ═══", NamedTextColor.GOLD));
+        source.sendMessage(Component.text("版本：" + BuildConstants.VERSION, NamedTextColor.GRAY));
+        source.sendMessage(Component.text("── 运行概况 ──", NamedTextColor.YELLOW));
+        source.sendMessage(Component.text("  压缩等级：" + cfg.level + "  窗口指数：" + cfg.windowLog
+                + "  在线玩家：" + proxy.getPlayerCount(), NamedTextColor.GRAY));
+        source.sendMessage(Component.text("  线程池：" + ZstdCompressPool.summary(), NamedTextColor.GRAY));
         if (ZstdCompressPool.backlogged()) {
             source.sendMessage(Component.text(
-                    "  队列积压：压缩跟不上流量 → 优先降低 level，其次调大 threads",
+                    "  队列积压：压缩跟不上流量，请优先降低压缩等级，其次增加线程数",
                     NamedTextColor.RED));
         }
 
-        source.sendMessage(Component.text("── Config ──", NamedTextColor.YELLOW));
-        source.sendMessage(Component.text("  debug: " + cfg.debug, NamedTextColor.GRAY));
+        source.sendMessage(Component.text("  调试日志：" + (cfg.debug ? "开启" : "关闭"), NamedTextColor.GRAY));
     }
 
     /** 各连接的压缩统计排行 —— 定位"是谁在拖后腿"。 */
@@ -135,7 +125,7 @@ public final class ZstdCommand {
             plugin.applyDebugFromConfig();
         }
         ZstdBandwidthProfiler.start(ZstdVelocityConfig.INSTANCE.debug, 60);
-        source.sendMessage(Component.text("Config reloaded.", NamedTextColor.GREEN));
+        source.sendMessage(Component.text("配置已重载。", NamedTextColor.GREEN));
         // ⚠️ 必须说清楚作用范围，否则管理员会以为 reload 没生效。三类参数都不会作用于已有连接：
         //   · level / window_log：连接建立时应用到该连接的 zstd 上下文（见 ZstdChannelManager 构造器）；
         //   · batch_window_ms / batch_max_packets：编码器 handlerAdded 时快照；

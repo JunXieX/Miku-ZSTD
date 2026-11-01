@@ -10,10 +10,10 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.LongAdder;
 
 /**
- * 出站带宽剖析（全服聚合，默认 60 秒一行）。
+ * 下行帧带宽剖析（全服聚合，默认 60 秒一行）。
  *
  * <h2>为什么需要它</h2>
- * <p>"怎么继续降低带宽"这个问题<b>必须用真实流量分布来回答</b>，因为不同包长区间的
+ * <p>"怎么继续降低带宽"这个问题<b>必须用真实流量分布来回答</b>，因为不同帧长区间的
  * 优化手段完全不同。实测（合成流量，见 <code>开发期探针 MemProbe7~9</code>）：</p>
  * <ul>
  *   <li>小包（&lt;48B）：无字典时压缩后<b>膨胀到 105%</b>（全部直存、纯浪费 CPU），
@@ -22,18 +22,18 @@ import java.util.concurrent.atomic.LongAdder;
  *   <li>因此"下一步该优化什么"取决于你自己的字节分布。</li>
  * </ul>
  *
- * <p>本剖析按包长分档统计<b>原始字节 / 线路字节 / 直存帧数</b>，直接告诉运维：
+ * <p>本剖析按帧长分档统计<b>原始字节 / 线路字节 / 直存帧数</b>，直接告诉运维：
  * 字节都花在哪个区间、该区间压缩率如何、值不值得继续投入。</p>
  *
- * <p>代价：每包一次数组下标 + {@link LongAdder#add}，可忽略。</p>
+ * <p>代价：每帧一次数组下标 + {@link LongAdder#add}，可忽略。</p>
  */
 public final class ZstdBandwidthProfiler {
 
     private static final Logger LOGGER = LoggerFactory.getLogger("miku-zstd");
 
-    /** 分档上界（字节）：&lt;128B、&lt;512B、&lt;4KB、≥4KB */
+    /** 原始帧大小分档上界（字节）：&lt;128B、&lt;512B、&lt;4KB、≥4KB */
     private static final int[] BAND_LIMIT = {128, 512, 4096, Integer.MAX_VALUE};
-    private static final String[] BAND_NAME = {"小包 <128B", "中包 128B-512B", "大包 512B-4KB", "巨包 ≥4KB"};
+    private static final String[] BAND_NAME = {"小帧 <128B", "中帧 128B-512B", "大帧 512B-4KB", "巨帧 ≥4KB"};
 
     private static final LongAdder[] RAW = new LongAdder[BAND_LIMIT.length];
     private static final LongAdder[] WIRE = new LongAdder[BAND_LIMIT.length];
@@ -95,7 +95,7 @@ public final class ZstdBandwidthProfiler {
         }
     }
 
-    /** 编码器热路径调用：记录一个出站包。 */
+    /** 编码器热路径调用：记录一个下行帧。 */
     public static void record(int rawSize, int wireSize, boolean compressed) {
         if (!enabled) return;
         int band = bandOf(rawSize);

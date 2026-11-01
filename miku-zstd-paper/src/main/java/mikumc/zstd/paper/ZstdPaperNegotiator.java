@@ -113,22 +113,19 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
     public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
         if (settled) {
             // 协商已定案，但协商器还要留一小段时间：客户端对查询的应答可能晚于服务端的
-            // 协议切换到达。这类应答必须被吞掉（见 settled 的注释），其余包原样下传。
+            // 协议切换到达。只吞本插件 txId 的应答，其余包原样下传。
             // ⚠️ 但"切换确认"要先把 txId 回填给闸门再吞 —— 帧层嗅探器是主路径，这里是它
             // 缺位时的包层兜底；若和普通应答一起吞掉，闸门只能白等 5 秒超时才放行扣包。
             if (isQueryAnswer(msg)) {
                 int switchTx = readSwitchTxId(msg);
-                if (switchTx > 0) {
-                    ZstdPaperChannelManager m = ctx.channel()
-                            .attr(ZstdPaperChannelManager.KEY).get();
-                    if (m != null && m.isReplaced()) {
-                        m.markSwitchConfirmed(switchTx);
-                    }
+                ZstdPaperChannelManager m = ctx.channel().attr(ZstdPaperChannelManager.KEY).get();
+                if (m != null && (readInt(msg, "transactionId", "id", "transactionID") == m.getNegotiateTxId()
+                        || (switchTx > 0 && m.isReplaced() && m.markSwitchConfirmed(switchTx)))) {
+                    io.netty.util.ReferenceCountUtil.release(msg);
+                    return;
                 }
-                io.netty.util.ReferenceCountUtil.release(msg);
-            } else {
-                super.channelRead(ctx, msg);
             }
+            super.channelRead(ctx, msg);
             return;
         }
 
@@ -172,11 +169,8 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
             // 0) 切换确认（客户端发来的 zstd:switch）：必须在通用应答解析之前拦下
             //    帧层嗅探器是主路径；这里只是包层兜底（嗅探器装不上时）。
             int switchTx = readSwitchTxId(msg);
-            if (switchTx > 0) {
+            if (switchTx > 0 && mgr.isReplaced() && mgr.markSwitchConfirmed(switchTx)) {
                 io.netty.util.ReferenceCountUtil.release(msg);
-                if (mgr.isReplaced()) {
-                    mgr.markSwitchConfirmed(switchTx);
-                }
                 return;
             }
             String cn = msg.getClass().getSimpleName();

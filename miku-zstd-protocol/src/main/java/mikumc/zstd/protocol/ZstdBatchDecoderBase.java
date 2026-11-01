@@ -124,7 +124,7 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
     }
 
     /** 字典代数上限：仅用于 varint 越界判定（滑窗最多几秒轮换一次，远小于此）。 */
-    private static final int MAX_DICT_GEN = 1 << 20;
+    private static final int MAX_DICT_GEN = Integer.MAX_VALUE;
 
     private ZstdDecompressCtx decompressCtx;
 

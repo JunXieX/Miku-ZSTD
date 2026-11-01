@@ -54,9 +54,6 @@ public class ZstdHandshakeSniffer extends MessageToMessageDecoder<ByteBuf> {
 
         byte[] data = new byte[in.readableBytes()];
         in.getBytes(in.readerIndex(), data);
-        if (!contains(data, MARKER)) {
-            return;
-        }
 
         // 仅对登录连接（nextState==2）注入；服务器列表 ping（nextState==1）不做任何处理。
         Integer nextState = parseHandshakeNextState(data);
@@ -156,15 +153,4 @@ public class ZstdHandshakeSniffer extends MessageToMessageDecoder<ByteBuf> {
         return nextState == ZstdVarInts.INVALID ? null : nextState;
     }
 
-    private static boolean contains(byte[] haystack, byte[] needle) {
-        if (haystack.length < needle.length) return false;
-        outer:
-        for (int i = 0; i <= haystack.length - needle.length; i++) {
-            for (int j = 0; j < needle.length; j++) {
-                if (haystack[i + j] != needle[j]) continue outer;
-            }
-            return true;
-        }
-        return false;
-    }
 }

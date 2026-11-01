@@ -9,7 +9,7 @@ import org.slf4j.LoggerFactory;
 import java.util.regex.Pattern;
 
 /**
- * 左上角统计 HUD：TX 标记原版，RX 显示下行 zstd 速率与压缩率。
+ * 左上角统计 HUD：显示下行 zstd 速率与压缩率。
  * 由 MixinHud 在 {@code Hud.extractRenderState} 尾部调用。
  *
  * <h2>3.1.1 变更</h2>
@@ -39,8 +39,7 @@ public final class ZstdHudRenderer {
     private static long lastDiagMs;
     /** 上一次诊断的"类别"，类别变化时立即输出（避免周期性刷屏） */
     private static String lastDiagKey;
-    private static String lastTxLine;
-    private static String lastRxLine;
+    private static String lastLine;
 
     private ZstdHudRenderer() {
     }
@@ -53,28 +52,23 @@ public final class ZstdHudRenderer {
         long now = System.currentTimeMillis();
 
         if (mc.player == null) {
+            lastLine = null;
             // 标题界面/未进入世界：Hud.extractRenderState 仍会被调用，但没有玩家就不画
-            diag("no-player", "HUD on but no player in world (title screen?) — nothing drawn");
+            diag("no-player", "HUD 已开启，当前没有进入游戏世界");
             return;
         }
 
         if (now - lastUpdateMs >= REFRESH_MS) {
             lastUpdateMs = now;
             String stats = ZstdStatsData.captureTabStats(1);
+            lastLine = stats;
             if (stats != null) {
-                int sep = stats.indexOf('|');
-                if (sep < 0) {
-                    lastTxLine = stats.trim();
-                } else {
-                    lastTxLine = stats.substring(0, sep).trim();
-                    lastRxLine = stats.substring(sep + 1).trim();
-                }
-                diag("drawing", "HUD drawing: " + lastTxLine + "  ||  " + lastRxLine);
+                diag("drawing", "HUD 正在显示下行统计");
             } else {
-                diag("waiting", "HUD waiting for stats — " + ZstdStatsData.debugSummary());
+                diag("waiting", "HUD 正在采集下行流量");
             }
         }
-        drawHud(g, mc.font, lastTxLine, lastRxLine);
+        drawHud(g, mc.font, lastLine);
     }
 
     /**
@@ -98,23 +92,13 @@ public final class ZstdHudRenderer {
         }
     }
 
-    private static void drawHud(GuiGraphicsExtractor g, Font font, String tx, String rx) {
-        if (tx == null && rx == null) {
-            return;
-        }
+    private static void drawHud(GuiGraphicsExtractor g, Font font, String line) {
+        if (line == null) return;
         int x = 4;
         int y = 4;
-        int totalLines = (tx != null ? 1 : 0) + (rx != null ? 1 : 0);
-        int maxW = Math.max(tx != null ? font.width(stripFormatting(tx)) : 0,
-                rx != null ? font.width(stripFormatting(rx)) : 0) + 4;
-        g.fill(x - 2, y - 2, x + maxW, y + LINE_HEIGHT * totalLines, 0x80000000);
-        if (tx != null) {
-            g.text(font, tx, x, y, TEXT_COLOR);
-            y += LINE_HEIGHT;
-        }
-        if (rx != null) {
-            g.text(font, rx, x, y, TEXT_COLOR);
-        }
+        int width = font.width(stripFormatting(line)) + 4;
+        g.fill(x - 2, y - 2, x + width, y + LINE_HEIGHT, 0x80000000);
+        g.text(font, line, x, y, TEXT_COLOR);
     }
 
     private static String stripFormatting(String s) {

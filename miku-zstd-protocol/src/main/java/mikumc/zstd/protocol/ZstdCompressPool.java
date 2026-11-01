@@ -83,7 +83,6 @@ public final class ZstdCompressPool {
             init(0, 0);
             p = pool;
         }
-        TOTAL_TASKS.increment();
         // ACTIVE 只统计"正在执行"，排队中的任务不计入 —— 否则 summary() 的"活跃"会把
         // 队列长度也算进去，与"CPU 是否打满"的判读混淆。
         p.execute(() -> {
@@ -94,6 +93,7 @@ public final class ZstdCompressPool {
             } finally {
                 long dt = System.nanoTime() - t0;
                 TOTAL_NANOS.add(dt);
+                TOTAL_TASKS.increment();
                 MAX_NANOS.accumulateAndGet(dt, Math::max);
                 if (dt >= slowThresholdMs * 1_000_000L) {
                     SLOW_TASKS.incrementAndGet();
@@ -152,7 +152,7 @@ public final class ZstdCompressPool {
         long total = TOTAL_TASKS.sum();
         long avgNs = total == 0 ? 0 : TOTAL_NANOS.sum() / total;
         return String.format(
-                "线程 %d | 活跃 %d | 队列 %d | 累计 %,d 次 | 平均 %.2fms | 最大 %.2fms | 慢(>%dms) %d 次",
+                "线程 %d | 活跃 %d | 队列 %d | 完成 %,d 次 | 平均 %.2f毫秒 | 最大 %.2f毫秒 | 慢任务（≥%d毫秒）%d 次",
                 threads, ACTIVE.get(), queueDepth(), total,
                 avgNs / 1_000_000.0, MAX_NANOS.get() / 1_000_000.0,
                 slowThresholdMs, SLOW_TASKS.get());

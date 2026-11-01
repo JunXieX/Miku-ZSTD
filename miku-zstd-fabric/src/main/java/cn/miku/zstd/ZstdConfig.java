@@ -71,7 +71,7 @@ public class ZstdConfig {
                     # 旧配置中的 compression 段已停用，保留该段也不会影响连接。
 
                     display:
-                      # HUD 显示下行速率与压缩率，上行标记为 Vanilla。
+                      # HUD 显示下行速率与压缩率。
                       # 游戏内按 F8 可临时开关（不落盘，重启后恢复此设置）。
                       hud_enabled: false
                     """;

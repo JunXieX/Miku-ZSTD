@@ -836,18 +836,35 @@ class FrameLayoutTest {
         int genIndex = probe.readerIndex(); // dictGen 的绝对位置
         assertEquals(0, ZstdVarInts.tryRead(probe, 1 << 20), "编码器应写 dictGen=0");
 
-        ByteBuf tampered = frame.retainedDuplicate();
-        tampered.setByte(genIndex, 1); // 冒充 gen=1：本地仍是 0
+        EmbeddedChannel control = new EmbeddedChannel(new TestDecoder(decompressCtx));
+        ByteBuf unmodified = frame.copy();
+        try {
+            feed(control, unmodified);
+            List<byte[]> got = drainInbound(control);
+            assertEquals(1, got.size(), "未篡改对照必须真正通过解压");
+            assertArrayEquals(fullPacket(repetitive(2048)), got.get(0));
+            assertTrue(control.isOpen(), "同一原始帧必须合法");
+        } finally {
+            unmodified.release();
+            control.finishAndReleaseAll();
+        }
 
+        ByteBuf tampered = frame.copy();
+        tampered.setByte(genIndex, 1); // 冒充 gen=1：本地仍是 0
         TestDecoder decoder = new TestDecoder(decompressCtx);
         EmbeddedChannel in = new EmbeddedChannel(decoder);
-        in.writeInbound(tampered);
-        in.runPendingTasks();
-        assertNull(in.readInbound(), "代数不符的帧不得产出任何包");
-        assertFalse(in.isOpen(), "代数不符必须 fail-fast 关闭连接");
-        in.finishAndReleaseAll();
-        frame.release();
-        out.finishAndReleaseAll();
+        try {
+            feed(in, tampered); // 与正常管线一致，先剥掉外层 bodyLen
+            in.runPendingTasks();
+            assertNull(in.readInbound(), "代数不符的帧不得产出任何包");
+            assertFalse(in.isOpen(), "代数不符必须 fail-fast 关闭连接");
+            assertNull(decoder.lastError, "应走代数校验，而非异常兜底");
+        } finally {
+            tampered.release();
+            in.finishAndReleaseAll();
+            frame.release();
+            out.finishAndReleaseAll();
+        }
     }
 
     @Test
@@ -963,6 +980,64 @@ class FrameLayoutTest {
     }
 
     @Test
+    @DisplayName("屏障 A-X-C：历史轮换完成后才能复用原文并开始下一压缩批")
+    void barrierCommitsHistoryBeforeReusingRawBuffer() {
+        assertBarrierSequence(repetitive(ZstdRollingDict.ROTATE_AFTER_BYTES), null, 0, true);
+    }
+
+    @Test
+    @DisplayName("屏障 A-B-X-C：在途期间积压的 B 必须先于协议任务 X")
+    void barrierWaitsForAllEarlierPendingPackets() {
+        assertBarrierSequence(repetitive(ZstdRollingDict.ROTATE_AFTER_BYTES), repetitive(1024), 0, true);
+    }
+
+    @Test
+    @DisplayName("屏障 A-X-C：压缩无收益回退直存仍保持原文与历史对称")
+    void barrierPreservesStoredFallbackHistory() {
+        assertBarrierSequence(incompressible(ZstdRollingDict.ROTATE_AFTER_BYTES), null, 0, false);
+    }
+
+    @Test
+    @DisplayName("屏障 A-X-C：并行压缩的临时原文释放后再开始后续批次")
+    void barrierPreservesTemporaryRawHistory() {
+        assertBarrierSequence(repetitive(1024 * 1024), null, 0, true);
+    }
+
+    @Test
+    @DisplayName("直存临时原文：写完必须释放，屏障之后仍能继续往返")
+    void storedBatchReleasesTemporaryRawBuffer() {
+        assertBarrierSequence(repetitive(600 * 1024), null, Integer.MAX_VALUE, false);
+    }
+
+    @Test
+    @DisplayName("合法非负 int 代数：超过旧 2^20 上限仍可真实编码解码")
+    void dictionaryGenerationAcceptsFullNonNegativeIntRange() throws ReflectiveOperationException {
+        TestEncoder encoder = new TestEncoder(true, 0, 1);
+        TestDecoder decoder = new TestDecoder(decompressCtx);
+        EmbeddedChannel out = new EmbeddedChannel(encoder);
+        EmbeddedChannel in = new EmbeddedChannel(decoder);
+        java.lang.reflect.Field generation = ZstdRollingDict.class.getDeclaredField("generation");
+        generation.setAccessible(true);
+        generation.setInt(encoder.rollingDict(), Integer.MAX_VALUE);
+        generation.setInt(decoder.rollingDict(), Integer.MAX_VALUE);
+        byte[] payload = repetitive(2048);
+        try {
+            io.netty.channel.ChannelFuture sent = out.write(packet(payload));
+            out.flush();
+            awaitWrite(out, sent);
+            assertNextPacket(out, in, payload);
+            assertTrue(in.isOpen(), "非负 int 上界是合法的匹配代数");
+            assertEquals(1, decoder.compressedFrames);
+        } finally {
+            synchronized (encoder.lock) {
+                encoder.lock.markClosed();
+            }
+            out.finishAndReleaseAll();
+            in.finishAndReleaseAll();
+        }
+    }
+
+    @Test
     @DisplayName("v7 地板：直存阈值配成 0 时，握手级小包仍必须直存（否则帧层嗅探器认不出）")
     void storedThresholdFloorKeepsHandshakeStored() {
         // zstd:switch 的询问/确认只有十几字节，靠"直存帧 [0][packet]"被帧层嗅探器识别。
@@ -987,6 +1062,81 @@ class FrameLayoutTest {
     // ────────────────────────────────────────────────────────────────
     // 辅助
     // ────────────────────────────────────────────────────────────────
+
+    private void assertBarrierSequence(byte[] a, byte[] b, int skip, boolean compressedA) {
+        TestEncoder encoder = new TestEncoder(true, skip, 1);
+        TestDecoder decoder = new TestDecoder(decompressCtx);
+        EmbeddedChannel out = new EmbeddedChannel(encoder);
+        EmbeddedChannel in = new EmbeddedChannel(decoder);
+        Object barrier = new Object();
+        byte[] c = repetitive(4096);
+        c[0] = 0x55;
+        try {
+            io.netty.channel.ChannelFuture first;
+            io.netty.channel.ChannelFuture before = null;
+            io.netty.channel.ChannelFuture task;
+            io.netty.channel.ChannelFuture last;
+            synchronized (encoder.lock) {
+                // 池线程拿不到连接锁，A 确定在途；排好全部输入后才允许压缩继续。
+                first = out.write(packet(a));
+                out.flush();
+                if (skip == Integer.MAX_VALUE && a.length > 512 * 1024) {
+                    assertEquals(0, encoder.lastRawBuffer.refCnt(), "同步直存的大帧原文必须已释放");
+                }
+                if (b != null) {
+                    before = out.write(packet(b));
+                    out.flush();
+                }
+                task = out.write(barrier);
+                last = out.write(packet(c));
+                out.flush();
+            }
+            awaitWrite(out, last);
+            assertTrue(first.isSuccess(), "A 的 promise 必须成功");
+            if (before != null) assertTrue(before.isSuccess(), "B 的 promise 必须成功");
+            assertTrue(task.isSuccess(), "屏障的 promise 必须成功");
+            assertEquals(compressedA ? 1 : 0, encoder.frames.get(0)[2], "覆盖指定的压缩/直存路径");
+            assertNextPacket(out, in, a);
+            if (b != null) assertNextPacket(out, in, b);
+            assertEquals(barrier, out.readOutbound(), "屏障须位于所有前序包之后、C之前");
+            assertNextPacket(out, in, c);
+            assertNull(out.readOutbound(), "不得产生重复帧或屏障");
+            assertTrue(in.isOpen(), "屏障后的帧必须通过真实 native 解压与代数校验");
+            assertTrue(encoder.rollingDict().generation() > 0, "A必须实际触发历史轮换");
+            assertEquals(encoder.rollingDict().generation(), decoder.rollingDict().generation());
+            assertArrayEquals(encoder.rollingDict().activeDict(), decoder.rollingDict().activeDict());
+        } finally {
+            synchronized (encoder.lock) {
+                encoder.lock.markClosed();
+            }
+            out.finishAndReleaseAll();
+            in.finishAndReleaseAll();
+        }
+    }
+
+    private static void awaitWrite(EmbeddedChannel channel, io.netty.channel.ChannelFuture future) {
+        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(5);
+        while (!future.isDone() && System.nanoTime() < deadline) {
+            channel.runPendingTasks();
+            Thread.yield();
+        }
+        assertTrue(future.isDone(), "压缩及事件循环回调必须完成");
+        assertTrue(future.isSuccess(), () -> "写入应成功：" + future.cause());
+    }
+
+    private static void assertNextPacket(EmbeddedChannel out, EmbeddedChannel in, byte[] expected) {
+        Object next = out.readOutbound();
+        assertTrue(next instanceof ByteBuf, "此位置必须是前序帧，协议屏障不得插队");
+        ByteBuf frame = (ByteBuf) next;
+        try {
+            feed(in, frame);
+        } finally {
+            frame.release();
+        }
+        List<byte[]> got = drainInbound(in);
+        assertEquals(1, got.size(), "必须恰好解出一个包");
+        assertArrayEquals(fullPacket(expected), got.get(0), "原文不得被下一批覆盖");
+    }
 
     private void assertRoundTrip(boolean withBodyLen, int perFrame, int total) {
         TestEncoder encoder = new TestEncoder(withBodyLen, Integer.MAX_VALUE, perFrame);
@@ -1168,6 +1318,7 @@ class FrameLayoutTest {
         boolean lastCompressed;
         int lastRaw;
         int lastWire;
+        ByteBuf lastRawBuffer;
         final ZstdCompressLock lock = new ZstdCompressLock();
 
         TestEncoder(boolean bodyLen, int skip, int maxPackets) {
@@ -1209,6 +1360,11 @@ class FrameLayoutTest {
         @Override
         protected boolean writeBodyLen() {
             return bodyLen;
+        }
+
+        @Override
+        protected void onRawBatch(ByteBuf raw, int length) {
+            lastRawBuffer = raw;
         }
 
         @Override

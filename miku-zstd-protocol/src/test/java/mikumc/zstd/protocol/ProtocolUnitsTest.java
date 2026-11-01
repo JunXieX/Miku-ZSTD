@@ -5,20 +5,14 @@ import io.netty.buffer.Unpooled;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
-import java.nio.charset.StandardCharsets;
-import java.util.Arrays;
-
-import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * 共享协议层里那些"短小但对齐要求很高"的组件的单元测试。
  *
- * <p>这些类都是三端（或两端）共用的契约点：VarInt 编码、字典 id、协商状态码、
- * 采样过滤、BossBar 模板、流量统计。它们的共同风险是"改错了不报错，只悄悄改变行为"，
+ * <p>这些类都是三端（或两端）共用的契约点：VarInt 编码、协议版本、协商状态码、
+ * BossBar 模板、流量统计。它们的共同风险是"改错了不报错，只悄悄改变行为"，
  * 因此每一个都要有可执行的边界样例。</p>
  */
 class ProtocolUnitsTest {
@@ -148,60 +142,6 @@ class ProtocolUnitsTest {
     }
 
     // ────────────────────────────────────────────────────────────────
-    // 采样过滤
-    // ────────────────────────────────────────────────────────────────
-
-    @Test
-    @DisplayName("采样过滤：过短、恰好 8 字节（多为 KeepAlive）与低于门槛的包都被排除")
-    void sampleFilterRules() {
-        int threshold = 16;
-        assertFalse(ZstdSampleFilter.shouldKeep(null, threshold));
-        assertFalse(ZstdSampleFilter.shouldKeep(new byte[0], threshold));
-
-        // 包 = [varint id][payload]，id 占 1 字节
-        assertFalse(ZstdSampleFilter.shouldKeep(pkt(1, 2), threshold), "载荷 2 字节太短");
-        assertFalse(ZstdSampleFilter.shouldKeep(pkt(1, 8), threshold), "8 字节载荷按启发式排除");
-        assertFalse(ZstdSampleFilter.shouldKeep(pkt(1, 15), threshold), "低于门槛");
-        assertTrue(ZstdSampleFilter.shouldKeep(pkt(1, 16), threshold), "达到门槛应保留");
-        assertTrue(ZstdSampleFilter.shouldKeep(pkt(1, 64), threshold));
-    }
-
-    @Test
-    @DisplayName("采样过滤：门槛调低到 1 时，短载荷规则仍会拦下 ≤2 与 8 字节")
-    void sampleFilterLowThresholdStillGuards() {
-        assertFalse(ZstdSampleFilter.shouldKeep(pkt(1, 1), 1));
-        assertFalse(ZstdSampleFilter.shouldKeep(pkt(1, 2), 1));
-        assertFalse(ZstdSampleFilter.shouldKeep(pkt(1, 8), 1));
-        assertTrue(ZstdSampleFilter.shouldKeep(pkt(1, 3), 1));
-        assertTrue(ZstdSampleFilter.shouldKeep(pkt(1, 4), 1));
-    }
-
-    @Test
-    @DisplayName("采样过滤：按偏移判定（免复制路径）必须与整包判定逐例一致")
-    void sampleFilterOffsetOverloadMatchesByteArray() {
-        // 训练器热路径现在直接在整帧缓冲上按 (offset,length) 判定，只有通过才复制。
-        // 两条路径的结论必须完全相同——否则"过滤掉哪些包"会随调用方式漂移。
-        int[] payloads = {0, 1, 2, 3, 8, 9, 15, 16, 64};
-        int[] thresholds = {0, 1, 16};
-        for (int payload : payloads) {
-            byte[] packet = pkt(1, payload);
-            // 前面塞一段干扰字节，确保实现真的用了 offset 而不是从 0 开始
-            byte[] frame = new byte[packet.length + 3];
-            Arrays.fill(frame, 0, 3, (byte) 0x7F);
-            System.arraycopy(packet, 0, frame, 3, packet.length);
-            for (int th : thresholds) {
-                assertEquals(ZstdSampleFilter.shouldKeep(packet, th),
-                        ZstdSampleFilter.shouldKeep(frame, 3, packet.length, th),
-                        "payload=" + payload + " threshold=" + th + " 两种判定的结论必须一致");
-            }
-        }
-        // 越界一律拒绝（绝不因算错长度而读到帧外）
-        assertFalse(ZstdSampleFilter.shouldKeep(new byte[4], 3, 5, 0));
-        assertFalse(ZstdSampleFilter.shouldKeep(new byte[4], -1, 2, 0));
-        assertFalse(ZstdSampleFilter.shouldKeep(new byte[4], 0, 0, 0));
-    }
-
-    // ────────────────────────────────────────────────────────────────
     // BossBar 模板与单位
     // ────────────────────────────────────────────────────────────────
 
@@ -294,26 +234,4 @@ class ProtocolUnitsTest {
         }
     }
 
-    // 5.0.42：训练字典整套已删除（含采纳判定与分档数学），
-    // 依据是实机对照——字典让线路字节多 3.7%，而它唯一可能帮到的小包只占总字节 0.1%。
-    // 保留下来的只有滚动历史，其正确性由 FrameLayoutTest 的对称用例覆盖。
-
-    @Test
-    @DisplayName("（占位）字典采纳判定已随训练字典一起删除")
-    void dictAdoptionRemoved() {
-        // 空用例：保留名字便于检索历史决策，不做断言。
-    }
-
-    // ────────────────────────────────────────────────────────────────
-
-    /** 造一个包：[varint id][payload of given size]。 */
-    private static byte[] pkt(int id, int payloadSize) {
-        ByteBuf buf = Unpooled.buffer();
-        ZstdVarInts.write(buf, id);
-        buf.writeBytes(new byte[payloadSize]);
-        byte[] out = new byte[buf.readableBytes()];
-        buf.getBytes(buf.readerIndex(), out);
-        buf.release();
-        return out;
-    }
 }

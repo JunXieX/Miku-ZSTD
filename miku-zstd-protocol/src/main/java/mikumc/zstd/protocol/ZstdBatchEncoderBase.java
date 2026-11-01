@@ -198,7 +198,7 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
     private long pendingBytes;
     private ScheduledFuture<?> windowTask;
 
-    /** 是否有压缩任务在途（仅 event loop 线程读写） */
+    /** 是否有批次尚未完成压缩、历史提交或资源收尾（仅 event loop 线程读写） */
     private boolean compressing;
     /** 在途压缩任务持有的 promise（仅 event loop 线程读写）；通道关闭时需一并失败化 */
     private List<ChannelPromise> inflightPromises;
@@ -586,6 +586,8 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
         removePendingPrefix(batchCount);
 
         final boolean withBodyLen = writeBodyLen();
+        compressing = true;
+        inflightPromises = promises;
 
         // ── 小包直存 ──
         // 实测：无字典时 ≤32B 压缩后膨胀到 102~113%，48B 起才有收益；
@@ -603,26 +605,21 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
                 writeStoredFrames(ctx, raw, rawTotal, withBodyLen, promises);
             } catch (Throwable t) {
                 failAll(promises, t);
+                failBarriers(t);
                 LOGGER.error("[Zstd] encoder stored-frame build failed", t);
-            }
-            if (!pending.isEmpty()) {
-                schedulePendingBatch(ctx);
+            } finally {
+                completeBatch(ctx, raw, rawTemporary);
             }
             return;
         }
 
         // ── 压缩路径：交给线程池 ──
-        // 帧头要写的代数在这里定格：本批可能压缩较久，期间上一帧的收尾会触发历史轮换，
-        // 而这个批次用的仍是"开始压缩时"那份字典。
+        // 定格本批代数；历史与资源收尾完成前，不允许下一批复用原文和上下文。
         inflightDictGen = rolling.generation();
-        // 兜底：确保上下文里装的确实是当前代数对应的字典（轮换发生时已经装过，这里是幂等复查）。
-        applyRollingDict();
-        compressing = true;
-        inflightPromises = promises;
-        final ZstdCompressLock lock = compressLock();
-
-        int blocks = parallelBlocks(rawTotal);
         try {
+            applyRollingDict();
+            final ZstdCompressLock lock = compressLock();
+            int blocks = parallelBlocks(rawTotal);
             if (blocks <= 1) {
                 ZstdCompressPool.execute(() ->
                         compressOneBlock(ctx, promises, raw, rawTotal, withBodyLen, lock, rawTemporary));
@@ -632,10 +629,10 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
         } catch (Throwable t) {
             // 池被关闭 / 线程创建失败：这批已经移出 pending 且 promises 已进 inflight，
             // 不在这里收尾就是"promise 永挂 + compressing 永久为真"（该连接之后再也发不出帧）。
-            compressing = false;
-            inflightPromises = null;
             failAll(promises, t);
+            failBarriers(t);
             LOGGER.error("[Zstd] encoder compression task rejected", t);
+            completeBatch(ctx, raw, rawTemporary);
         }
     }
 
@@ -790,8 +787,6 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
                                  Throwable failure, Block[] blocks, ByteBuf raw,
                                  int rawTotal, boolean withBodyLen, boolean rawTemporary) {
         ctx.executor().execute(() -> {
-            compressing = false;
-            inflightPromises = null;
             try {
                 if (removed || failure != null || !ctx.channel().isActive()) {
                     // 三种收尾共用一个出口：处理器已移除 / 本批压缩失败 / 通道已关。
@@ -824,25 +819,31 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
                 LOGGER.error("[Zstd] encoder frame build failed", t);
             } finally {
                 releaseBlocks(blocks);
-                // 大帧用的临时缓冲（不在字段里，池化分配器不会替我们回收）。
-                // 判据用成帧时记下的 rawTemporary：此处 rawBuf 可能已被 handlerRemoved 释放。
-                if (rawTemporary && raw != null) {
-                    raw.release();
-                }
-                // handler 已移除且当时有在途压缩：scratch 必须等这里才释放（见字段说明）
-                if (deferredScratchRelease) {
-                    deferredScratchRelease = false;
-                    synchronized (compressLock()) {
-                        releaseScratch();
-                    }
-                }
-                // 压缩期间攒下的包：立刻接着发（不设 compressing 了，可以再走一轮）。
-                // handler 已移除时不能再碰 pipeline。
-                if (!removed && !pending.isEmpty()) {
-                    emitBatch(ctx);
-                }
+                completeBatch(ctx, raw, rawTemporary);
             }
         });
+    }
+
+    /** 历史与原文的所有权交还后，才允许下一批或协议屏障推进。 */
+    private void completeBatch(ChannelHandlerContext ctx, ByteBuf raw, boolean rawTemporary) {
+        if (rawTemporary) {
+            raw.release();
+        }
+        if (deferredScratchRelease) {
+            deferredScratchRelease = false;
+            synchronized (compressLock()) {
+                releaseScratch();
+            }
+        }
+        compressing = false;
+        inflightPromises = null;
+        if (!removed) {
+            if (!pending.isEmpty()) {
+                schedulePendingBatch(ctx);
+            } else if (!barriers.isEmpty()) {
+                drainBarriers(ctx, out(ctx));
+            }
+        }
     }
 
     /**
@@ -981,7 +982,6 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
             }
         });
         target.flush();
-        drainBarriers(ctx, target);
     }
 
     private static void releaseBlocks(Block[] blocks) {
@@ -1134,8 +1134,6 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
         }
         // 一批对应多个帧：全部写完后只 flush 一次（不会因此多出 TCP 段）。
         target.flush();
-        // 排队的协议切换任务必须排在这一批帧之后（见 barriers 字段的说明）
-        drainBarriers(ctx, target);
     }
 
     /**

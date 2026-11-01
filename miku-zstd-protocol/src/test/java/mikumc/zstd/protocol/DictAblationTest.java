@@ -1,8 +1,8 @@
 package mikumc.zstd.protocol;
 
 import com.github.luben.zstd.ZstdCompressCtx;
-import com.github.luben.zstd.ZstdDictCompress;
-import com.github.luben.zstd.ZstdDictTrainer;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
@@ -16,41 +16,14 @@ import java.util.Random;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * 字典消融对照：<b>只跑数据，不做门禁</b>（唯一断言是"滚动历史必须有效"，防用例空转）。
- *
- * <h2>它回答什么问题</h2>
- * <p>5.0.37 起"静态训练字典"（gen 0）与"滚动历史"（gen≥1）先后作用于同一条连接。
- * 线上日志只能给出"新候选打不过现有字典"，回答不了"滚动历史在场时，静态字典还剩多少价值"。
- * 本对照把四种组合放在<b>同一份语料</b>上跑，给出每档字节差。</p>
- *
- * <h2>语料为什么要"每块独立调色板"</h2>
- * <p>第一版语料把整个流都从一块 32KB 模板池里拼出来，于是 64KB 的字典能把"世界"整个背下来，
- * 静态字典拿到 95.8% 的假成绩——那是在测"字典能不能记住一个小词表"，不是测 MC 流量。
- * 现在改成真实结构：</p>
- * <ul>
- *   <li><b>区块包</b>：每块自带<b>独立调色板</b>（16×4B，块块不同）+ 由调色板下标构成的大段字节。
- *       块内重复极高、<b>块间几乎不重复</b> —— 这正是静态字典无能为力、而"刚刚发过的同一片区块"
- *       才有用的形态；</li>
- *   <li><b>小包</b>：共享一份真实世界存在的小词表（维度名、常见字符串、字段名）+ 变化的数值；</li>
- *   <li><b>中包</b>：引用<b>当前区块</b>调色板的方块更新 —— 只有滚动历史能吃到这份局部相关性。</li>
- * </ul>
- *
- * <h2>四个模式</h2>
- * <ul>
- *   <li>{@code none}：不装字典；</li>
- *   <li>{@code trained}：只装静态训练字典（64KB，与线上 dict_max_bytes 同量级）；</li>
- *   <li>{@code roll-256K}：滚动历史，每 256KB 轮换（当前线上值）；</li>
- *   <li>{@code roll-1M}：滚动历史，每 1MB 轮换（5.0.38 试过又回退的那个值）。</li>
- * </ul>
+ * 同一份合成语料对照无字典与生产滚动历史，只统计压缩体，不含线路帧头。
+ * 每个样本按一次 flush 的单包批次补长度前缀；历史喂入与轮换直接使用生产实现。
  */
 class DictAblationTest {
 
     private static final int LEVEL = 3;
-    private static final int DICT_BYTES = ZstdRollingDict.DICT_BYTES;
     private static final int[] BAND_LIMIT = {128, 4096};
     private static final long CORPUS_BYTES = 12L * 1024 * 1024;
-
-    private enum Mode { NONE, TRAINED, ROLLING }
 
     private static final class Result {
         final long[] band = new long[3];
@@ -62,124 +35,80 @@ class DictAblationTest {
     @Test
     void ablation() throws IOException {
         Corpus corpus = build();
-        byte[] trained = trainDict(corpus.packets);
-
-        Result none = run(corpus.packets, Mode.NONE, 0, null);
-        Result trainedR = run(corpus.packets, Mode.TRAINED, 0, trained);
-        Result roll256 = run(corpus.packets, Mode.ROLLING, 256 * 1024, null);
-        Result roll1m = run(corpus.packets, Mode.ROLLING, 1024 * 1024, null);
+        Result none = run(corpus.packets, false);
+        Result rolling = run(corpus.packets, true);
 
         StringBuilder sb = new StringBuilder();
-        sb.append("==== dict ablation v2 (synthetic, per-chunk palettes) ====\n");
-        sb.append("raw=").append(corpus.rawTotal).append("B  compressed(none)=").append(none.total)
-                .append("B (").append(String.format("%.1f%%", 100.0 * none.total / corpus.rawTotal))
-                .append("), samples=").append(none.count)
-                .append(", chunks=").append(corpus.chunks)
-                .append(", level=").append(LEVEL).append(", dict=").append(DICT_BYTES).append("B\n\n");
-        sb.append(String.format("%-11s %11s %11s %8s %11s %8s %11s %8s%n",
-                "band", "none", "trained", "vs none", "roll256K", "vs none", "roll1M", "vs none"));
+        sb.append(String.format("==== dict ablation (synthetic, production rolling history) ====%n"));
+        sb.append(String.format("raw=%dB, samples=%d, chunks=%d, level=%d, dict=%dB, rotate=%dB%n",
+                corpus.rawTotal, none.count, corpus.chunks, LEVEL,
+                ZstdRollingDict.DICT_BYTES, ZstdRollingDict.ROTATE_AFTER_BYTES));
+        sb.append(String.format("%-12s %11s %11s %8s%n",
+                "band", "none", "rolling", "vs none"));
         String[] names = {"<128B", "128B-4KB", ">=4KB"};
-        for (int i = 0; i < 3; i++) {
-            sb.append(String.format("%-11s %11d %11d %7.1f%% %11d %7.1f%% %11d %7.1f%%%n",
-                    names[i], none.band[i], trainedR.band[i], pct(none.band[i], trainedR.band[i]),
-                    roll256.band[i], pct(none.band[i], roll256.band[i]),
-                    roll1m.band[i], pct(none.band[i], roll1m.band[i])));
+        for (int i = 0; i < names.length; i++) {
+            sb.append(String.format("%-12s %11d %11d %7.1f%%%n",
+                    names[i], none.band[i], rolling.band[i], pct(none.band[i], rolling.band[i])));
         }
-        sb.append(String.format("%-11s %11d %11d %7.1f%% %11d %7.1f%% %11d %7.1f%%%n",
-                "TOTAL", none.total, trainedR.total, pct(none.total, trainedR.total),
-                roll256.total, pct(none.total, roll256.total),
-                roll1m.total, pct(none.total, roll1m.total)));
-        sb.append(String.format("%n滚动次数：256K=%d，1M=%d%n", roll256.rotations, roll1m.rotations));
-        sb.append(String.format("trained 相对 roll256K 的字节比：%.1f%%（>0 = 静态字典更小）%n",
-                (1.0 - (double) trainedR.total / roll256.total) * 100));
-        sb.append(String.format("roll1M 相对 roll256K 的字节比：%.1f%%（>0 = 1MB 更小，<0 = 放宽阈值有代价）%n",
-                (1.0 - (double) roll1m.total / roll256.total) * 100));
-
+        sb.append(String.format("%-12s %11d %11d %7.1f%%%n",
+                "TOTAL", none.total, rolling.total, pct(none.total, rolling.total)));
+        sb.append(String.format("生产滚动次数：%d%n", rolling.rotations));
         System.out.print(sb);
         Path out = Path.of("build", "ablation-report.txt");
         Files.createDirectories(out.getParent());
         Files.writeString(out, sb.toString(), StandardCharsets.UTF_8);
 
-        // ⚠️ 这是<b>报告型</b>用例：字典收益本来就只有几个百分点，用"必须省 X%"当门槛会把
-        // 正常结果判成失败（第一版就因为这个失败过）。这里只守住一条：滚动历史不得<em>变差</em>。
-        assertTrue(roll256.total <= none.total * 1.01,
-                "滚动历史不得让线路字节变差，实际 " + pct(none.total, roll256.total) + "%");
-        assertTrue(trainedR.total > 0 && roll1m.total > 0, "各模式都应产出数据");
+        assertTrue(rolling.rotations > 0, "语料必须触发真实滚动历史轮换，避免对照空转");
+        assertTrue(rolling.total <= none.total * 1.01,
+                "滚动历史不得让压缩体变差，实际 " + pct(none.total, rolling.total) + "%");
     }
 
     private static double pct(long base, long value) {
         return base == 0 ? 0 : (1.0 - (double) value / base) * 100;
     }
 
-    private Result run(List<byte[]> corpus, Mode mode, int rotateBytes, byte[] trainedDict) {
+    private Result run(List<byte[]> corpus, boolean useRolling) {
         Result r = new Result();
         r.count = corpus.size();
+        ZstdRollingDict history = useRolling ? new ZstdRollingDict() : null;
+        byte[] appliedDict = null;
         ZstdCompressCtx ctx = new ZstdCompressCtx();
-        ZstdDictCompress dictObj = null;
         try {
             ctx.setLevel(LEVEL);
             ctx.setMagicless(true);
             ctx.setContentSize(false);
             ctx.setDictID(false);
-            if (mode == Mode.TRAINED) {
-                dictObj = new ZstdDictCompress(trainedDict, LEVEL);
-                ctx.loadDict(dictObj);
-            }
-
-            byte[] ring = new byte[DICT_BYTES];
-            int fill = 0;
-            int sinceRotate = 0;
-            for (byte[] s : corpus) {
-                if (mode == Mode.ROLLING && fill >= DICT_BYTES && sinceRotate >= rotateBytes) {
-                    byte[] snapshot = new byte[DICT_BYTES];
-                    System.arraycopy(ring, 0, snapshot, 0, DICT_BYTES);
-                    ctx.loadDict(snapshot);
-                    sinceRotate = 0;
-                    r.rotations++;
+            for (byte[] packet : corpus) {
+                byte[] raw = new byte[ZstdVarInts.length(packet.length) + packet.length];
+                ByteBuf batch = Unpooled.wrappedBuffer(raw);
+                try {
+                    batch.clear();
+                    ZstdVarInts.write(batch, packet.length);
+                    batch.writeBytes(packet);
+                } finally {
+                    batch.release();
                 }
-                int n = ctx.compress(s).length;
-                r.band[bandOf(s.length)] += n;
+                if (history != null && history.activeDict() != appliedDict) {
+                    appliedDict = history.activeDict();
+                    ctx.loadDict(appliedDict);
+                }
+                int n = ctx.compress(raw).length;
+                r.band[bandOf(packet.length)] += n;
                 r.total += n;
-                if (mode == Mode.ROLLING) {
-                    feedRing(ring, fill, s);
-                    fill = Math.min(DICT_BYTES, fill + s.length);
-                    sinceRotate += s.length;
+                if (history != null) {
+                    history.feed(raw, 0, raw.length);
                 }
             }
         } finally {
             ctx.close();
-            if (dictObj != null) dictObj.close();
         }
+        r.rotations = history == null ? 0 : history.generation();
         return r;
-    }
-
-    private static void feedRing(byte[] ring, int fill, byte[] s) {
-        if (s.length >= DICT_BYTES) {
-            System.arraycopy(s, s.length - DICT_BYTES, ring, 0, DICT_BYTES);
-            return;
-        }
-        int overflow = fill + s.length - DICT_BYTES;
-        if (overflow > 0) {
-            System.arraycopy(ring, overflow, ring, 0, fill - overflow);
-            System.arraycopy(s, 0, ring, fill - overflow, s.length);
-        } else {
-            System.arraycopy(s, 0, ring, fill, s.length);
-        }
     }
 
     private static int bandOf(int len) {
         if (len < BAND_LIMIT[0]) return 0;
         return len < BAND_LIMIT[1] ? 1 : 2;
-    }
-
-    private static byte[] trainDict(List<byte[]> corpus) {
-        long total = 0;
-        for (byte[] s : corpus) total += s.length;
-        ZstdDictTrainer tr = new ZstdDictTrainer((int) Math.min(total, 64L * 1024 * 1024), DICT_BYTES);
-        for (byte[] s : corpus) {
-            if (!tr.addSample(s)) break;
-        }
-        return tr.trainSamples();
     }
 
     /** 语料 + 它有多少个区块，仅用于报告。 */
@@ -264,7 +193,7 @@ class DictAblationTest {
             }
         }
         for (byte[] pk : c.packets) {
-            c.rawTotal += pk.length;
+            c.rawTotal += ZstdVarInts.length(pk.length) + pk.length;
         }
         return c;
     }
