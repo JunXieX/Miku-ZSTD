@@ -516,7 +516,13 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
                     ctx.channel().remoteAddress(), cause.toString());
             return;
         }
-        if (!ctx.channel().isActive()) {
+        // ⚠️ 连接层 I/O 异常（对端 RST、网络中断）不是解码问题：栈来自 NioSocketChannel.doReadBytes，
+        // 与我们的帧格式无关。此时 isActive() 往往还是 true（异常先于 inactive 事件送达），
+        // 不单独识别的话会打一条 WARN + 完整堆栈，看上去像插件把玩家踢了。
+        if (isConnectionIoError(cause)) {
+            LOGGER.debug("[Zstd] connection I/O error (remote={}): {}",
+                    ctx.channel().remoteAddress(), cause.toString());
+        } else if (!ctx.channel().isActive()) {
             LOGGER.debug("[Zstd] decoder exception after channel closed (remote={}): {}",
                     ctx.channel().remoteAddress(), cause.toString());
         } else {
@@ -526,6 +532,11 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
         if (ctx.channel().isOpen()) {
             ctx.close();
         }
+    }
+
+    /** 是否为连接层 I/O 异常（对端重置/中断），而不是协议或解压错误。 */
+    private static boolean isConnectionIoError(Throwable cause) {
+        return cause instanceof java.io.IOException;
     }
 
     /** 是否为"发包被其它插件取消"的控制流异常（不是连接错误）。 */
