@@ -4,10 +4,19 @@ plugins {
 }
 
 group = 'mikumc.zstd'
-version = '5.0.45'
+version = '5.0.46'
 
 base {
     archivesName = 'Miku-ZSTD'
+}
+
+// 描述文件版本由构建属性注入，避免包名与运行时版本不同步。
+tasks.named('processResources') {
+    def resourceProperties = [version: project.version]
+    inputs.properties(resourceProperties)
+    filesMatching('paper-plugin.yml') {
+        expand(resourceProperties)
+    }
 }
 
 repositories {
