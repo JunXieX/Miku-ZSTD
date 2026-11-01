@@ -6,7 +6,7 @@ import mikumc.zstd.protocol.ZstdBatchEncoderBase;
 import mikumc.zstd.protocol.ZstdCompressLock;
 
 /**
- * Miku-ZSTD 编码器（Paper → 客户端）帧格式 v6（协商版本 v7）。
+ * Miku-ZSTD 编码器（Paper → 客户端）帧格式 v7（协商版本 v9）。
  *
  * <p>⚠️ 与 Velocity 端唯一的协议差异：服务端管线<b>有 prepender</b>，外层长度由它负责，
  * 因此本编码器<b>不写</b> bodyLen（与 Fabric 客户端一致；Velocity 端才需要写）。
@@ -56,6 +56,18 @@ public class ZstdPaperEncoder extends ZstdBatchEncoderBase {
     @Override
     protected int configWindowLog() {
         return ZstdPaperConfig.INSTANCE.windowLog;
+    }
+
+    /**
+     * 本方向（服务端 → 客户端）<b>继续走压缩</b>，返回 {@code true}。
+     *
+     * <p>5.0.43 只砍掉了上行（客户端 → 服务端）：那边压完反而膨胀 13%，只剩批处理有意义。
+     * 下行正好相反——区块、注册表、实体同步都是大包，压缩率才是收益的全部来源，
+     * 再叠上跨帧的滚动历史，正文里那 85% 的节省就出在这个方向。</p>
+     */
+    @Override
+    protected boolean compressUpstream() {
+        return true;
     }
 
     @Override

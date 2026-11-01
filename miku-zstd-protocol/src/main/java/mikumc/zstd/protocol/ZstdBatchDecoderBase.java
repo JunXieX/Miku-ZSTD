@@ -243,6 +243,46 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
      * @param inBytes  收到的压缩字节数
      * @param outBytes 解压后的字节数
      */
+    /**
+     * 入站帧是否是"存储批帧"（{@code [0][count][pktLen][pkt]...}）。默认 false。
+     *
+     * <p><b>上行（客户端→服务端）返回 true</b>：那个方向不压缩（实测压了反而膨胀 13%，
+     * 字典收益 0.0%），只保留批处理。返回 true 时本类不建解压上下文、不喂滚动历史、
+     * 不校验 {@code dictGen}。</p>
+     */
+    protected boolean storedBatchFrames() {
+        return false;
+    }
+
+    /**
+     * 解析存储批帧并逐包下传。
+     *
+     * <p>布局：{@code [0][varint count] + count × [varint pktLen][packet]}。任何长度不自洽
+     * 都按协议错误关连接（fail-fast），绝不"尽力而为"地猜包边界。</p>
+     */
+    private void emitStoredBatch(ChannelHandlerContext ctx, ByteBuf in, int remaining) {
+        final int end = in.readerIndex() + remaining;
+        int[] cursor = {in.readerIndex()};
+        int count = ZstdVarInts.readOr(in, cursor, ZstdVarInts.INVALID, end);
+        if (count == ZstdVarInts.INVALID || count <= 0) {
+            protocolError(ctx, "illegal stored-batch count (remaining=" + remaining + ")");
+            return;
+        }
+        for (int i = 0; i < count; i++) {
+            int pktLen = ZstdVarInts.readOr(in, cursor, ZstdVarInts.INVALID, end);
+            if (pktLen <= 0 || cursor[0] + (long) pktLen > end) {
+                protocolError(ctx, "corrupt stored-batch layout (packet " + i + "/" + count
+                        + ", pktLen=" + pktLen + ", left=" + (end - cursor[0]) + ")");
+                return;
+            }
+            emit(ctx, in.readRetainedSlice(pktLen));
+            cursor[0] += pktLen;
+        }
+        if (cursor[0] != end) {
+            protocolError(ctx, "stored-batch trailing bytes: " + (end - cursor[0]));
+        }
+    }
+
     protected abstract void onCompressedFrame(int inBytes, int outBytes);
 
     // ────────────────────────────────────────────────────────────────
@@ -339,6 +379,11 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
 
             sawZstdFrame = true;
             onStoredFrame(remaining);
+            // 上行（客户端→服务端）的帧是"存储批"：[0][count][len][pkt]...，本方向不压缩
+            if (storedBatchFrames()) {
+                emitStoredBatch(ctx, in, remaining);
+                return;
+            }
             // 历史记账的形态是 {@code [varint pktLen][pkt]}，与编码器喂进去的完全一致；
             // 直存帧按定义一定不大，这一次拷贝可忽略（采样顺手复用同一个数组）。
             byte[] batch = singlePacketBatch(in, remaining);

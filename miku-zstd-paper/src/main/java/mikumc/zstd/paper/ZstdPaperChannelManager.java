@@ -38,6 +38,15 @@ public class ZstdPaperChannelManager {
     public final mikumc.zstd.protocol.ZstdConnStats stats = new mikumc.zstd.protocol.ZstdConnStats();
 
     private final ZstdCompressCtx compressCtx;
+
+    /**
+     * 解压上下文。
+     *
+     * <p>⚠️ 5.0.43 起上行（客户端 → 服务端）不再压缩，这个 ctx 已经<b>没有实际用途</b>
+     * ——入站只剩"握手窗口里的原版压缩帧"，那条路径用的是 JDK 的 {@code Inflater}。
+     * 暂时保留：基类仍会向解码器索要它，租借/归还也挂在同一条生命周期上。
+     * 等这版跑稳再单独清理（连带 {@link ZstdCtxPool#borrowDecompress()} 那一档）。</p>
+     */
     private final ZstdDecompressCtx decompressCtx;
 
     private volatile int negotiateTxId = -1;
@@ -53,6 +62,7 @@ public class ZstdPaperChannelManager {
         this.compressCtx = ZstdCtxPool.borrowCompress(cfg.level);
         this.compressCtx.setWindowLog(cfg.windowLog);
         this.compressCtx.setLong(1); // LDM：提升区块级长距离重复的压缩率
+        // 上行已不压缩，这份 ctx 仅剩占位（见字段注释）；归还路径与压缩 ctx 共用同一把锁
         this.decompressCtx = ZstdCtxPool.borrowDecompress();
         // 帧头精简必须与客户端一致（magicless / 无 contentSize / 无 dictID）
         this.compressCtx.setMagicless(true);

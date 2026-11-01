@@ -5,7 +5,7 @@ import io.netty.channel.ChannelHandlerContext;
 import mikumc.zstd.protocol.ZstdBatchDecoderBase;
 
 /**
- * Miku-ZSTD 解码器（服务端 → 客户端）帧格式 <b>v6</b>（协商版本 v7）。
+ * Miku-ZSTD 解码器（服务端 → 客户端）帧格式 <b>v7</b>（协商版本 v9）。
  *
  * <p>帧解析、内层切包、两道防护（压缩比上限 / scratch 上限）、fail-fast 协议
  * 全部在共享基类 {@link ZstdBatchDecoderBase} 中（三端同一份源码）；
@@ -22,6 +22,13 @@ import mikumc.zstd.protocol.ZstdBatchDecoderBase;
  * 之前，所以本类拿到的必然是"已解密、且外层长度已被 {@code splitter} 剥掉"的完整帧——它才能
  * 把首字节当 {@code rawSize} 读。若别的模组把解密挪到 {@code splitter} 之后（或干脆挪到本类
  * 下游），进到这里的会是密文，帧头必然是非法 varint，表现为"一连服务器就断"。</p>
+ *
+ * <h2>⚠️ 不要覆写 {@code storedBatchFrames()}</h2>
+ * <p>那个钩子属于<b>上行</b>解的那一侧（Paper / Velocity 解客户端发来的存储批帧）。本类解的是
+ * 服务端 → 客户端，这个方向仍然压缩，而服务端的小包直存帧是 {@code [0][packet]}——{@code [0]}
+ * 后面直接是包 id。一旦把本类也标成"存储批"，这些帧会被当成 {@code [0][count][len][pkt]...}：
+ * 包 id 被读成 count，随后必然长度不自洽，按协议错误关连接，表现就是"一连服务器就断"。
+ * 所以这里保持基类默认的 {@code false}，什么也不用写。</p>
  *
  * <h2>统计口径</h2>
  * <p>两个方向都按"帧体线下字节"与"解压后字节"记账，且<b>两侧都计入 rawSize 标记</b>

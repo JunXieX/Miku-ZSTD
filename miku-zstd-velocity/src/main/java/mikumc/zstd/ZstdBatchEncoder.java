@@ -7,7 +7,7 @@ import mikumc.zstd.protocol.ZstdCompressLock;
 import mikumc.zstd.protocol.ZstdTrafficCounter;
 
 /**
- * Miku-ZSTD 编码器（服务端 → 客户端）帧格式 <b>v6</b>（协商版本 v7）。
+ * Miku-ZSTD 编码器（服务端 → 客户端）帧格式 <b>v7</b>（协商版本 v9）。
  *
  * <p>批处理、建帧、promise 编排等全部逻辑在共享基类
  * {@link ZstdBatchEncoderBase} 中（两端同一份源码）；本类只声明服务端的
@@ -42,6 +42,19 @@ public class ZstdBatchEncoder extends ZstdBatchEncoderBase {
     protected ZstdCompressLock compressLock() {
         ZstdChannelManager m = manager;
         return m == null ? super.compressLock() : m.compressLock();
+    }
+
+    /**
+     * 本方向（服务端 → 客户端）<b>照旧压缩</b>——上行才是"去掉 zstd、只保留批处理"的那一端。
+     *
+     * <p>⚠️ 这个方向与上行的结论必须分开看：上行单包均值 28.8B，压缩后反而膨胀 13%，
+     * 所以那边只留批处理；而下游是区块/注册表/TAB 这些真能压的数据，去掉 zstd 等于把
+     * 87% 的节省一起丢掉。返回值一旦写成 {@code false}，基类会把整批写成
+     * {@code [0][count][len][pkt]...} 的存储批、完全不碰 zstd —— 对下行是灾难性的。</p>
+     */
+    @Override
+    protected boolean compressUpstream() {
+        return true;
     }
 
     /**

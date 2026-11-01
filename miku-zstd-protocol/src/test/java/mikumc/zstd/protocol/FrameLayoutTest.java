@@ -1347,6 +1347,12 @@ class FrameLayoutTest {
             return skip;
         }
 
+        /** 用例默认走压缩路径（等于下行）；上行用例由 {@code ZstdBatchEncoderBase} 的钩子切换。 */
+        @Override
+        protected boolean compressUpstream() {
+            return true;
+        }
+
         @Override
         protected int configLevel() {
             return 3;

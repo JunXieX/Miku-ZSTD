@@ -12,6 +12,11 @@ public final class ZstdProtocolVersion {
     /**
      * 协商协议版本（登录期在 negotiate 载荷里交换，三端必须一致）。
      *
+     * <p>9：上行（客户端→服务端）<b>彻底去掉 zstd</b>，只保留批处理：该方向的帧固定为
+     * 存储批帧 {@code [0][count][pktLen][pkt]...}，不压缩、无 {@code dictGen}、不建压缩上下文。
+     * 依据：上行单包均值 28.8B，压缩后反而膨胀 13%，字典收益 0.0%（2026-11-01 实测，
+     * 跑图/飞行/PVP 场景）；唯一有效的是批处理省掉的每包前缀。</p>
+     *
      * <p>8：删除训练字典（trainer / 字典下发 / negotiate 里的 dictId 与 flags）。
      * 协商载荷简化为 {@code [int 版本]}，应答简化为 {@code [varint 状态]}。
      * 两端版本不一致时客户端干净回落原版。</p>
@@ -23,10 +28,10 @@ public final class ZstdProtocolVersion {
      *
      * <p>6：帧内改成 [rawSize][blockCount] + 每块 [blockRawLen][chunkLen][chunk]（大帧分块并行）。</p>
      */
-    public static final int NEGOTIATE = 8;
+    public static final int NEGOTIATE = 9;
 
     /** 帧格式版本（写进文档；线格式变更时与 {@link #NEGOTIATE} 一起升）。 */
-    public static final int FRAME = 6;
+    public static final int FRAME = 7;
 
     private ZstdProtocolVersion() {
     }

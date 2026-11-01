@@ -79,7 +79,7 @@ MikuMC 系列插件交流群：1105054380
 
 ## 工作原理
 
-协议版本 **v8**（Velocity / Paper / Fabric 三端的 `ZstdProtocolVersion.NEGOTIATE` 一致；帧格式 **v6**）。
+协议版本 **v9**（Velocity / Paper / Fabric 三端的 `ZstdProtocolVersion.NEGOTIATE` 一致；帧格式 **v7**）。
 
 ```
 客户端 ──握手(主机名末尾附 \0ZSTD\0 标记)──▶ 服务端
@@ -105,21 +105,26 @@ MikuMC 系列插件交流群：1105054380
 > 而实测收益是负的（多 3.7%），小包覆盖不到 0.1% 的总字节。删掉之后协商只剩一次往返、
 > 没有任何字典流量，跨帧重复由滚动历史（协议内自动维护）承担。
 
-### 帧格式（v6）
+### 帧格式（v7）
 
 ```
-服务端 → 客户端   [varint bodyLen?][varint rawSize][varint dictGen][varint blockCount] + block...
-客户端 → 服务端   [varint rawSize][varint dictGen][varint blockCount] + block...
+服务端 → 客户端   [varint bodyLen?][varint rawSize][varint dictGen][varint blockCount] + block...   ← 压缩
+                 [varint bodyLen?][0][packet]                                                       ← 直存（一帧一包）
+客户端 → 服务端   [0][varint count] + count × [varint pktLen][packet]                                ← 存储批帧（不压缩）
 block              [varint blockRawLen][varint chunkLen][chunk]
 压缩帧（rawSize > 0）  解压后 = [varint pktLen][pkt] [varint pktLen][pkt] ...   ← 一个或多个包
-直存帧（rawSize == 0） 帧体恰好是一个包 [0][packet]，与原版未压缩帧逐字节同形（无 dictGen）
 ```
 
-- **`rawSize == 0` 表示未压缩直存**，帧体**恰好是一个包**（`[0][packet]`），与原版未压缩帧
+- **上行（客户端 → 服务端）不做 zstd，只做批处理**（协议 v9 起）：实测上行单包均值只有 28.8B，
+  压缩后反而**膨胀 13%**，字典对上行收益 0.0%——压缩这一步一个字节都没省，全靠直存兜底。
+  真正有效的是把一次 flush 内的多个包写进**一个**存储批帧 `[0][count][pktLen][pkt]...`，
+  省掉每包 1 字节的 `[0]` 前缀与逐包外层长度。服务端按 `count` 拆回逐包下传，
+  长度不自洽即按协议错误关连接（不猜包边界）
+- **下行仍是 zstd**：`rawSize == 0` 的直存帧，帧体**恰好是一个包**（`[0][packet]`），与原版未压缩帧
   逐字节同形 —— 原版解码器（`CompressionDecoder`）与包解码器都能直接读懂。
-  **因此直存帧必须一帧一包、且不带任何内层长度前缀、也不带 `dictGen`**：多写一层
+  **因此下行直存帧必须一帧一包、且不带任何内层长度前缀、也不带 `dictGen`**：多写一层
   `[varint pktLen]` 时，包解码器读到的"包 id"就是那个长度值 → `Unknown packet` → 玩家进不去服
-- **一帧多包只发生在压缩帧**：同一个 flush 边界内的包合成一帧压缩，帧头与熵表开销被摊薄
+- **一帧多包**：下行走压缩帧时合批（摊薄帧头与熵表），上行走存储批帧（摊薄逐包前缀）
 - **`dictGen` 是滚动历史字典的代数**（协议 v7 新增）：两端各自维护最近 64KB 原始字节，
   每喂满 256KB 重建一次字典并让代数 +1，**字典本身不传输**；代数对不上即按协议错乱关连接
   （这是一致性校验，不是优化开关）
@@ -130,6 +135,8 @@ block              [varint blockRawLen][varint chunkLen][chunk]
 - **`bodyLen` 只由 Velocity 写**（4.x 管线的压缩编码器把"外层长度 + 压缩"合在同一个处理器里，
   跳过它就必须自带长度）；Paper / Fabric 侧由 prepender 负责——这是刻意设计，缺层或双层都会
   导致对端解码失败
+- **上行的解压上下文已成占位**（v9 起）：上行不再产生压缩帧，服务端仍留着 zstd 解压 ctx
+  只是为了不动资源生命周期，等后续单独清理
 - 小包（<48B，协议层另有 16B 硬地板）压缩后反而膨胀，直接走直存路径
 
 ### 协商载荷

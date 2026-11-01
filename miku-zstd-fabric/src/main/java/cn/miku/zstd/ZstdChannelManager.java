@@ -9,16 +9,19 @@ import mikumc.zstd.protocol.ZstdCompressLock;
 /**
  * 每连接上下文：zstd 压缩/解压上下文与传输状态。
  *
- * <p><b>协商版本 v8</b>（{@link #PROTOCOL_VERSION}），<b>帧格式 v6</b>：
- * 客户端→服务端 {@code [rawSize][zstd(payload)|packet]}（外层长度由 prepender 补）；
- * 服务端→客户端 {@code [bodyLen][rawSize][zstd(payload)|packet]}
+ * <p><b>协商版本 v9</b>（{@link #PROTOCOL_VERSION}），<b>帧格式 v7</b>：
+ * 客户端→服务端 {@code [0][count][pktLen][packet]...}（存储批帧，<b>不压缩</b>，外层长度由
+ * prepender 补）；服务端→客户端 {@code [bodyLen][rawSize][zstd(payload)|packet]}
  * （bodyLen 由服务端编码器自带，已被 frame-decoder 剥离）。{@code rawSize == 0} 表示直存：
  * 帧体恰好是一个包（{@code [0][packet]}），与原版未压缩帧逐字节同形。</p>
  *
- * <p>5.0.42 起训练字典整套删除：不再有协商下发、本地缓存、上下文装载。两个上下文里唯一的
- * "字典"是滚动历史——两端各自从这条连接的原始字节流现算，每帧向前引用最近 64KB，
- * <b>不经过网络</b>（见 {@code mikumc.zstd.protocol.ZstdRollingDict}）。因此本类只剩两件事：
- * 上下文的生命周期，以及压缩方向那把锁。</p>
+ * <p>5.0.42 起训练字典整套删除：不再有协商下发、本地缓存、上下文装载。下行的"字典"只剩
+ * 滚动历史——两端各自从这条连接的原始字节流现算，每帧向前引用最近 64KB，<b>不经过网络</b>
+ * （见 {@code mikumc.zstd.protocol.ZstdRollingDict}）。</p>
+ *
+ * <p>5.0.43 起<b>上行彻底不压缩</b>（实测压了反而膨胀 13%），只批处理，因此本类的
+ * {@code compressCtx} 对客户端已经没有任何压缩职责，只作为"编码器愿意攒批"的占位存在
+ * （见字段注释）。</p>
  */
 public class ZstdChannelManager {
 
@@ -29,7 +32,12 @@ public class ZstdChannelManager {
     public static final int PROTOCOL_VERSION = mikumc.zstd.protocol.ZstdProtocolVersion.NEGOTIATE;
 
     /**
-     * 压缩/解压上下文。
+     * 压缩上下文。<b>上行已不压缩（5.0.43），此 ctx 仅剩占位</b>。
+     *
+     * <p>⚠️ 为什么还不删：编码器的 {@code write()} 用"有没有 ctx"来决定"要不要攒批"
+     * （{@code compressCtx == null} 意味着整条通道透传），删掉它会把上行唯一保留的优化
+     * ——批处理——一起关掉。它的 {@code level} / {@code window_log} 参数因此也不再影响任何
+     * 字节，只是构造成本。等基类把"是否攒批"与"是否压缩"彻底拆成两个判定，这里就可以删。</p>
      *
      * <p>⚠️ 非 final：{@link #resetContexts()} 用"换一个新实例"来丢掉旧上下文里绑定的
      * 滚动历史字典（zstd 没有卸载接口）。所有读写都必须在 {@code compressLock} 内完成 ——
@@ -41,6 +49,8 @@ public class ZstdChannelManager {
     public ZstdChannelManager() {
         ZstdConfig cfg = ZstdConfig.INSTANCE;
         // 上下文从租借池取（池内实例已 reset，参数需重设）
+        // ⚠️ 上行不压缩后下面三行只是"借一份占位"：参数设置没有实际效果，但仍是编码器进入
+        // 攒批路径的前提（见 compressCtx 字段注释）。保留是为了让恢复上行压缩只改一个返回值。
         this.compressCtx = ZstdCtxPool.borrowCompress(cfg.level);
         this.compressCtx.setWindowLog(cfg.windowLog);
         this.compressCtx.setLong(1); // LDM：提升区块级长距离重复的压缩率

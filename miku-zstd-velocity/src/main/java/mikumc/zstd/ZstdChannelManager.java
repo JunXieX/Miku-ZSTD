@@ -17,18 +17,19 @@ import org.slf4j.LoggerFactory;
  * <p>持有 zstd 压缩/解压上下文与协商状态机。生命周期：嗅探器检测到
  * {@code \0ZSTD\0} 握手标记时创建，连接关闭时释放本地资源。</p>
  *
- * <h2>帧格式（v6；协商版本见 {@link #PROTOCOL_VERSION}）</h2>
+ * <h2>帧格式（v7；协商版本见 {@link #PROTOCOL_VERSION}）</h2>
  * <ul>
- *   <li>服务端 → 客户端帧：{@code [varint bodyLen][varint rawSize][zstd(payload) | packet]}
- *       —— Velocity 把「写外层长度」与「压缩」放在<b>同一个</b>处理器里，我们的帧要从它
- *       之后写出（才能跳过它），于是 bodyLen 由编码器<b>自带</b>
- *       （见 {@code ZstdBatchEncoder#writeBodyLen}）。</li>
- *   <li>客户端 → 服务端帧：{@code [varint rawSize][zstd(payload) | packet]}
- *       —— 外层长度由客户端管线的 prepender 负责，服务端 frame-decoder 剥离后
- *       本解码器收到的即完整帧负载。</li>
- *   <li>{@code rawSize == 0} 表示未压缩直存：帧体<b>恰好是一个包</b>（{@code [0][packet]}），
+ *   <li>服务端 → 客户端帧（<b>压缩</b>）：{@code [varint bodyLen][varint rawSize][zstd(payload)]}
+ *       或直存 {@code [varint bodyLen][0][packet]} —— Velocity 把「写外层长度」与「压缩」
+ *       放在<b>同一个</b>处理器里，我们的帧要从它之后写出（才能跳过它），于是 bodyLen 由
+ *       编码器<b>自带</b>（见 {@code ZstdBatchEncoder#writeBodyLen}）。</li>
+ *   <li>客户端 → 服务端帧（<b>不压缩</b>，5.0.43 起）：存储批
+ *       {@code [0][varint count] + count × [varint pktLen][packet]} —— 外层长度由客户端
+ *       管线的 prepender 负责，服务端 frame-decoder 剥离后本解码器收到的即完整帧负载；
+ *       基类按 {@code count} 逐包拆开下传（见 {@code ZstdBatchDecoder#storedBatchFrames}）。</li>
+ *   <li>下行 {@code rawSize == 0} 表示未压缩直存：帧体<b>恰好是一个包</b>（{@code [0][packet]}），
  *       与原版未压缩帧逐字节同形；{@code rawSize > 0} 才是压缩帧，其
- *       {@code payload = [varint pktLen][pkt]...} 可含多个包（批处理只在这里）。</li>
+ *       {@code payload = [varint pktLen][pkt]...} 可含多个包。上行不压缩，只有上面那种存储批帧。</li>
  *   <li>「v几」有三种含义（协商版本 / 帧格式 / 历史版本），见
  *       {@link ZstdVarInts} 类注释里的术语表——不要混用。</li>
  * </ul>
