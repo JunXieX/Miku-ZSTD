@@ -344,8 +344,15 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
                 }
                 byte[] chunk = acquireScratch(chunkLen);
                 in.readBytes(chunk, 0, chunkLen);
-                byte[] block = dctx.decompress(chunk, 0, chunkLen, blockRaw);
-                System.arraycopy(block, 0, data, off, blockRaw);
+                // 直接解进 data 的偏移处：zstd-jni 的 decompress(src,..,originalSize) 内部
+                // 是 new byte[originalSize] 再整块拷贝，分块帧因此会多分配一份 rawSize
+                // 级别的数组并多一次全量 memcpy（进服 Registry 那种 4 块帧最吃亏）。
+                long n = dctx.decompressByteArray(data, off, rawSize - off, chunk, 0, chunkLen);
+                if (n != blockRaw) {
+                    protocolError(ctx, "block " + i + " decompressed to " + n
+                            + " but declared " + blockRaw);
+                    return;
+                }
                 off += blockRaw;
             }
             sawZstdFrame = true;
