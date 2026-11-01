@@ -75,7 +75,6 @@ public class MikuZstdPaper extends JavaPlugin {
         }
 
         registerPermissions();
-        ZstdPaperTrainer.init(getDataFolder().toPath());
         ZstdCompressPool.init(ZstdPaperConfig.INSTANCE.compressThreads, 5);
         // onEnable 阶段 MC 的监听通道通常还没建立，等服务器就绪后再挂钩。
         // ⚠️ 这里不能用 BukkitScheduler：Folia 上 Bukkit.getScheduler() 直接抛
@@ -89,7 +88,7 @@ public class MikuZstdPaper extends JavaPlugin {
         getLifecycleManager().registerEventHandler(
                 io.papermc.paper.plugin.lifecycle.event.types.LifecycleEvents.COMMANDS,
                 commands -> commands.registrar().register(
-                        "mikuzstd", "查看 Miku-ZSTD 状态与字典训练情况", new ZstdPaperCommand()));
+                        "mikuzstd", "查看 Miku-ZSTD 状态与压缩统计", new ZstdPaperCommand()));
         LOGGER.info("[Zstd] Miku-ZSTD Paper 已启用（目标 Paper/Folia 26.2+，平台={}，无 Bukkit 兼容层）",
                 platformName());
     }
@@ -122,18 +121,13 @@ public class MikuZstdPaper extends JavaPlugin {
 
     @Override
     public void onDisable() {
-        // ⚠️ 三步必须各自兜住异常：任何一步抛出都不能让后面的收尾被跳过。
-        // 漏掉 Monitor 只是少一次发包；漏掉 Trainer 会残留 native 字典内存与训练线程；
-        // 漏掉 uninstallHook 会残留被包装的 childHandler（旧类加载器无法回收）与在线连接上的协商器。
+        // ⚠️ 每一步必须各自兜住异常：任何一步抛出都不能让后面的收尾被跳过。
+        // 漏掉 Monitor 只是少一次发包；漏掉 uninstallHook 会残留被包装的 childHandler
+        //（旧类加载器无法回收）与在线连接上的协商器。
         try {
             ZstdPaperMonitor.stop();
         } catch (Throwable t) {
             LOGGER.warn("[Zstd] 停用 BossBar 监控时异常（继续收尾）", t);
-        }
-        try {
-            ZstdPaperTrainer.shutdown(); // 内部会调 ZstdPaperDictRegistry.shutdown()，释放字典原生内存
-        } catch (Throwable t) {
-            LOGGER.warn("[Zstd] 停用训练器时异常（继续收尾）", t);
         }
         try {
             uninstallHook();

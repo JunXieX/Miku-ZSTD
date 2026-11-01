@@ -33,19 +33,18 @@ import org.slf4j.LoggerFactory;
  *       {@link ZstdVarInts} 类注释里的术语表——不要混用。</li>
  * </ul>
  *
- * <h2>字典门控</h2>
- * <p>negotiate 应答由 {@code ZstdNegotiateAnswerSniffer}（帧层）与 Hijacker（包层，兜底）
- * 捕获并回填 {@link #markDictResponse}。仅当客户端确认双向字典就绪（status==0）时才把字典
- * 加载进压缩/解压上下文。</p>
+ * <h2>协商应答门控</h2>
+ * <p>协商载荷只有 {@code [int 协议版本]}，应答只有 {@code [varint 状态]}
+ *（{@code 0 = 就绪}、{@code 2 = 保持原版}）。应答由 {@code ZstdNegotiateAnswerSniffer}
+ *（帧层，主路径）与 Hijacker（包层，兜底）捕获并回填 {@link #markNegotiateResponse}，
+ * 激活前必须看到"已应答且状态为就绪"，否则一律回落原版。</p>
  *
- * <p>⚠️ 客户端报告过"缺字典"（status==1）时，本端<b>必须先推 {@code zstd:dict} 并等到
- * 它的应答</b>才能激活——否则客户端会停在"等字典"状态永不激活，而本端已开始用 zstd 发帧，
- * 形成单侧 zstd 的必断连组合。激活路径上有一道硬门控兜底（见 ZstdHijacker 的 activateZstd）。</p>
+ * <p>⚠️ 5.0.42 起没有"字典协商"这一段了：训练字典整套删除，跨帧重复交给
+ * {@link mikumc.zstd.protocol.ZstdRollingDict}（协议内每方向自动维护 64KB 滑窗）。
+ * 因此本类不再持有任何字典对象，也不再需要引用计数/归还。</p>
  *
  * <h2>3.1.0 变更</h2>
  * <ul>
- *   <li>字典改为从 {@link ZstdDictRegistry} 共享获取（每连接省约 3.35MB，见该类实测数据），
- *       并带引用计数，连接关闭时归还；</li>
  *   <li>VarInt 收敛到 {@link ZstdVarInts}；</li>
  *   <li>删除只写不读的 {@code ZSTD_ENABLED} / {@code ZSTD_STATE} 属性（服务端无读取方）。</li>
  * </ul>
@@ -70,24 +69,16 @@ public class ZstdChannelManager {
     /**
      * negotiate 的 txId，用于在 Hijacker 中匹配应答。
      *
-     * <p>volatile：发送侧（{@code sendNegotiateNow} / {@code sendDictQuery}）可能跑在出站写路径上，
+     * <p>volatile：发送侧（{@code sendNegotiateNow}）跑在出站写路径上，
      * 而读取侧是帧层嗅探器（event loop）——写入若不可见，嗅探器就匹配不上应答，
      * 表现为"协商静默超时、回落原版"。</p>
      */
     private volatile int negotiateTxId = -1;
-    /** zstd:dict 查询的 txId（协议 v4 按需推送字典时使用）；volatile 理由同 {@link #negotiateTxId}。 */
-    private volatile int dictTxId = -1;
-    /** 已收到 negotiate 应答 */
-    private volatile boolean dictResponseReceived;
-    /** 客户端确认双向字典就绪（encStatus==0 && decStatus==0） */
-    private volatile boolean dictConfirmed;
-    /**
-     * 客户端曾报告"缺字典"（encStatus==1 / decStatus==1），即协议 v4 需要推一次
-     * {@code zstd:dict} 才能激活。激活前的硬门控要看它：见
-     * {@link #isDictConfirmed()} 与 ZstdHijacker 的 activateZstd。
-     */
-    private volatile boolean dictRequested;
-    /** 客户端协议版本不匹配（status==2），须完全跳过 zstd */
+    /** 已收到 negotiate 应答（无论结论是就绪还是保持原版） */
+    private volatile boolean answerReceived;
+    /** 客户端答复"就绪"（status==0）：本连接可以切 zstd */
+    private volatile boolean clientReady;
+    /** 客户端保持原版（status==2），须完全跳过 zstd */
     private volatile boolean protocolMismatch;
 
     /** 「协议不匹配」告警的只报一次标志（该情形通常影响所有客户端，逐连接重复无价值） */
@@ -101,10 +92,6 @@ public class ZstdChannelManager {
     /** 本连接的切换闸门（未安装时为 null，此时按"未确认"处理）。 */
     private volatile mikumc.zstd.protocol.ZstdSwitchGate switchGate;
 
-    /** 已从注册表取用的字典条目，连接关闭时归还引用 */
-    private ZstdDictRegistry.Entry encoderDictEntry;
-    private ZstdDictRegistry.Entry decoderDictEntry;
-
     public ZstdChannelManager() {
         ZstdVelocityConfig cfg = ZstdVelocityConfig.INSTANCE;
         // 上下文从租借池取（见 ZstdCtxPool 的说明）：池内实例已被 reset，参数需重设。
@@ -113,8 +100,8 @@ public class ZstdChannelManager {
         this.compressCtx.setLong(1); // LDM：提升区块级长距离重复的压缩率
         this.decompressCtx = ZstdCtxPool.borrowDecompress();
         applySlimFrameFormat();
-        // 注意：字典不在这里加载——必须等 negotiate 应答确认客户端字典就绪后
-        // 由 activateZstd 按门控结果显式调用 loadTrainerDicts()。
+        // 注意：这里不装载任何字典。跨帧重复由协议基类的滚动历史（ZstdRollingDict）
+        // 在帧边界自行维护，本类不参与，也不需要在激活路径上做任何字典准备。
     }
 
     /**
@@ -123,59 +110,21 @@ public class ZstdChannelManager {
      * <ul>
      *   <li>{@code magicless}：省 4 字节 magic（对几十字节的小包占比可观）；</li>
      *   <li>{@code contentSize=false}：省 1~4 字节——解压尺寸由协议里的 rawSize 提供，帧内不必再写；</li>
-     *   <li>{@code dictID=false}：省 1~4 字节——字典由双方显式加载，帧内不必再写。</li>
+     *   <li>{@code dictID=false}：省 1~4 字节——字典由双方按同一份滚动历史各自生成，
+     *       帧内既不必也不该带 id。</li>
      * </ul>
      *
      * <p>三者都只是"不再重复写入双方已知的信息"，语义不变。实测（每包一帧）可再省约 10.7%。
      * 解压端必须设置相同的 magicless 开关。</p>
      *
-     * <p>loadDict 之后会再调用一次——zstd 的部分参数在装载字典时可能被重置，
-     * 这里不依赖其内部行为，直接幂等地重新施加。</p>
+     * <p>本方法本身就是幂等的，构造器里施加一次即可；协议基类在换滚动历史字典时会重新
+     * loadDict，那里也会重新施加同样三个开关（见 {@code ZstdBatchEncoderBase}）。</p>
      */
     private void applySlimFrameFormat() {
         compressCtx.setMagicless(true);
         compressCtx.setContentSize(false);
         compressCtx.setDictID(false);
         decompressCtx.setMagicless(true);
-    }
-
-    /**
-     * 把当前字典装进两端上下文（仅在 dictConfirmed 时调用）。
-     *
-     * <p>字典对象由 {@link ZstdDictRegistry} 全进程共享，此处只取引用，
-     * 不做 {@code new ZstdDictCompress(...)}（后者每连接约 3.2MB）。</p>
-     *
-     * <p>⚠️ <b>必须幂等</b>：本方法位于激活路径上，而激活在锚点未就绪时会重试
-     * （{@code ZstdHijacker.activateZstd} 的锚点重试）。每次重入都重新
-     * {@code acquireEncoder()} 会<b>丢掉上一次引用的归还</b>：注册表引用计数只增不减，
-     * 换字典时条目永远等不到归零，那几 MB 原生字典内存就此泄漏。
-     * 现在改为"已持有则不再取"，顺带省掉重复的 {@code loadDict}。</p>
-     */
-    public void loadTrainerDicts() {
-        synchronized (compressLock) {
-        // 通道已关闭（上下文已释放）：装载字典等于写已释放的原生内存，直接放弃
-        //（正常时序下不会走到这里，此判仅作为兜底，见 ZstdCompressLock 的类注释）。
-        if (compressLock.isClosed()) return;
-        if (encoderDictEntry == null) {
-            ZstdDictRegistry.Entry enc = ZstdDictRegistry.acquireEncoder();
-            if (enc != null && enc.compressDict() != null) {
-                compressCtx.loadDict(enc.compressDict());
-                encoderDictEntry = enc;
-                LOGGER.debug("[Zstd] Loaded encoder dict {} ({}B) -> compressCtx",
-                        enc.id(), enc.bytes().length);
-            }
-        }
-        if (decoderDictEntry == null) {
-            ZstdDictRegistry.Entry dec = ZstdDictRegistry.acquireDecoder();
-            if (dec != null && dec.decompressDict() != null) {
-                decompressCtx.loadDict(dec.decompressDict());
-                decoderDictEntry = dec;
-                LOGGER.debug("[Zstd] Loaded decoder dict {} ({}B) -> decompressCtx",
-                        dec.id(), dec.bytes().length);
-            }
-        }
-        applySlimFrameFormat(); // loadDict 后幂等重申，避免参数被重置
-        }
     }
 
     /**
@@ -199,20 +148,6 @@ public class ZstdChannelManager {
         return compressCtx;
     }
 
-    /**
-     * 压缩方向是否已装载字典。编码器据此选择"小包跳过压缩"的阈值：
-     * 实测无字典时 48B 以下压缩反而膨胀，有字典时 24B 起才有收益（见 ZstdVelocityConfig）。
-     */
-    /** 当前装载的压缩字典（分块并行给临时 ctx 用）；未装载返回 null。 */
-    public com.github.luben.zstd.ZstdDictCompress compressDict() {
-        ZstdDictRegistry.Entry e = encoderDictEntry;
-        return e == null ? null : e.compressDict();
-    }
-
-    public boolean hasCompressDict() {
-        return encoderDictEntry != null;
-    }
-
     public ZstdDecompressCtx getDecompressCtx() {
         return decompressCtx;
     }
@@ -227,39 +162,29 @@ public class ZstdChannelManager {
         this.negotiateTxId = txId;
     }
 
-    public int getDictTxId() {
-        return dictTxId;
-    }
-
-    public void setDictTxId(int txId) {
-        this.dictTxId = txId;
-    }
-
     /**
      * Hijacker/嗅探器拦截到 negotiate 应答时回填结果。
      *
-     * <p>⚠️ <b>状态语义（双端必须完全一致）</b>：{@code 0 = 客户端会启用 zstd}，
+     * <p>⚠️ <b>状态语义（三端必须完全一致）</b>：{@code 0 = 客户端会启用 zstd}，
      * {@code 2 = 客户端保持原版}。服务端严格按 2 回落原版 zlib，因此客户端侧
      * 任何返回 2 的分支都必须同时放弃激活 zstd——否则会出现"服务端 zlib /
-     * 客户端 zstd"的必断连组合（3.1.0 实测"无法进入服务器"的根因即客户端在
-     * 服务端尚无字典时返回 2 却仍激活了 zstd）。</p>
+     * 客户端 zstd"的必断连组合。</p>
      *
      * <p>状态码经 {@link mikumc.zstd.protocol.ZstdNegotiateStatus#sanitize} 归一化：
-     * 畸形载荷里的越界值不能被当成"第三种状态"放行。</p>
+     * 畸形载荷里的越界值——以及旧客户端可能仍回的 {@code 1 = 需要字典}——一律按 2 处理，
+     * 不能被当成"第三种状态"放行。</p>
      *
-     * @param encStatus      客户端对 encoder 字典的应答（0=可用，1=需要字典，2=不可用）
-     * @param decStatus      客户端对 decoder 字典的应答
+     * @param status         应答里的状态码（0=就绪，其余一律按保持原版）
      * @param clientAnswered 客户端是否<b>理解</b>了这次查询（应答的 success 位）。
      *                       {@code false} 表示它根本不认识 {@code zstd:negotiate}
      *                       （多半是没装模组），与"装了模组但版本不匹配"要分开表述，
      *                       否则公开服上每个原版玩家登录都会刷一条误导性的 WARN。
      */
-    public void markDictResponse(int encStatus, int decStatus, boolean clientAnswered) {
-        this.dictResponseReceived = true;
-        int enc = mikumc.zstd.protocol.ZstdNegotiateStatus.sanitize(encStatus);
-        int dec = mikumc.zstd.protocol.ZstdNegotiateStatus.sanitize(decStatus);
-        if (enc == mikumc.zstd.protocol.ZstdNegotiateStatus.VANILLA
-                || dec == mikumc.zstd.protocol.ZstdNegotiateStatus.VANILLA) {
+    public void markNegotiateResponse(int status, boolean clientAnswered) {
+        this.answerReceived = true;
+        int s = mikumc.zstd.protocol.ZstdNegotiateStatus.sanitize(status);
+        if (s != mikumc.zstd.protocol.ZstdNegotiateStatus.READY) {
+            this.clientReady = false;
             this.protocolMismatch = true;
             if (!clientAnswered) {
                 // 原版客户端 / 未安装模组：这是完全正常的预期行为，不是问题
@@ -267,47 +192,24 @@ public class ZstdChannelManager {
             } else if (MISMATCH_WARNED.compareAndSet(false, true)) {
                 // 真正值得上报的信号：客户端认识这个查询但拒绝了（多为版本不匹配）。
                 // 只报一次——若真是版本不匹配，它会命中每一条连接，逐条告警只会淹没日志。
-                LOGGER.warn("[Zstd] 客户端明确拒绝 zstd（enc={}, dec={}）。若所有客户端都如此，"
+                LOGGER.warn("[Zstd] 客户端明确拒绝 zstd（status={}）。若所有客户端都如此，"
                         + "通常是两端版本不匹配；本端保持原版 zlib，不影响进服。"
-                        + "（本条只提示一次）", enc, dec);
+                        + "（本条只提示一次）", s);
             }
         } else {
-            this.dictConfirmed = (enc == mikumc.zstd.protocol.ZstdNegotiateStatus.READY
-                    && dec == mikumc.zstd.protocol.ZstdNegotiateStatus.READY);
-            LOGGER.debug("[Zstd] Negotiate 应答：enc={} dec={} dictConfirmed={}", enc, dec, dictConfirmed);
+            this.clientReady = true;
+            LOGGER.debug("[Zstd] Negotiate 应答：status={} → 客户端就绪", s);
         }
     }
 
-    /**
-     * 记下"客户端请求了字典"。协议 v4 在推完 {@code zstd:dict} 并拿到它的应答之前，
-     * 都不能激活 zstd——见 ZstdHijacker 激活前的硬门控。
-     */
-    /**
-     * 记下"客户端请求了字典"，并返回本次是否是<b>第一次</b>请求。
-     *
-     * <p>⚠️ 必须能区分重复：同一条 negotiate 应答若被重传/重放，旧的 void 版本会让调用方
-     * 再推一遍整份字典（默认 2×128KB，配置上限 2×1MB），并覆盖 {@code dictTxId}，
-     * 使前一次的应答从此无人认领。</p>
-     *
-     * @return {@code true} 表示第一次请求，调用方应推送字典；{@code false} 表示已经在等应答
-     */
-    public synchronized boolean markDictRequested() {
-        if (this.dictRequested) return false;
-        this.dictRequested = true;
-        return true;
+    /** 是否已收到 negotiate 应答（结论未定也算"已应答"，但还要看 {@link #isClientReady()}）。 */
+    public boolean isAnswerReceived() {
+        return answerReceived;
     }
 
-    /** 客户端是否报告过缺字典（决定激活前是否必须等到字典确认）。 */
-    public boolean isDictRequested() {
-        return dictRequested;
-    }
-
-    public boolean isDictResponseReceived() {
-        return dictResponseReceived;
-    }
-
-    public boolean isDictConfirmed() {
-        return dictConfirmed;
+    /** 客户端是否答复"就绪"（status==0）。激活的唯一正面判据。 */
+    public boolean isClientReady() {
+        return clientReady;
     }
 
     public boolean isProtocolMismatch() {
@@ -634,7 +536,7 @@ public class ZstdChannelManager {
         return false;
     }
 
-    /** 释放 zstd 上下文并归还共享字典引用。 */
+    /** 释放 zstd 上下文（归还租借池）。 */
     public void close() {
         stats.remove();
         // 走 setReplaced 归还计数（幂等），而不是直接判断 replaced —— 重复 close 不会多减
@@ -648,16 +550,6 @@ public class ZstdChannelManager {
             // 归还池（内部 reset）；池满/已停用时才真正 close
             ZstdCtxPool.returnCompress(compressCtx);
             ZstdCtxPool.returnDecompress(decompressCtx);
-        }
-        ZstdDictRegistry.Entry enc = encoderDictEntry;
-        if (enc != null) {
-            encoderDictEntry = null;
-            enc.release();
-        }
-        ZstdDictRegistry.Entry dec = decoderDictEntry;
-        if (dec != null) {
-            decoderDictEntry = null;
-            dec.release();
         }
     }
 }

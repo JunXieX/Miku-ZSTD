@@ -27,9 +27,9 @@ public class ZstdPaperEncoder extends ZstdBatchEncoderBase {
     }
 
     /**
-     * 压缩已卸载到线程池；字典由 ChannelManager 改写 {@code compressCtx}、且它负责在
-     * 关连接时 close 该上下文，所以这里必须返回<b>与它相同的那把锁</b>——否则池线程压缩
-     * 会与「换字典 / close」并发，后者是 use-after-free（SIGSEGV）。
+     * 压缩已卸载到线程池，而 {@code compressCtx} 由 ChannelManager 持有、并在关连接时归还
+     * （池内部会 reset）。因此这里必须返回<b>与它相同的那把锁</b>——否则池线程压缩
+     * 会与「装滚动历史字典 / 归还上下文」并发，后者是 use-after-free（SIGSEGV）。
      */
     @Override
     protected ZstdCompressLock compressLock() {
@@ -37,16 +37,15 @@ public class ZstdPaperEncoder extends ZstdBatchEncoderBase {
         return m == null ? super.compressLock() : m.compressLock();
     }
 
+    /**
+     * 小包直存阈值。
+     *
+     * <p>5.0.42 起只有一个值：训练字典删除后，压缩端不再有"预置的熵表"，滚动历史只提供
+     * 内容匹配，对几十字节的包照样压不动（压不动会退回直存，但 CPU 白花）。</p>
+     */
     @Override
-    protected boolean hasCompressDict() {
-        ZstdPaperChannelManager m = manager;
-        return m != null && m.hasCompressDict();
-    }
-
-    @Override
-    protected int skipCompressThreshold(boolean hasCompressDict) {
-        ZstdPaperConfig cfg = ZstdPaperConfig.INSTANCE;
-        return hasCompressDict ? cfg.skipCompressBelowBytesWithDict : cfg.skipCompressBelowBytes;
+    protected int skipCompressThreshold() {
+        return ZstdPaperConfig.INSTANCE.skipCompressBelowBytes;
     }
 
     @Override
@@ -57,12 +56,6 @@ public class ZstdPaperEncoder extends ZstdBatchEncoderBase {
     @Override
     protected int configWindowLog() {
         return ZstdPaperConfig.INSTANCE.windowLog;
-    }
-
-    @Override
-    protected com.github.luben.zstd.ZstdDictCompress compressDict() {
-        ZstdPaperChannelManager m = manager;
-        return m == null ? null : m.compressDict();
     }
 
     @Override
@@ -99,22 +92,8 @@ public class ZstdPaperEncoder extends ZstdBatchEncoderBase {
         }
     }
 
-    /**
-     * 采样：把整批原始字节交给训练器，由它在锁外按包拆开、过滤、只为入库样本拷贝
-     * （见 {@code ZstdPaperTrainer#addBatch}）。
-     */
-    @Override
-    protected void onRawBatch(io.netty.buffer.ByteBuf raw, int length) {
-        // ⚠️ 先问训练器要不要，再决定拷不拷：这份拷贝跑在 event loop 上，而攒批以 flush
-        // 为界（tick 末尾、区块发送完成都会 flush），高流量时每条连接每秒成百批，
-        // 训练环满了之后这些拷贝就是全额白做。
-        if (!ZstdPaperTrainer.wantsEncoderSample()) {
-            return;
-        }
-        byte[] copy = new byte[length];
-        raw.getBytes(raw.readerIndex(), copy, 0, length);
-        ZstdPaperTrainer.submitEncoderBatch(copy, length);
-    }
+    // 注：基类还留着 onRawBatch 采样钩子，本端不覆写——它只服务于已删除的训练字典，
+    // 基类的默认实现本来就是空的。
 
     @Override
     protected int configBatchWindowMs() {

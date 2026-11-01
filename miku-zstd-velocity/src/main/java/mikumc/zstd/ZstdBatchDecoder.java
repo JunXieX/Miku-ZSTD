@@ -17,6 +17,10 @@ import mikumc.zstd.protocol.ZstdBatchDecoderBase;
  *
  * <p>服务端不做入站统计——带宽剖析（{@code ZstdBandwidthProfiler}）只统计出站，
  * 因为"降带宽"关心的就是服务端发给玩家的字节量。</p>
+ *
+ * <p>⚠️ 5.0.42 起<b>不再覆写采样钩子</b>（{@code onDecodedPayload} / {@code onStoredPayload}
+ * / {@code wantsStoredPayload}）：训练字典已整体删除，覆写它们只会白拷一份入站字节。
+ * 协议基类的空实现即是最终形态。</p>
  */
 public class ZstdBatchDecoder extends ZstdBatchDecoderBase {
 
@@ -61,12 +65,6 @@ public class ZstdBatchDecoder extends ZstdBatchDecoderBase {
         // 服务端无入站统计（有意）
     }
 
-    /** 直存帧也是字典收益的主战场（它们都是"小到不值得压缩"的包），必须采样。 */
-    @Override
-    protected boolean wantsStoredPayload() {
-        return true;
-    }
-
     /**
      * 服务端声明：切换确认之前，入站只可能是原版帧（由 {@link ZstdSwitchGate} 保证）。
      * 确认之后（或超时兜底之后）立即转为严格 zstd 模式。
@@ -90,22 +88,4 @@ public class ZstdBatchDecoder extends ZstdBatchDecoderBase {
         return mgr != null && mgr.isSwitchConfirmed();
     }
 
-    /** 直存帧采样：格式与解压帧相同，直接整帧批量提交。 */
-    @Override
-    protected void onStoredPayload(byte[] data) {
-        ZstdSampleTrainer.submitDecoderBatch(data, data.length);
-    }
-
-    /**
-     * 解压帧采样：整帧批量提交给训练器。
-     *
-     * <p>以前这里逐包 {@code new byte[]} + {@code arraycopy}，等于给<b>每一个入站包</b>
-     * 都在 event loop 上加一次堆分配，而且还要再手写一遍 varint 解析。
-     * 现在把整帧交给 {@code addBatch}：解析与过滤都在锁外完成，且只在样本真正入库时
-     * 才拷贝——编码侧早就是这个做法，解码侧补齐。</p>
-     */
-    @Override
-    protected void onDecodedPayload(byte[] data) {
-        ZstdSampleTrainer.submitDecoderBatch(data, data.length);
-    }
 }

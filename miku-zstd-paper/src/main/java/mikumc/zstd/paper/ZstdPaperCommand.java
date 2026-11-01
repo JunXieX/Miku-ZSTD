@@ -11,7 +11,7 @@ import java.util.Locale;
 import mikumc.zstd.protocol.ZstdCompressPool;
 
 /**
- * {@code /mikuzstd}：状态与字典检测，以及 BossBar 实时监控开关。
+ * {@code /mikuzstd}：运行状态与 BossBar 实时监控开关。
  *
  * <p>⚠️ Paper 插件<b>不支持</b>在 {@code paper-plugin.yml} 里声明命令（调用
  * {@code JavaPlugin#getCommand} 会直接抛 {@code UnsupportedOperationException}），
@@ -70,7 +70,8 @@ public final class ZstdPaperCommand implements BasicCommand {
                 ? "§c  原版压缩阈值 = " + threshold + "（已关闭）→ 本插件会自动停用"
                 : "§a  原版压缩阈值 = " + threshold + " → zstd 可接管");
         sender.sendMessage("§7  压缩等级=" + cfg.level + " 窗口=" + cfg.windowLog
-                + " 批处理=" + cfg.batchWindowMs + "ms/" + cfg.batchMaxPackets + "包");
+                + " 批处理=" + cfg.batchWindowMs + "ms/" + cfg.batchMaxPackets + "包"
+                + " 直存阈值=" + cfg.skipCompressBelowBytes + "B");
 
         sender.sendMessage("§e── 压缩线程池 ──");
         sender.sendMessage("§7  " + ZstdCompressPool.summary());
@@ -81,25 +82,9 @@ public final class ZstdPaperCommand implements BasicCommand {
         sender.sendMessage("§e── 解压缓冲 ──");
         sender.sendMessage("§7  " + mikumc.zstd.protocol.ZstdBatchDecoderBase.scratchStats());
 
-        sender.sendMessage("§e── 字典训练 ──");
-        showTrainer(sender, "压缩(encoder)", ZstdPaperTrainer.getEncoder(), cfg.trainerMinSamples);
-        showTrainer(sender, "解压(decoder)", ZstdPaperTrainer.getDecoder(), cfg.trainerMinSamples);
-
-        sender.sendMessage("§e── 共享注册表 ──");
-        long encId = ZstdPaperDictRegistry.encoderDictId();
-        long decId = ZstdPaperDictRegistry.decoderDictId();
-        sender.sendMessage(encId == 0
-                ? "§7  压缩字典: §c未装载（dictId=0，正在用无字典压缩）"
-                : "§7  压缩字典: §aid=" + encId);
-        sender.sendMessage(decId == 0
-                ? "§7  解压字典: §c未装载（dictId=0）"
-                : "§7  解压字典: §aid=" + decId);
-
-        if (encId == 0) {
-            sender.sendMessage("§8  提示：字典需累积 " + cfg.trainerMinSamples
-                    + " 个样本或等 " + (cfg.trainerFallbackTimeoutMs / 60000) + " 分钟兜底触发首轮训练；"
-                    + "训练本身不刷控制台日志（需要时把日志级别调到 DEBUG），用 /mikuzstd status 查看当前字典 id");
-        }
+        sender.sendMessage("§e── 跨帧历史 ──");
+        sender.sendMessage("§7  滚动历史：§a自动§7（每帧把最近 64KB 原始字节当字典，每 256KB 轮换一次）"
+                + " §8无需配置、不下发");
     }
 
     /**
@@ -134,19 +119,5 @@ public final class ZstdPaperCommand implements BasicCommand {
     @Override
     public String permission() {
         return null;
-    }
-
-    private static void showTrainer(CommandSender sender, String label, ZstdPaperTrainer t, int minSamples) {
-        if (t == null) {
-            sender.sendMessage("§7  " + label + ": §7已禁用（trainer.enabled=false）");
-            return;
-        }
-        byte[] dict = t.getCurrentDict();
-        sender.sendMessage("§7  " + label + ": samples=" + t.getSampleCount() + "/" + minSamples
-                + " bytes=" + t.getSampleBytes()
-                + " dictId=" + t.getCurrentDictId()
-                + " dictSize=" + (dict == null ? 0 : dict.length) + "B");
-        // 现有字典 vs 不装字典的【绝对】收益（训练日志里的 -1.3% 是"候选 vs 现有"，别混）
-        sender.sendMessage("§7  " + label + " 字典-vs-无字典: " + t.dictAblation());
     }
 }

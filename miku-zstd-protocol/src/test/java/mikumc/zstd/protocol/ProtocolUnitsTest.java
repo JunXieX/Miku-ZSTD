@@ -118,48 +118,8 @@ class ProtocolUnitsTest {
         assertEquals(4, ZstdVarInts.length(ZstdVarInts.MC_MAX_FRAME_BYTES + 1));
     }
 
-    @Test
-    @DisplayName("帧上限：两个方向的字典同帧发送也不得撑破帧上限（含包头开销）")
-    void bothDictionariesFitInOneFrame() {
-        // zstd:dict 把两个方向的字典放进同一个包：
-        //   [pktId][txId][len+"zstd:dict"][flags] + 2 × ([int crc][int len][bytes])
-        // 包头固定开销按 64 字节保守估算（本题的判据与服务端 sendDictQuery 的兜底一致）。
-        int perDir = ZstdVarInts.MAX_DICT_BYTES_PER_DIRECTION;
-        long frameBytes = 2L * (perDir + 8) + 64;
-        assertTrue(frameBytes <= ZstdVarInts.MC_MAX_FRAME_BYTES,
-                "两方向各 " + perDir + "B 时合帧需要 " + frameBytes
-                        + "B，已超过 MC 帧上限 " + ZstdVarInts.MC_MAX_FRAME_BYTES);
-
-        // 反面：如果仍按 1MB 单方向来夹，两方向就会超限 —— 这正是本常量存在的理由
-        long oneMegEach = 2L * (0x100000 + 8) + 64;
-        assertTrue(oneMegEach > ZstdVarInts.MC_MAX_FRAME_BYTES,
-                "前提校验：两方向各 1MB 应当超限，否则本上限就没有必要");
-    }
-
-    // ────────────────────────────────────────────────────────────────
-    // 字典 id（跨端契约）
-    // ────────────────────────────────────────────────────────────────
-
-    @Test
-    @DisplayName("字典 id：同一内容恒等、不同内容不同、空值返回 NONE")
-    void dictIdIsContentAddressed() {
-        byte[] a = "dictionary-A".getBytes(StandardCharsets.US_ASCII);
-        byte[] aCopy = Arrays.copyOf(a, a.length);
-        byte[] b = "dictionary-B".getBytes(StandardCharsets.US_ASCII);
-
-        assertEquals(ZstdDictId.of(a), ZstdDictId.of(aCopy), "同样内容必须得到同样的 id");
-        assertNotEquals(ZstdDictId.of(a), ZstdDictId.of(b), "不同内容不应碰撞（同长度不同字节）");
-        assertEquals(ZstdDictId.NONE, ZstdDictId.of(null));
-        assertEquals(ZstdDictId.NONE, ZstdDictId.of(new byte[0]));
-    }
-
-    @Test
-    @DisplayName("字典 id：wireChecksum 必须是 of 的低 32 位（线上帧与缓存键同源）")
-    void dictIdWireChecksumMatchesId() {
-        byte[] d = "some-dict-bytes".getBytes(StandardCharsets.US_ASCII);
-        assertEquals((int) ZstdDictId.of(d), ZstdDictId.wireChecksum(d),
-                "线上 int 校验字段必须与 id 同源，否则客户端缓存键会对不上");
-    }
+    // 5.0.42：训练字典删除后，"两方向字典同帧"这个约束随之消失
+    //（zstd:dict 通道已不存在），对应的帧上限用例一并删除。
 
     // ────────────────────────────────────────────────────────────────
     // 协商状态码（白名单）
@@ -169,7 +129,8 @@ class ProtocolUnitsTest {
     @DisplayName("状态码：0/1/2 原样保留，其它一律归一为 2（保持原版）")
     void negotiateStatusWhitelist() {
         assertEquals(0, ZstdNegotiateStatus.sanitize(0));
-        assertEquals(1, ZstdNegotiateStatus.sanitize(1));
+        // ⚠️ 5.0.42 起 1（旧的"需要字典"）已取消，按 VANILLA 处理
+        assertEquals(2, ZstdNegotiateStatus.sanitize(1));
         assertEquals(2, ZstdNegotiateStatus.sanitize(2));
 
         // 畸形载荷里的越界值绝不能被当成"第三种状态"放行
@@ -177,9 +138,6 @@ class ProtocolUnitsTest {
             assertEquals(ZstdNegotiateStatus.VANILLA, ZstdNegotiateStatus.sanitize(bad),
                     "越界值 " + bad + " 必须归一为 VANILLA");
         }
-        assertTrue(ZstdNegotiateStatus.needsDict(1));
-        assertFalse(ZstdNegotiateStatus.needsDict(0));
-        assertFalse(ZstdNegotiateStatus.needsDict(2));
     }
 
     // ────────────────────────────────────────────────────────────────
@@ -329,41 +287,14 @@ class ProtocolUnitsTest {
         }
     }
 
-    // ────────────────────────────────────────────────────────────────
-    // 字典采纳判定（"字典会不会被启用"的唯一开关）
-    // ────────────────────────────────────────────────────────────────
+    // 5.0.42：训练字典整套已删除（含采纳判定与分档数学），
+    // 依据是实机对照——字典让线路字节多 3.7%，而它唯一可能帮到的小包只占总字节 0.1%。
+    // 保留下来的只有滚动历史，其正确性由 FrameLayoutTest 的对称用例覆盖。
 
     @Test
-    @DisplayName("字典采纳：首部字典给 -2% 容差；替换字典才看阈值")
-    void dictAdoption() {
-        // 首部字典：改进 0.1% 也应采纳（否则小包永远压不动，整条机制成死代码）
-        assertTrue(ZstdDictAdoption.shouldAdoptDict(true, 0.001, 0.01));
-        // ⚠️ 5.0.40 起改为容差判定：字典的净收益结构性地落在 ±2% 噪声带里
-        //（小包 +10%、中包 -1%，而小包只占总字节的百分之几），用 ">0" 当门槛会让
-        // 真实服务器上的字典<em>永远启用不了</em>——实测有服攒到 2000 样本 / 23.8MB 仍是 dictSize=0。
-        assertTrue(ZstdDictAdoption.shouldAdoptDict(true, 0.0, 0.01), "恰好 0 必须采纳");
-        assertTrue(ZstdDictAdoption.shouldAdoptDict(true, -0.01, 0.01), "-1% 仍在容差内");
-        assertTrue(ZstdDictAdoption.shouldAdoptDict(true, ZstdDictAdoption.FIRST_DICT_FLOOR, 0.01),
-                "容差边界必须采纳");
-        assertFalse(ZstdDictAdoption.shouldAdoptDict(true, -0.03, 0.01), "-3% 超出容差，拒绝");
-        assertFalse(ZstdDictAdoption.shouldAdoptDict(true, -0.2, 0.01));
-
-        // 替换字典：必须达到阈值
-        assertFalse(ZstdDictAdoption.shouldAdoptDict(false, 0.009, 0.01));
-        assertTrue(ZstdDictAdoption.shouldAdoptDict(false, 0.01, 0.01));
-    }
-
-    @Test
-    @DisplayName("字典采纳：分档边界与改进率计算")
-    void dictBandMath() {
-        assertEquals(0, ZstdDictAdoption.bandOf(ZstdDictAdoption.SMALL_BELOW - 1));
-        assertEquals(1, ZstdDictAdoption.bandOf(ZstdDictAdoption.SMALL_BELOW));
-        assertEquals(1, ZstdDictAdoption.bandOf(ZstdDictAdoption.MID_BELOW - 1));
-        assertEquals(2, ZstdDictAdoption.bandOf(ZstdDictAdoption.MID_BELOW));
-
-        assertEquals(0.0, ZstdDictAdoption.bandRatio(0, 100), 1e-9, "旧字节为 0 时不得除零");
-        assertEquals(0.2, ZstdDictAdoption.bandRatio(1000, 800), 1e-9);
-        assertEquals(3, ZstdDictAdoption.BANDS, "分档数量与 bandOf 的返回值域必须一致");
+    @DisplayName("（占位）字典采纳判定已随训练字典一起删除")
+    void dictAdoptionRemoved() {
+        // 空用例：保留名字便于检索历史决策，不做断言。
     }
 
     // ────────────────────────────────────────────────────────────────

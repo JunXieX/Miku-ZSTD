@@ -4,7 +4,6 @@ import com.mojang.brigadier.tree.LiteralCommandNode;
 import com.velocitypowered.api.command.BrigadierCommand;
 import com.velocitypowered.api.command.CommandSource;
 import com.velocitypowered.api.proxy.ProxyServer;
-import net.kyori.adventure.audience.Audience;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
 import mikumc.zstd.protocol.ZstdCompressPool;
@@ -32,7 +31,7 @@ public final class ZstdCommand {
         this.plugin = plugin;
     }
 
-    /** 构建命令树：{@code /mikuzstd [status|bar|reload|train [force]]}。 */
+    /** 构建命令树：{@code /mikuzstd [status|top|bar|reload]}。 */
     public BrigadierCommand build() {
         LiteralCommandNode<CommandSource> node = BrigadierCommand.literalArgumentBuilder("mikuzstd")
                 // ⚠️ 主节点刻意【不设 requires】。
@@ -68,26 +67,14 @@ public final class ZstdCommand {
                             ctx.getSource().sendMessage(ZstdBossBarMonitor.toggle(ctx.getSource()));
                             return 1;
                         }))
-                // 下面两个会真的改动服务端状态（重载配置 / 触发训练），保留权限门槛：
+                // 重载配置会改动服务端状态，保留权限门槛：
                 // 装了权限插件后授予 mikuzstd.command（或 zstd.command）即可。
-                // 注意 requires 沿链累积，force 会自动继承 train 的限制。
                 .then(BrigadierCommand.literalArgumentBuilder("reload")
                         .requires(ZstdCommand::hasPermission)
                         .executes(ctx -> {
                             reload(ctx.getSource());
                             return 1;
                         }))
-                .then(BrigadierCommand.literalArgumentBuilder("train")
-                        .requires(ZstdCommand::hasPermission)
-                        .executes(ctx -> {
-                            train(ctx.getSource(), false);
-                            return 1;
-                        })
-                        .then(BrigadierCommand.literalArgumentBuilder("force")
-                                .executes(ctx -> {
-                                    train(ctx.getSource(), true);
-                                    return 1;
-                                })))
                 .build();
         return new BrigadierCommand(node);
     }
@@ -110,10 +97,6 @@ public final class ZstdCommand {
         source.sendMessage(Component.text("── Connections ──", NamedTextColor.YELLOW));
         source.sendMessage(Component.text("  Online players: " + proxy.getPlayerCount(), NamedTextColor.GRAY));
 
-        source.sendMessage(Component.text("── Trainer ──", NamedTextColor.YELLOW));
-        showTrainerStatus(source, "Encoder", ZstdSampleTrainer.getEncoder());
-        showTrainerStatus(source, "Decoder", ZstdSampleTrainer.getDecoder());
-
         source.sendMessage(Component.text("── 压缩线程池 ──", NamedTextColor.YELLOW));
         source.sendMessage(Component.text("  " + ZstdCompressPool.summary(), NamedTextColor.GRAY));
 
@@ -128,24 +111,6 @@ public final class ZstdCommand {
 
         source.sendMessage(Component.text("── Config ──", NamedTextColor.YELLOW));
         source.sendMessage(Component.text("  debug: " + cfg.debug, NamedTextColor.GRAY));
-    }
-
-    private void showTrainerStatus(Audience source, String label, ZstdSampleTrainer trainer) {
-        if (trainer == null) {
-            source.sendMessage(Component.text("  " + label + ": 已禁用（trainer.enabled=false）",
-                    NamedTextColor.GRAY));
-            return;
-        }
-        long dictId = trainer.getCurrentDictId();
-        byte[] dict = trainer.getCurrentDict();
-        source.sendMessage(Component.text("  " + label + ": samples=" + trainer.getSampleCount()
-                + " bytes=" + trainer.getSampleBytes()
-                + " dictId=" + dictId
-                + " dictSize=" + (dict != null ? dict.length : 0) + "B",
-                NamedTextColor.GRAY));
-        // 现有字典 vs 不装字典的<b>绝对</b>收益（训练日志里的 -1.3% 是"候选 vs 现有"，别混）
-        source.sendMessage(Component.text("  " + label + " dict-vs-no-dict: " + trainer.dictAblation(),
-                NamedTextColor.GRAY));
     }
 
     /** 各连接的压缩统计排行 —— 定位"是谁在拖后腿"。 */
@@ -175,54 +140,12 @@ public final class ZstdCommand {
         // ⚠️ 必须说清楚作用范围，否则管理员会以为 reload 没生效。三类参数都不会作用于已有连接：
         //   · level / window_log：连接建立时应用到该连接的 zstd 上下文（见 ZstdChannelManager 构造器）；
         //   · batch_window_ms / batch_max_packets：编码器 handlerAdded 时快照；
-        //   · threads / trainer.*：线程池只在首次 init 时固定，训练器参数在 init 构造器里快照。
+        //   · threads：线程池只在首次 init 时固定。
         source.sendMessage(Component.text(
-                "即时生效：logging.debug、bossbar.format、skip_compress_below_bytes*；"
+                "即时生效：logging.debug、bossbar.format、skip_compress_below_bytes；"
                         + "需新连接：level、window_log、batch_window_ms、batch_max_packets；"
-                        + "需重启代理：threads、trainer.*。已有连接仍在用旧值。",
+                        + "需重启代理：threads。已有连接仍在用旧值。",
                 NamedTextColor.YELLOW));
     }
 
-    private void train(CommandSource source, boolean forced) {
-        ZstdSampleTrainer enc = ZstdSampleTrainer.getEncoder();
-        ZstdSampleTrainer dec = ZstdSampleTrainer.getDecoder();
-
-        // train       ：样本达标才训练（绕过冷却与"环满 / 兜底超时"门槛）
-        // train force ：连样本门槛一起绕过（小服 / 测试环境用）
-        boolean encStarted = triggerTrain(enc, forced);
-        boolean decStarted = triggerTrain(dec, forced);
-
-        Component msg;
-        if (!encStarted && !decStarted) {
-            // ⚠️ 不能一律报"已触发"：force 也可能提交不成功（已有训练在跑 / 执行器已关闭），
-            // 那种情况必须说清楚，否则命令输出会与实际情况不符。
-            msg = Component.text(forced
-                            ? "训练未提交：已有训练在进行，或训练执行器已关闭。"
-                            : "两端样本都不足，本次未触发训练。可用 /mikuzstd train force 绕过样本门槛。",
-                    NamedTextColor.YELLOW);
-        } else {
-            msg = Component.text(forced ? "Force training triggered. " : "Training triggered. ",
-                    NamedTextColor.GREEN);
-        }
-        if (enc != null) {
-            msg = msg.append(Component.text("Encoder: " + enc.getSampleCount() + " samples, dict="
-                    + enc.getCurrentDictId() + "  ", NamedTextColor.GRAY));
-        }
-        if (dec != null) {
-            msg = msg.append(Component.text("Decoder: " + dec.getSampleCount() + " samples, dict="
-                    + dec.getCurrentDictId(), NamedTextColor.GRAY));
-        }
-        source.sendMessage(msg);
-    }
-
-    /** 按 {@code forced} 选择"绕过一切"还是"仍要求样本达标"。 */
-    private static boolean triggerTrain(ZstdSampleTrainer trainer, boolean forced) {
-        if (trainer == null) {
-            return false;
-        }
-        if (forced) {
-            return trainer.forceTrain();
-        }
-        return trainer.requestTrain();
-    }
 }

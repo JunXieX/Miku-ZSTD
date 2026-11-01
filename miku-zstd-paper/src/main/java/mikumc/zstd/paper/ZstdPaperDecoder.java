@@ -56,12 +56,6 @@ public class ZstdPaperDecoder extends ZstdBatchDecoderBase {
         // 服务端无入站统计（有意）
     }
 
-    /** 直存帧也是字典收益的主战场（它们都是"小到不值得压缩"的包），必须采样。 */
-    @Override
-    protected boolean wantsStoredPayload() {
-        return true;
-    }
-
     /**
      * 服务端声明：切换确认之前，入站只可能是原版帧（由 {@link mikumc.zstd.protocol.ZstdSwitchGate}
      * 保证）。确认之后立即转为严格 zstd 模式。
@@ -81,20 +75,7 @@ public class ZstdPaperDecoder extends ZstdBatchDecoderBase {
         return mgr != null && mgr.isSwitchConfirmed();
     }
 
-    /** 直存帧采样：格式与解压帧相同，直接整帧批量提交。 */
-    @Override
-    protected void onStoredPayload(byte[] data) {
-        ZstdPaperTrainer.submitDecoderBatch(data, data.length);
-    }
-
-    /**
-     * 解压帧采样：整帧批量提交给训练器（与编码侧同一个做法）。
-     *
-     * <p>以前逐包 {@code new byte[]} + {@code arraycopy}，给每个入站包都在 event loop
-     * 上加一次堆分配，还顺带手写了一遍 varint 解析。</p>
-     */
-    @Override
-    protected void onDecodedPayload(byte[] data) {
-        ZstdPaperTrainer.submitDecoderBatch(data, data.length);
-    }
+    // 注：基类的 onStoredPayload / onDecodedPayload / wantsStoredPayload 三个钩子只服务于
+    // 已删除的训练字典，本端不覆写（默认 wantsStoredPayload=false，采样回调一次都不会被调）。
+    // 直存帧那次 singlePacketBatch 拷贝仍会发生——它是滚动历史 feedHistory 的输入，与训练无关。
 }

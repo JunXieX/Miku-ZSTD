@@ -51,10 +51,15 @@ public class ZstdConfig {
     /** 单帧最多合并多少个包 */
     public final int batchMaxPackets;
 
-    /** 无字典时：小于此字节数的批次直接直存（实测 ≤32B 压缩后膨胀，48B 起才有收益） */
+    /**
+     * 小包跳过压缩的阈值：小于此字节数的批次直接直存，不调用 zstd。
+     *
+     * <p>实测 ≤32B 的批次压缩后膨胀到 102~113%，48B 起压缩才有收益。这个口径是按
+     * "上下文里还没有历史字典"测出来的——滚动历史要等本方向攒够 320KB（64KB 滑窗填满
+     * + 256KB 轮换间隔）才第一次生效，而客户端上行以几十字节的移动包为主，基本走不到，
+     * 所以不再按"有无字典"分两档。</p>
+     */
     public final int skipCompressBelowBytes;
-    /** 有字典时：阈值更低（实测 24B 起才有收益） */
-    public final int skipCompressBelowBytesWithDict;
 
     /**
      * ⚠️ 与服务端同规则：<b>所有数值都夹取</b>。
@@ -70,8 +75,6 @@ public class ZstdConfig {
         this.batchWindowMs = clamp(getInt(c, "batch_window_ms", 50), 0, 1000);
         this.batchMaxPackets = clamp(getInt(c, "batch_max_packets", 64), 1, 4096);
         this.skipCompressBelowBytes = clamp(getInt(c, "skip_compress_below_bytes", 48), 0, 65536);
-        this.skipCompressBelowBytesWithDict =
-                clamp(getInt(c, "skip_compress_below_bytes_with_dict", 24), 0, 65536);
 
         Map<String, Object> d = section(map, "display");
         this.hudEnabled = getBool(d, "hud_enabled", false);
@@ -142,20 +145,22 @@ public class ZstdConfig {
 
                     compression:
                       # ── 压缩等级 (1-22) ──
-                      # 默认 3。依据是开发期探针的实测（带 128KB 字典、按批处理形态）：
-                      #   · 小包是字典收益的主战场，而高等级在这里【反而更差】——
+                      # 默认 3。依据是开发期探针的实测（当时代码还带着训练字典，这里只取等级之间的
+                      # 相对关系；训练字典已于 5.0.42 删除，滚动历史沿用同一套帧格式）：
+                      #   · 小包是滚动历史收益的主战场，而高等级在这里【反而更差】——
                       #     单包 64B：L3 压到 45.3%，L9 只能压到 57.8%，L3 好 12.5 个百分点；
                       #   · 数据越长高等级才越有优势：8KB 批次上 L9 好约 4 个百分点；
                       #   · 但代价悬殊：L9 的压缩耗时是 L3 的 8~12 倍（8KB 批次 173μs vs 14.7μs）；
                       #   · 解压耗时与等级无关，但客户端【也要压上行流量】，所以等级同样影响上传侧。
-                      # 结论：默认 3。两端等级可以不同，但帧格式与字典必须一致（由模组自动协商）。
+                      # 结论：默认 3。两端等级可以不同，但帧格式必须一致（由模组自动协商）；
+                      # 滚动历史是两端各自按同一批字节算出来的，不需要也不应该协商。
                       level: 3
 
                       # 滑动窗口大小，单位为 2 的幂（20 = 1MB）。
                       # 窗口决定"能记住多少历史数据用于跨包匹配"，听起来对大包有帮助，但实测
                       # （开发期探针 WindowProbe，逐值独立 JVM 测量）恰恰相反：
                       #   window_log 17 / 20 / 23 的压缩率【完全相同】——批次 29.5%、大包重复 12.5%。
-                      # 原因：小包的重复内容已被【字典】吃掉；大包（区块）多为新内容，本就匹配不到历史。
+                      # 原因：小包的重复内容已被【滚动历史】吃掉；大包（区块）多为新内容，本就匹配不到历史。
                       # 而 zstd 上下文的哈希表规模是 2^(windowLog-1) × 4B ——【指数增长】：
                       #   23 ≈ 16MB      20 ≈ 2MB      18 ≈ 0.5MB
                       # 所以默认取 20：内存省一个数量级，压缩率实测无损。
@@ -189,12 +194,11 @@ public class ZstdConfig {
                       batch_max_packets: 64
 
                       # ── 小包跳过压缩（实测阈值，别凭感觉改）──
-                      # 无字典时：≤32B 的批次压缩后【膨胀到 102~113%】，48B 起压缩才有收益。
+                      # ≤32B 的批次压缩后【膨胀到 102~113%】，48B 起压缩才有收益。
+                      # 训练字典删除后只保留这一档：实测"有字典时 24B 起才有收益"那组数据是
+                      # 按 128KB 训练字典测的，而滚动历史要等本方向攒够 320KB 才第一次生效，
+                      # 客户端的上行流量基本走不到，按 24B 分档等于白留一个永远不命中的开关。
                       skip_compress_below_bytes: 48
-
-                      # 有字典时阈值更低：实测 24B 起就有收益（16B 仍膨胀到 103.5%）。
-                      # ⚠️ 不要与上面共用一个值，否则会白丢这块收益。
-                      skip_compress_below_bytes_with_dict: 24
 
                     display:
                       # 客户端 HUD：在屏幕上显示实时压缩统计。

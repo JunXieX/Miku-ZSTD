@@ -296,20 +296,19 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
      */
     protected abstract ZstdCompressCtx resolveCompressContext(ChannelHandlerContext ctx);
 
-    /** 本连接是否已装载压缩字典（影响小包跳过压缩的阈值，每帧查询一次） */
-    protected abstract boolean hasCompressDict();
-
-    /** 小包跳过压缩的阈值：低于该值直接直存，不调用 zstd */
-    protected abstract int skipCompressThreshold(boolean hasCompressDict);
+    /**
+     * 小包跳过压缩的阈值：低于该值直接直存，不调用 zstd。
+     *
+     * <p>5.0.42 起不再区分"有没有静态字典"：训练字典整套已删除，滚动历史不提供熵表，
+     * 所以这里只有一个阈值（各端配置项 {@code skip_compress_below_bytes}）。</p>
+     */
+    protected abstract int skipCompressThreshold();
 
     /** 压缩等级（分块并行时给每块配临时 ctx 用）。 */
     protected abstract int configLevel();
 
     /** 窗口日志（0 = 交给 zstd 按等级自动选）。 */
     protected abstract int configWindowLog();
-
-    /** 本连接的压缩字典（可能为 null）。 */
-    protected abstract com.github.luben.zstd.ZstdDictCompress compressDict();
 
     /** 帧头是否写外层 {@code bodyLen}（只有 Velocity true；Paper / Fabric 由 prepender 负责） */
     protected abstract boolean writeBodyLen();
@@ -359,19 +358,15 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
     }
 
     /**
-     * 把"当前生效的字典"装进给定压缩上下文。
+     * 把"当前生效的历史"装进给定压缩上下文。
      *
-     * <p>滚动历史优先（gen ≥ 1），否则回落到子类提供的静态字典（gen 0，协商阶段下发的那份）。</p>
+     * <p>5.0.42 起只有一种字典来源：滚动历史（{@link ZstdRollingDict}）。训练字典整套已删除
+     * ——实机对照显示它比不装还差 3.7%，而滚动历史才是那 85% 节省的来源。</p>
      */
     private void loadActiveDict(ZstdCompressCtx c) {
         byte[] bytes = rolling.activeDict();
         if (bytes != null) {
             c.loadDict(bytes);
-            return;
-        }
-        com.github.luben.zstd.ZstdDictCompress dict = compressDict();
-        if (dict != null) {
-            c.loadDict(dict);
         }
     }
 
@@ -645,7 +640,7 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
         //（16B 仍膨胀到 103.5%，靠字典预置的 Huffman/FSE 表）；滚动历史是 raw content，
         // 只有内容匹配、没有熵表，24~47B 的包压出来照样膨胀 —— 把它算作"有字典"等于每帧
         // 白跑一次 zstd（字节不会变差，压不动会退回直存，但 CPU 是白花的）。
-        if (rawTotal < Math.max(MIN_STORED_THRESHOLD, skipCompressThreshold(hasCompressDict()))) {
+        if (rawTotal < Math.max(MIN_STORED_THRESHOLD, skipCompressThreshold())) {
             try {
                 writeStoredFrames(ctx, raw, rawTotal, withBodyLen, promises);
             } catch (Throwable t) {

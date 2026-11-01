@@ -66,9 +66,11 @@ MikuMC 系列插件交流群：1105054380
 |---|---|---|---|
 | `writeBodyLen()` | `true`（无 frame-encoder，编码器自带外层长度） | `false`（prepender 负责） | `false`（prepender 负责） |
 | `onFrame(...)` | 带宽剖析 + 全局/连接统计 | 监控 + 连接统计 | HUD 统计 |
-| `skipCompressThreshold(...)` | `ZstdVelocityConfig` | `ZstdPaperConfig` | `ZstdConfig` |
-| `hasCompressDict()` | 查 `encoderDictEntry` | 查 `encoderDictEntry` | 查 `decoderDictEntry`（语义相反，见该类注释） |
-| `wantsStoredPayload()` | `true`（训练用） | `true` | `false`（不训练，零开销） |
+| `skipCompressThreshold()` | `ZstdVelocityConfig` | `ZstdPaperConfig` | `ZstdConfig` |
+| `wantsStoredPayload()` | `false` | `false` | `false` |
+
+> 5.0.42 删除训练字典后，`hasCompressDict()` / `compressDict()` 两个抽象钩子已不存在，
+> 直存阈值只剩一档（`skip_compress_below_bytes`，默认 48）。滚动历史是唯一的字典来源。
 
 ## 接入方式
 

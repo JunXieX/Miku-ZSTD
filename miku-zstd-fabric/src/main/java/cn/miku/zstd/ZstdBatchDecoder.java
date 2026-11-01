@@ -44,11 +44,11 @@ public class ZstdBatchDecoder extends ZstdBatchDecoderBase {
     /**
      * 每帧重新取解压上下文。
      *
-     * <p>⚠️ 与编码器同理：客户端重协商到"无字典"的服务器时，
-     * {@code ZstdChannelManager#resetDicts()} 会 close 旧上下文并换一个新的。
-     * 解压走的 {@code decoderDictEntry} 不是 null 的旧实例 —— 继续用会读已释放的
-     * 原生内存。读取发生在 decode（event loop）上，替换也只在 event loop 上发生
-     * （协商回调），因此不存在并发。</p>
+     * <p>⚠️ 与编码器同理：重放登录（重新协商）时 {@code ZstdChannelManager#resetContexts()}
+     * 会把旧上下文归还池、换一个新的。旧实例里绑着上一轮滚动历史算出的字典，继续用就会按
+     * 错代的字典解压 —— 帧头 {@code dictGen} 对不上，或者更糟：解出一堆看着像包的东西。
+     * 读取发生在 decode（event loop）上，替换也只在 event loop 上发生（协商回调），
+     * 因此不存在并发。</p>
      */
     @Override
     protected ZstdDecompressCtx decompressContextForFrame() {

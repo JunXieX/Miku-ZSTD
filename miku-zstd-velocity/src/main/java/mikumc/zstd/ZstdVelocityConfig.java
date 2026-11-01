@@ -17,6 +17,13 @@ import java.util.Map;
  * 窗口 17/20/23 的压缩率完全相同，但哈希表按 {@code 2^(windowLog-1) × 4B} 指数增长、
  * 且每连接一份。完整依据见下方生成的配置模板注释。</p>
  *
+ * <h2>5.0.42：训练字典已整体删除</h2>
+ * <p>实机对照显示装上 128KB 训练字典后同一批样本反而多 3.7%，而它唯一可能帮到的小包
+ * （&lt;128B）只占总字节 0.1% 且仍然膨胀。跨帧重复改由<b>滚动历史</b>承担
+ * （{@link mikumc.zstd.protocol.ZstdRollingDict}，协议内自动维护，没有对应配置项）。
+ * 因此 {@code trainer.*} 与 {@code skip_compress_below_bytes_with_dict} 两个配置段落均已删除，
+ * 旧配置文件里留着它们也不会报错（未知键被忽略）。</p>
+ *
  * <h2>3.1.0 修复</h2>
  * <p>旧实现每次 {@code load()} 都无条件调用 {@code writeConfig()}，把配置文件
  * 重置为内置模板——用户手改的等级、窗口与注释每次启动都会丢失
@@ -49,29 +56,15 @@ public class ZstdVelocityConfig {
     public final int batchMaxPackets;
 
     /**
-     * 无字典时：小于此字节数的批次直接直存，不调用 zstd。
-     * 实测（探针 10）无字典时 ≤32B 压缩后膨胀到 102~113%，跳过可同时省 CPU 与线路字节；
-     * 48B 起压缩才开始有收益，故默认取 48。
+     * 小于此字节数的批次直接直存，不调用 zstd。
+     * 实测 ≤32B 压缩后膨胀到 102~113%，48B 起压缩才开始有收益，故默认取 48。
+     *
+     * <p>⚠️ 5.0.42 删掉训练字典后只剩这一个阈值（原来的
+     * {@code skip_compress_below_bytes_with_dict} 已移除）：滚动历史生效后
+     * （gen ≥ 1）小包同样能压出收益，但判断口径仍是"这一批有多大"，
+     * 不再区分"有没有训练字典"。</p>
      */
     public final int skipCompressBelowBytes;
-    /**
-     * 有字典时：阈值更低。实测有字典时 24B 起才有收益（16B 仍膨胀到 103.5%），故默认取 24。
-     * 注意不能与无字典共用同一个值——有字典时 48B 能压到 84.8%，跳过会白白丢掉这部分收益。
-     */
-    public final int skipCompressBelowBytesWithDict;
-
-    /** 是否启用字典训练（采样 + 训练 + 下发）。默认 false，见构造函数里的实测依据。 */
-    public final boolean trainerEnabled;
-
-    public final int trainerMaxSamples;
-    public final int trainerMinSamples;
-    public final long trainerCooldownMs;
-    public final long trainerFallbackTimeoutMs;
-    public final int trainerDictMaxBytes;
-    public final int trainerSampleTargetBytes;
-    public final int trainerMaxHistorySamples;
-    public final double trainerAdoptionThreshold;
-    public final int trainerPruneMinPayload;
 
     /** BossBar 文本模板（支持 & 颜色代码与 %players%/%raw%/%wire%/%ratio% 占位符）。 */
     public final String bossbarFormat;
@@ -83,17 +76,6 @@ public class ZstdVelocityConfig {
      * {@code ZstdChannelManager} 时让 zstd-jni 抛异常，而那个构造发生在
      * <b>建连路径</b>上（握手嗅探器 / Paper 的通道初始化）——于是"一个配置打错"
      * 的后果从"zstd 不生效"恶化成"玩家连不上"。夹取把它变回无害。</p>
-     *
-     * <p>{@code dict_max_bytes} 的上限不是 1MB，而是 {@link ZstdVarInts#MAX_DICT_BYTES_PER_DIRECTION}
-     * （约 1000KB）。原因有两层，取更严的那个：</p>
-     * <ul>
-     *   <li>客户端 {@code loadOne} 会拒绝超过 0x100000（1MB）的字典并回报"不可用"，</li>
-     *   <li>更硬的一条：{@code zstd:dict} 把<b>两个方向</b>的字典放进<b>同一个包</b>，
-     *       而 MC 的单帧上限是 {@code 2^21-1 ≈ 2MB}。两方向各 1MB 会直接撑破帧上限，
-     *       客户端抛 {@code length wider than 21-bit} 并断连（不是"字典不生效"，是"进不去"）。
-     *       该包在 Paper 端还是在原版压缩启用之前发出的裸帧，不会被压缩缩小。</li>
-     * </ul>
-     * <p>夹在这里，越界配置就不会造成"训练出来的字典根本发不出去"。</p>
      */
     private ZstdVelocityConfig(Map<String, Object> map) {
         Map<String, Object> c = getMap(map, "compression");
@@ -103,29 +85,6 @@ public class ZstdVelocityConfig {
         this.batchWindowMs = clamp(getInt(c, "batch_window_ms", 50), 0, 1000);
         this.batchMaxPackets = clamp(getInt(c, "batch_max_packets", 64), 1, 4096);
         this.skipCompressBelowBytes = clamp(getInt(c, "skip_compress_below_bytes", 48), 0, 65536);
-        this.skipCompressBelowBytesWithDict =
-                clamp(getInt(c, "skip_compress_below_bytes_with_dict", 24), 0, 65536);
-
-        Map<String, Object> t = getMap(map, "trainer");
-        // ⚠️ 5.0.41 起默认 <b>关闭</b>：实机 /mikuzstd status 显示字典相对"不装字典"
-        // 反而差 3.7%（字典 350394B / 无字典 337767B），而它只可能帮到的小包
-        // 只占 0.1% 的总字节；采样却常驻 25MB 样本并周期训练。默认关掉，
-        // 想要字典的服主可以显式打开（打开后首部字典按 -2% 容差采纳）。
-        this.trainerEnabled = getBool(t, "enabled", false);
-        this.trainerMaxSamples = clamp(getInt(t, "max_samples", 10000), 16, 10_000_000);
-        // min_samples 不能超过环容量，否则训练永远不会触发（环已满也到不了门槛）
-        this.trainerMinSamples = clamp(getInt(t, "min_samples", 2000), 1, this.trainerMaxSamples);
-        // ⚠️ 5.0.38 起默认 <b>30 分钟</b>（原 5 分钟）：实机日志显示字典已收敛——连续几轮训出来的
-        // 候选都比现有字典差 1.3%（按字节加权），每 5 分钟拿 30MB 样本训一遍等于纯烧 CPU。
-        // 想彻底停掉就把这里设成 86400000（一天一次）；想立刻重训可以临时改小。
-        this.trainerCooldownMs = Math.max(0L, getLong(t, "cooldown_ms", 1_800_000));
-        this.trainerFallbackTimeoutMs = Math.max(1000L, getLong(t, "fallback_timeout_ms", 600000));
-        this.trainerDictMaxBytes = clamp(getInt(t, "dict_max_bytes", 131072), 1024,
-                mikumc.zstd.protocol.ZstdVarInts.MAX_DICT_BYTES_PER_DIRECTION);
-        this.trainerSampleTargetBytes = clamp(getInt(t, "sample_target_bytes", 1048576), 1024, 1 << 30);
-        this.trainerMaxHistorySamples = clamp(getInt(t, "max_history_samples", 20000), 0, 10_000_000);
-        this.trainerAdoptionThreshold = clampD(getDouble(t, "adoption_threshold", 0.01), 0.0, 1.0);
-        this.trainerPruneMinPayload = clamp(getInt(t, "prune_min_payload", 16), 0, 4096);
 
         Map<String, Object> l = getMap(map, "logging");
         // ⚠️ 5.0.36 起默认开启（与 Paper 端一致）：登录期问题只有 debug 日志能定位。
@@ -136,11 +95,6 @@ public class ZstdVelocityConfig {
     }
 
     private static int clamp(int value, int min, int max) {
-        if (value < min) return min;
-        return Math.min(value, max);
-    }
-
-    private static double clampD(double value, double min, double max) {
         if (value < min) return min;
         return Math.min(value, max);
     }
@@ -184,23 +138,9 @@ public class ZstdVelocityConfig {
         return o instanceof Number ? ((Number) o).intValue() : def;
     }
 
-    private static long getLong(Map<String, Object> map, String key, long def) {
-        Object o = map.get(key);
-        return o instanceof Number ? ((Number) o).longValue() : def;
-    }
-
-    private static double getDouble(Map<String, Object> map, String key, double def) {
-        Object o = map.get(key);
-        return o instanceof Number ? ((Number) o).doubleValue() : def;
-    }
-
     private static String getString(Map<String, Object> map, String key, String def) {
         Object o = map.get(key);
         return o instanceof String s && !s.isBlank() ? s : def;
-    }
-
-    private static boolean getBool(Map<String, Object> map, String key) {
-        return getBool(map, key, false);
     }
 
     /** 带默认值的布尔读取（缺失键时用它，而不是硬编码 false）。 */
@@ -212,7 +152,7 @@ public class ZstdVelocityConfig {
     // ------------------------------------------------------------------
     // 默认配置生成（全中文注释）
     // 注意：本模板仅在配置文件不存在时写入一次，之后用户的修改不会被覆盖。
-    // 模板数值必须与上面各 getInt/getLong 的默认值保持一致。
+    // 模板数值必须与上面各 getInt 的默认值保持一致。
     // ------------------------------------------------------------------
 
     private static void writeConfig(Path configPath) {
@@ -228,8 +168,8 @@ public class ZstdVelocityConfig {
 
                     compression:
                       # ── 压缩等级 (1-22) ──
-                      # 默认 3。依据是开发期探针的实测（带 128KB 字典、按批处理形态）：
-                      #   · 小包是字典收益的主战场，而高等级在这里【反而更差】——
+                      # 默认 3。依据是开发期探针的实测（按批处理形态）：
+                      #   · 小包是收益的主战场，而高等级在这里【反而更差】——
                       #     单包 64B：L3 压到 45.3%，L9 只能压到 57.8%，L3 好 12.5 个百分点；
                       #   · 数据越长高等级才越有优势：8KB 批次上 L9 好约 4 个百分点；
                       #   · 但代价悬殊：L9 的压缩耗时是 L3 的 8~12 倍（8KB 批次 173μs vs 14.7μs）；
@@ -243,7 +183,8 @@ public class ZstdVelocityConfig {
                       # 窗口决定"能记住多少历史数据用于跨包匹配"，听起来对大包有帮助，但实测
                       # （开发期探针 WindowProbe，逐值独立 JVM 测量）恰恰相反：
                       #   window_log 17 / 20 / 23 的压缩率【完全相同】——批次 29.5%、大包重复 12.5%。
-                      # 原因：小包的重复内容已被【字典】吃掉；大包（区块）多为新内容，本就匹配不到历史。
+                      # 原因：小包的重复内容已被【滚动历史】吃掉（每方向 64KB 滑窗，协议内自动维护）；
+                      # 大包（区块）多为新内容，本就匹配不到历史。
                       # 而 zstd 上下文的哈希表规模是 2^(windowLog-1) × 4B ——【指数增长】：
                       #   23 ≈ 16MB      20 ≈ 2MB      18 ≈ 0.5MB
                       # 且这是【每连接】一份（200 人在线就是 GB 级差距）。
@@ -282,59 +223,10 @@ public class ZstdVelocityConfig {
                       batch_max_packets: 64
 
                       # ── 小包跳过压缩（实测阈值，别凭感觉改）──
-                      # 无字典时：≤32B 的批次压缩后【膨胀到 102~113%】，48B 起压缩才有收益。
+                      # ≤32B 的批次压缩后【膨胀到 102~113%】，48B 起压缩才有收益。
+                      # 另外协议层还有一道 16B 的硬地板：切换握手包必须保持直存，
+                      # 否则帧层嗅探器认不出它（配置调到 16 以下也不会低于这个地板）。
                       skip_compress_below_bytes: 48
-
-                      # 有字典时阈值更低：实测 24B 起就有收益（16B 仍膨胀到 103.5%）。
-                      # ⚠️ 不要与上面共用一个值 —— 有字典时 48B 能压到 84.8%，用 48 会白丢这块收益。
-                      skip_compress_below_bytes_with_dict: 24
-
-                    trainer:
-                      # 5.0.41 起默认 false：实机对照显示字典相对"不装字典"差 3.7%
-                      #（字典 350394B / 无字典 337767B），而它能帮到的小包只占总字节 0.1%，
-                      # 采样却常驻 25MB 样本并周期训练。滚动的跨帧历史（gen≥1）不受此开关影响。
-                      enabled: false
-                      # ── 字典自动训练 ──
-                      # 字典是【小包收益的主要来源】：实测单包 64B 在无字典时压缩后膨胀到 107.8%，
-                      # 带上字典后能压到 45.3%。插件会持续采样真实流量并自动训练字典，
-                      # 训练完成后推送给客户端。
-                      # 注意口径：字典收益集中在"小包"（数量上占绝大多数），但小包只占总字节
-                      # 的一小部分 —— 所以按【总字节】加权后整体收益通常只有 1~3%。
-
-                      # 采样环容量：攒够此数量的样本后触发一次训练
-                      max_samples: 10000
-
-                      # 触发训练所需的最少样本数
-                      min_samples: 2000
-
-                      # 两次训练之间的最小间隔（毫秒），默认 5 分钟
-                      # 5.0.38 起默认 30 分钟（原 5 分钟）：实测字典已收敛，周期训练不再产出。
-                      # 彻底停用可设 86400000（一天一次）。
-                      cooldown_ms: 1800000
-
-                      # 兜底超时（毫秒）：达到 min_samples 后等待这么久即强制训练
-                      fallback_timeout_ms: 600000
-
-                      # 训练出的字典大小上限（字节），默认 128KB
-                      dict_max_bytes: 131072
-
-                      # 单轮训练的目标样本总量（字节）。
-                      # 注意：这个预算只有在样本数已达 min_samples 后才会真正封环 ——
-                      # 样本数不足时会让环继续增长（上限由 max_samples 兜住），
-                      # 否则真实流量下"1MB / 几 KB 平均包长 = 仅几百个样本"，
-                      # 每轮都会在远低于 min_samples 的状态下训练，字典质量长期偏低。
-                      sample_target_bytes: 1048576
-
-                      # 跨重启保留的历史样本上限
-                      max_history_samples: 20000
-
-                      # 新字典需比旧字典至少提升此比例才会被替换。
-                      # ⚠️ 设成 0.03 会让字典在多数服务器上【永远无法被采纳】，整个训练机制等于失效
-                      #（字典收益按总字节加权往往只有 1~3%）。首部字典不受此限：只要不劣化就采纳。
-                      adoption_threshold: 0.01
-
-                      # 采样时忽略载荷小于此值（字节）的包
-                      prune_min_payload: 16
 
                     bossbar:
                       # ── BossBar 实时监控文本（/mikuzstd bar 开关）──

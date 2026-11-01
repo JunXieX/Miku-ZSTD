@@ -7,11 +7,11 @@ import mikumc.zstd.protocol.ZstdBatchEncoderBase;
 import mikumc.zstd.protocol.ZstdCompressLock;
 
 /**
- * Miku-ZSTD 编码器（客户端 → 服务端）帧格式 <b>v6</b>（协商版本 v7）。
+ * Miku-ZSTD 编码器（客户端 → 服务端）帧格式 <b>v6</b>（协商版本 v8）。
  *
  * <p>批处理、建帧、promise 编排等全部逻辑在共享基类
  * {@link ZstdBatchEncoderBase} 中（三端同一份源码）；本类只声明客户端的
- * 六处差异：写出位置、外层长度归属、统计出口、配置来源、字典状态查询、批处理参数。</p>
+ * 五处差异：写出位置、外层长度归属、统计出口、配置来源、批处理参数。</p>
  *
  * <p><b>只管出站包 → 帧</b>：本类挂在原版 {@code compress} 的 <b>tail 侧</b>（出站先经过它），
  * 收到的是包编码器产出的 ByteBuf。成帧结果<b>不</b>经过原版 {@code compress} ——
@@ -43,11 +43,11 @@ public class ZstdBatchEncoder extends ZstdBatchEncoderBase {
     /**
      * 每批压缩前重新取一次上下文。
      *
-     * <p>⚠️ 必须动态取，不能只用 {@link #resolveCompressContext} 缓存的实例：
-     * 客户端在"重新协商到无字典的服务器"时，{@code ZstdChannelManager#resetDicts()}
-     * 会 close 旧上下文并换一个新的来清空字典（zstd 没有卸载接口）。若这里仍拿着
-     * 旧实例，压缩就会写已释放的原生内存 → SIGSEGV。读取在池线程、调用方已在
-     * {@code compressLock} 内，因此不会与替换并发。</p>
+     * <p>⚠️ 必须动态取，不能只用 {@link #resolveCompressContext} 缓存的实例：重放登录
+     * （重新协商）时 {@code ZstdChannelManager#resetContexts()} 会把旧上下文归还池、换一个新的
+     * ——滚动历史字典绑在上下文里，不换掉就会按上一轮的字典压缩（两端 dictGen 随之错位）。
+     * 若这里仍拿着旧实例，压缩写的就是已经归还池、可能被别的连接借走的内存。读取发生在池线程、
+     * 调用方已持有 {@code compressLock}，因此不会与替换并发。</p>
      */
     @Override
     protected ZstdCompressCtx compressContextForBatch() {
@@ -56,9 +56,9 @@ public class ZstdBatchEncoder extends ZstdBatchEncoderBase {
     }
 
     /**
-     * 压缩已卸载到线程池；字典由 ChannelManager 改写 {@code compressCtx}、且它负责在
-     * 关连接时 close 该上下文，所以这里必须返回<b>与它相同的那把锁</b>——否则池线程压缩
-     * 会与「换字典 / close」并发，后者是 use-after-free（SIGSEGV）。
+     * 压缩已卸载到线程池；ChannelManager 会在重新协商时换掉 {@code compressCtx}、并在关连接时
+     * 把它归还池，所以这里必须返回<b>与它相同的那把锁</b>——否则池线程压缩会与「换上下文 / 归还」
+     * 并发，写出的是别人已经借走的内存（数据错乱，极端情况下 SIGSEGV）。
      */
     @Override
     protected ZstdCompressLock compressLock() {
@@ -66,18 +66,17 @@ public class ZstdBatchEncoder extends ZstdBatchEncoderBase {
         return m == null ? super.compressLock() : m.compressLock();
     }
 
+    /**
+     * 小包跳过压缩的阈值：低于它直接直存，不调用 zstd。
+     *
+     * <p>5.0.42 删除训练字典后只剩滚动历史这一种字典来源，而它要等本方向攒够 320KB
+     * （64KB 滑窗填满 + 256KB 轮换间隔）才会第一次生效；客户端上行以几十字节的移动包为主，
+     * 绝大多数连接根本走不到那一步。因此统一按"无字典"的实测口径取一个值，
+     * 不再按方向状态分档——分档在客户端上行几乎没有命中机会，只会让配置更难理解。</p>
+     */
     @Override
-    protected boolean hasCompressDict() {
-        ZstdChannelManager m = manager;
-        return m != null && m.hasCompressDict();
-    }
-
-    @Override
-    protected int skipCompressThreshold(boolean hasCompressDict) {
-        ZstdConfig cfg = ZstdConfig.INSTANCE;
-        return hasCompressDict
-                ? cfg.skipCompressBelowBytesWithDict
-                : cfg.skipCompressBelowBytes;
+    protected int skipCompressThreshold() {
+        return ZstdConfig.INSTANCE.skipCompressBelowBytes;
     }
 
     @Override
@@ -88,12 +87,6 @@ public class ZstdBatchEncoder extends ZstdBatchEncoderBase {
     @Override
     protected int configWindowLog() {
         return ZstdConfig.INSTANCE.windowLog;
-    }
-
-    @Override
-    protected com.github.luben.zstd.ZstdDictCompress compressDict() {
-        ZstdChannelManager m = manager;
-        return m == null ? null : m.compressDict();
     }
 
     /**

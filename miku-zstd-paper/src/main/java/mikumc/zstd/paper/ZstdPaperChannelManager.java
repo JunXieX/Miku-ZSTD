@@ -20,9 +20,10 @@ import org.slf4j.LoggerFactory;
  *   <li>入站：{@code splitter} → {@code decompress} → {@code decoder}。</li>
  * </ul>
  *
- * <p>字典链路与 Velocity 端同构：{@link ZstdPaperTrainer} 从真实流量采样训练，
- * {@link ZstdPaperDictRegistry} 进程级共享并按引用计数换代释放；协商时按客户端所缺方向
- * 通过 {@code zstd:dict} 按需下发。</p>
+ * <p>5.0.42 起没有"训练字典"这一层了：跨帧匹配全部由
+ * {@link mikumc.zstd.protocol.ZstdRollingDict} 提供（每帧把最近 64KB 原始字节当字典，
+ * 两端对称维护），本类只管上下文与互斥锁，不再持有任何字典对象——省掉下发通道，
+ * 也省掉一处"两端字典不一致就断连"的故障源。</p>
  */
 public class ZstdPaperChannelManager {
 
@@ -40,15 +41,8 @@ public class ZstdPaperChannelManager {
     private final ZstdDecompressCtx decompressCtx;
 
     private volatile int negotiateTxId = -1;
-    /** zstd:dict 查询的 txId（协议 v4 按需推送字典） */
-    private volatile int dictTxId = -1;
-    /** 已取用的共享字典条目，连接关闭时归还引用 */
-    private ZstdPaperDictRegistry.Entry encoderDictEntry;
-    private ZstdPaperDictRegistry.Entry decoderDictEntry;
     private volatile boolean responseReceived;
     private volatile boolean refused;
-    private volatile boolean confirmed;
-    private volatile boolean dictRequested;
     private volatile boolean replaced;
 
     public ZstdPaperChannelManager() {
@@ -71,7 +65,7 @@ public class ZstdPaperChannelManager {
      * 压缩上下文的互斥锁。
      *
      * <p>压缩已卸载到线程池执行，因此任何改写 {@link #compressCtx} 的操作
-     * （换字典、重申帧头参数、close）都必须与池线程互斥——{@code ZstdCompressCtx} 不是线程安全的。
+     * （装载滚动历史、重申帧头参数、close）都必须与池线程互斥——{@code ZstdCompressCtx} 不是线程安全的。
      * 编码器通过 {@code ZstdBatchEncoderBase#compressLock()} 取得同一把锁。</p>
      *
      * <p>⚠️ 类型是 {@link ZstdCompressLock} 而不是 {@code Object}：它同时承载"上下文已关闭"
@@ -86,75 +80,6 @@ public class ZstdPaperChannelManager {
 
     public ZstdCompressCtx getCompressCtx() {
         return compressCtx;
-    }
-
-    /**
-     * 把共享字典装进两端上下文（仅在客户端确认就绪后调用）。
-     * 字典对象由 {@link ZstdPaperDictRegistry} 进程级共享，此处只取引用。
-     *
-     * <p>⚠️ <b>必须幂等</b>：本方法在激活路径上，而激活失败会重试
-     * （{@code ZstdPaperNegotiator.tryActivate0} 的锚点重试是<b>常态</b>——原版
-     * compress/decompress 是在 SetCompression 写出之后才安装的，首次尝试必然找不到锚点）。
-     * 每次重试都重新 {@code acquireEncoder()} 会<b>丢掉上一次引用的归还</b>：注册表引用计数
-     * 只增不减，换字典时条目永远等不到归零，那几 MB 原生字典内存就此泄漏。
-     * 现在改为"已持有则不再取"，顺带省掉重复的 {@code loadDict}。</p>
-     */
-    public void loadTrainerDicts() {
-        synchronized (compressLock) {
-        // 通道已关闭（上下文已释放）：装载字典等于写已释放的原生内存，直接放弃
-        //（正常时序下不会走到这里，此判仅作为兜底，见 ZstdCompressLock 的类注释）。
-        if (compressLock.isClosed()) return;
-        if (encoderDictEntry == null) {
-            ZstdPaperDictRegistry.Entry enc = ZstdPaperDictRegistry.acquireEncoder();
-            if (enc != null && enc.compressDict() != null) {
-                compressCtx.loadDict(enc.compressDict());
-                encoderDictEntry = enc;
-                compressCtx.setMagicless(true);
-                compressCtx.setContentSize(false);
-                compressCtx.setDictID(false);
-                LOGGER.debug("[Zstd] 已装载压缩字典 id={} ({}B)", enc.id(), enc.bytes().length);
-            }
-        }
-        if (decoderDictEntry == null) {
-            ZstdPaperDictRegistry.Entry dec = ZstdPaperDictRegistry.acquireDecoder();
-            if (dec != null && dec.decompressDict() != null) {
-                decompressCtx.loadDict(dec.decompressDict());
-                decoderDictEntry = dec;
-                decompressCtx.setMagicless(true);
-                LOGGER.debug("[Zstd] 已装载解压字典 id={} ({}B)", dec.id(), dec.bytes().length);
-            }
-        }
-        }
-    }
-
-    /** 压缩方向是否已装载字典（编码器据此选小包跳过阈值）。 */
-    /** 当前装载的压缩字典（分块并行时给临时 ctx 绑定用）；未装载返回 null。 */
-    public com.github.luben.zstd.ZstdDictCompress compressDict() {
-        ZstdPaperDictRegistry.Entry e = encoderDictEntry;
-        return e == null ? null : e.compressDict();
-    }
-
-    public boolean hasCompressDict() {
-        return encoderDictEntry != null;
-    }
-
-    public int getDictTxId() {
-        return dictTxId;
-    }
-
-    /**
-     * 抢占字典查询的 txId（只允许一次）。
-     *
-     * <p>⚠️ 与 {@link #claimNegotiateTxId(int)} 同一个理由：两条发查询的路径可能并发，
-     * 重复发出会让客户端多回一个应答，而多出来的那个应答没人认领 —— 落到
-     * {@code ServerLoginPacketListenerImpl} 就是 "unexpected query response" 断连。</p>
-     *
-     * @return 是否抢到（{@code false} 表示本连接已经推过字典，调用方应直接返回）
-     */
-    public synchronized boolean claimDictTxId(int txId) {
-        if (this.dictTxId != -1) return false;
-        this.dictTxId = txId;
-        return true;
     }
 
     public ZstdDecompressCtx getDecompressCtx() {
@@ -187,46 +112,27 @@ public class ZstdPaperChannelManager {
 
     /**
      * 回填协商结论。语义与另两端完全一致：
-     * {@code 0 = 客户端启用 zstd}、{@code 1 = 需要字典}、{@code 2 = 客户端保持原版}。
+     * {@code 0 = 客户端启用 zstd}、{@code 2 = 客户端保持原版}
+     *（5.0.42 删掉了原来的 {@code 1 = 需要字典}——滚动历史不需要任何下发）。
      *
-     * <p>两点收紧（与 Velocity 端对齐）：</p>
-     * <ul>
-     *   <li>状态码经 {@link ZstdNegotiateStatus#sanitize} 归一化，越界值不再被当成
-     *       第三种状态放行；</li>
-     *   <li>{@code confirmed} 的含义<b>必须</b>是"两个方向都是 0（就绪）"。旧实现写成
-     *       {@code confirmed = !refused}，于是 {@code (1,1)}（客户端还在等字典）也会被
-     *       判为"已确认"，本端就会在客户端尚未激活时先行激活 → 单侧 zstd → 断连。</li>
-     * </ul>
+     * <p>状态码先经 {@link ZstdNegotiateStatus#sanitize} 归一化：旧客户端的 1、以及畸形载荷里的
+     * 任何其它值都按 2 处理。"不动"永远比"单侧动"安全——服务端一旦激活、客户端没激活，
+     * 就是必断连的单侧 zstd。</p>
      *
      * @param clientAnswered 客户端是否理解了这次查询（应答的 success 位）；
      *                       false 表示它不认识该通道（多半没装模组），与"装了但版本不匹配"要分开看
      */
-    public void markResponse(int encStatus, int decStatus, boolean clientAnswered) {
+    public void markResponse(int status, boolean clientAnswered) {
         this.responseReceived = true;
-        int enc = mikumc.zstd.protocol.ZstdNegotiateStatus.sanitize(encStatus);
-        int dec = mikumc.zstd.protocol.ZstdNegotiateStatus.sanitize(decStatus);
-        this.refused = enc == mikumc.zstd.protocol.ZstdNegotiateStatus.VANILLA
-                || dec == mikumc.zstd.protocol.ZstdNegotiateStatus.VANILLA;
-        this.confirmed = !this.refused
-                && enc == mikumc.zstd.protocol.ZstdNegotiateStatus.READY
-                && dec == mikumc.zstd.protocol.ZstdNegotiateStatus.READY;
+        int s = mikumc.zstd.protocol.ZstdNegotiateStatus.sanitize(status);
+        this.refused = s == mikumc.zstd.protocol.ZstdNegotiateStatus.VANILLA;
         if (!clientAnswered) {
             LOGGER.debug("[Zstd] 客户端未识别 zstd:negotiate（未安装 Miku-ZSTD 模组），保持原版 zlib");
         } else if (this.refused) {
-            LOGGER.debug("[Zstd] 客户端拒绝 zstd（enc={} dec={}）——多为两端版本不匹配，保持原版 zlib", enc, dec);
+            LOGGER.debug("[Zstd] 客户端保持原版（status={}）——多为两端版本不匹配", s);
         } else {
-            LOGGER.debug("[Zstd] 协商应答：enc={} dec={} confirmed={}", enc, dec, this.confirmed);
+            LOGGER.debug("[Zstd] 协商应答：status={} → 可激活", s);
         }
-    }
-
-    /** 客户端报告过"缺字典"（协议 v4 需先推 {@code zstd:dict}）。 */
-    public void markDictRequested() {
-        this.dictRequested = true;
-    }
-
-    /** 客户端是否报告过缺字典——激活前必须等字典确认，见 {@code ZstdPaperNegotiator} 的硬门控。 */
-    public boolean isDictRequested() {
-        return dictRequested;
     }
 
     public boolean isResponseReceived() {
@@ -236,10 +142,6 @@ public class ZstdPaperChannelManager {
     /** 客户端明确拒绝（协议不匹配等）——必须回落原版 zlib。 */
     public boolean isRefused() {
         return refused;
-    }
-
-    public boolean isConfirmed() {
-        return confirmed;
     }
 
     public boolean isReplaced() {
@@ -493,16 +395,6 @@ public class ZstdPaperChannelManager {
             // 归还而非关闭：池内部会 reset（清字典与参数），池满或已停用时才真正 close
             ZstdCtxPool.returnCompress(compressCtx);
             ZstdCtxPool.returnDecompress(decompressCtx);
-        }
-        ZstdPaperDictRegistry.Entry enc = encoderDictEntry;
-        if (enc != null) {
-            encoderDictEntry = null;
-            enc.release();
-        }
-        ZstdPaperDictRegistry.Entry dec = decoderDictEntry;
-        if (dec != null) {
-            decoderDictEntry = null;
-            dec.release();
         }
     }
 }

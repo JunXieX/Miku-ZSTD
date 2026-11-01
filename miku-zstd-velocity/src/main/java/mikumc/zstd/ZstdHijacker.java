@@ -27,8 +27,8 @@ import java.util.concurrent.TimeUnit;
  *   <li><b>协商</b>：首个出站包写出前发送 {@code zstd:negotiate} 登录查询
  *       （该时刻客户端登录监听器必然就绪）；</li>
  *   <li><b>应答</b>：拦截客户端回包 LoginPluginResponsePacket（txId 匹配；Velocity 内部类型，
- *       反射访问，见下方字段注释），解析字典状态回填
- *       {@link ZstdChannelManager#markDictResponse}——该包的 txId
+ *       反射访问，见下方字段注释），解析后再回填
+ *       {@link ZstdChannelManager#markNegotiateResponse}——该包的 txId
  *       不属于 Velocity 内核 inflight 列表，在此消费最干净；</li>
  *   <li><b>激活</b>：检测到 SetCompression 写出时启动管线接管（插入而非替换）。激活前按门控
  *       等待协商应答（100ms × 20 重试，超时/版本不匹配则放弃 zstd 回落原版）；
@@ -44,7 +44,7 @@ import java.util.concurrent.TimeUnit;
  *       是不必要的热路径成本；</li>
  *   <li>激活前<b>先校验两端锚点齐备</b>再动手安装，避免"只装上编码器"这类
  *       单侧 zstd 的必断连组合；</li>
- *   <li>VarInt 与字典读取统一走 {@link ZstdVarInts} / {@link ZstdDictRegistry}。</li>
+ *   <li>VarInt 读取统一走 {@link ZstdVarInts}。</li>
  * </ul>
  */
 public class ZstdHijacker extends ChannelDuplexHandler {
@@ -128,29 +128,6 @@ public class ZstdHijacker extends ChannelDuplexHandler {
     private static final int RESPONSE_MAX_RETRIES = 20;
 
     /**
-     * 「已推送 {@code zstd:dict}、正在等其应答」阶段的重试次数（合计约 10s）。
-     *
-     * <p>⚠️ 这一阶段<b>不能</b>沿用上面那个 2s 预算，否则会产出一个<b>必断连</b>组合，
-     * 而不是安全回落：</p>
-     * <ol>
-     *   <li>两个阶段共用同一个 {@code attempt} 计数器（从 SetCompression 写出时开始累加），
-     *       协商应答本身就要吃掉一个 RTT；</li>
-     *   <li>字典阶段要传输的是<b>字典字节</b>——两个方向各最多 {@code dict_max_bytes}
-     *       （默认 128KB、配置上限 1MB，即最多 2MB），客户端还要做 CRC32 校验并构建
-     *       {@code ZstdDictCompress/Decompress}（实测约 3.2MB 的原生预计算）；</li>
-     *   <li>慢链路（移动网络 / 跨境 / 拥塞）下 256KB 就可能超过剩余的 1~2s。</li>
-     * </ol>
-     * <p>一旦超时，本端按"回落原版"补发扣住的包并保持 vanilla zlib；而客户端那边
-     * <b>字典已经装载成功</b>，它会在应答写出后照常切到 zstd —— 于是形成
-     * 「服务端 zlib / 客户端 zstd」，双向都解析错乱、必然断连。
-     * 这与本项目到处防范的那类缺陷完全同型，只是触发条件从"逻辑漏判"变成了"预算不够"。</p>
-     *
-     * <p>取 10s 的取舍：足以让 2MB 字典在约 200KB/s 的慢链路上跑完；同时它有界，
-     * 真正死掉的连接最多让登录卡 10s 后回落原版，不会无限期挂住。</p>
-     */
-    private static final int DICT_RESPONSE_MAX_RETRIES = 100;
-
-    /**
      * 取"发送登录期查询包"的写入位置：<b>只能用 {@code minecraft-encoder} 的 context</b>。
      *
      * <p>⚠️ 这里曾经优先用 {@code compression-encoder} 的 context（还在其上手工拼 MC 压缩帧）。
@@ -162,8 +139,8 @@ public class ZstdHijacker extends ChannelDuplexHandler {
      * ①外层长度由更早加入的处理器补齐；②压缩一旦启用，原版 compression-encoder 会<b>自己按阈值</b>
      * 处理（小包直存 / 大包 deflate）—— 所以我们既不需要、也不应该手工拼 MC 的压缩帧。</p>
      *
-     * <p>⚠️ 协议 v7 把编码器改成"插在原版压缩处理器旁边"之后，这两处（negotiate / dict）
-     * <b>仍然不能</b>挪到 {@code compression-encoder} 的 context：它们写的是<b>裸 MC 包</b>，
+     * <p>⚠️ 协议 v7 把编码器改成"插在原版压缩处理器旁边"之后，这里（negotiate）
+     * <b>仍然不能</b>挪到 {@code compression-encoder} 的 context：它写的是<b>裸 MC 包</b>，
      * 长度前缀与压缩都得靠管线补齐；从压缩处理器之后写出等于把这一层补全一起跳过，
      * 又回到上面那个"帧长为 0"的崩法。真正的"写帧"位置是另一个方法
      *（见 {@link #compressionWriteCtx}）—— 两者的区别是"写包"还是"写帧"。</p>
@@ -200,16 +177,16 @@ public class ZstdHijacker extends ChannelDuplexHandler {
      * <p>只有当 SetCompression 已经写出（{@code pipelineActivated}）时才动手：
      * 否则我们会先于 Velocity 的 setupCompression 改动管线，随后被原版压缩处理器覆盖。</p>
      */
-    public void onDictResponseReceived() {
+    public void onAnswerReceived() {
         ChannelHandlerContext c = this.selfCtx;
         if (c == null || !pipelineActivated) return;
         c.channel().eventLoop().execute(() -> tryActivate(c, 0));
     }
 
     /** 供嗅探器按通道调用（无处理器时静默忽略）。 */
-    public static void notifyDictResponse(io.netty.channel.Channel channel) {
+    public static void notifyAnswerReceived(io.netty.channel.Channel channel) {
         ZstdHijacker h = channel.pipeline().get(ZstdHijacker.class);
-        if (h != null) h.onDictResponseReceived();
+        if (h != null) h.onAnswerReceived();
     }
 
     @Override
@@ -226,42 +203,18 @@ public class ZstdHijacker extends ChannelDuplexHandler {
             // 其它插件发起的、txId 恰为 0 的登录查询应答会被我们误吞
             Object idValue = invokeOrNull(M_RESP_ID, msg);
             int txId = idValue instanceof Number n ? n.intValue() : 0;
-            boolean isNegotiate = mgr.getNegotiateTxId() != 0 && txId == mgr.getNegotiateTxId();
-            boolean isDict = mgr.getDictTxId() != 0 && txId == mgr.getDictTxId();
-            if (isNegotiate || isDict) {
+            if (mgr.getNegotiateTxId() != 0 && txId == mgr.getNegotiateTxId()) {
                 try {
                     Object contentValue = invokeOrNull(M_RESP_CONTENT, msg);
                     ByteBuf data = contentValue instanceof ByteBuf bb ? bb : null;
                     boolean success = Boolean.TRUE.equals(invokeOrNull(M_RESP_SUCCESS, msg));
-                    int encStatus = ZstdNegotiateStatus.VANILLA;
-                    int decStatus = ZstdNegotiateStatus.VANILLA;
-                    if (success && data != null && data.readableBytes() >= 2) {
-                        encStatus = readStatus(data);
-                        decStatus = readStatus(data);
+                    int status = ZstdNegotiateStatus.FALLBACK;
+                    if (success && data != null && data.readableBytes() >= 1) {
+                        status = readStatus(data);
                     }
-                    if (isNegotiate && needsDictPush(encStatus, decStatus)) {
-                        // 协议 v4：客户端报告缺字典 —— 单独推送一次 zstd:dict，
-                        // 门控结论等这次推送的应答到达后再定（见 markDictResponse 调用点）。
-                        // ⚠️ 只有第一次请求才推：重放的应答若再推一遍，不仅白传整份字典
-                        //（默认 2×128KB，上限 2×1MB），还会把 dictTxId 覆盖成新值，
-                        // 让前一次的应答从此无人认领。
-                        if (!mgr.markDictRequested()) {
-                            return; // 已经在等字典应答
-                        }
-                        if (!sendDictQuery(ctx.channel(), ZstdNegotiateStatus.needsDict(encStatus),
-                                ZstdNegotiateStatus.needsDict(decStatus))) {
-                            // 推送没发出去（字典过大 / 锚点缺失）：立即回落原版，
-                            // 不要白等满 10 秒的字典阶段预算。
-                            LOGGER.warn("[Zstd] zstd:dict 未能发出 — 立即回落原版");
-                            giveUp(ctx);
-                            return;
-                        }
-                    } else {
-                        mgr.markDictResponse(encStatus, decStatus, success);
-                        if (isDict) {
-                            ZstdHijacker.notifyDictResponse(ctx.channel());
-                        }
-                    }
+                    mgr.markNegotiateResponse(status, success);
+                    // 立即触发激活（若 SetCompression 已写出），省掉最长 100ms 的轮询等待
+                    ZstdHijacker.notifyAnswerReceived(ctx.channel());
                 } finally {
                     ReferenceCountUtil.release(msg);
                 }
@@ -526,7 +479,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
         }
     }
 
-    /** 门控激活：等待协商应答；版本不匹配/字典未确认/超时则放弃（原版 zlib 全程接管）。 */
+    /** 门控激活：等待协商应答；客户端保持原版/超时则放弃（原版 zlib 全程接管）。 */
     private void tryActivate0(ChannelHandlerContext ctx, int attempt) {
         Channel channel = ctx.channel();
         if (!channel.isActive() || pipelineRemoved(channel)) return;
@@ -534,20 +487,13 @@ public class ZstdHijacker extends ChannelDuplexHandler {
         ZstdChannelManager mgr = channel.attr(ZstdChannelManager.KEY).get();
         if (mgr == null || mgr.isReplaced()) return;
 
-        if (!mgr.isDictResponseReceived()) {
-            // ⚠️ 预算必须分阶段：等"协商应答"只要一个 RTT（2s 足够），而等"字典应答"
-            // 要传完字典字节 + 客户端建好原生字典（最多 2MB，慢链路上远超 2s）。
-            // 用同一个 2s 预算会在慢链路上超时回落，而客户端那边字典已到、照常切 zstd
-            // → 单侧 zstd → 断连。详见 DICT_RESPONSE_MAX_RETRIES 的注释。
-            int maxRetries = mgr.isDictRequested() ? DICT_RESPONSE_MAX_RETRIES : RESPONSE_MAX_RETRIES;
-            if (attempt >= maxRetries) {
-                // ⚠️ 这句日志必须能自证"卡在哪一步"：只写"超时"无法区分
-                //「协商应答就没收到」与「协商应答收到了、字典也推了，但字典应答没回来」，
-                // 而两者的排查方向完全相反（前者看客户端有没有收到查询，后者看推送有没有被接受）。
+        if (!mgr.isAnswerReceived()) {
+            // 协议 v8 只剩一段等待：negotiate 的应答（一个 RTT）。原来"字典推送 → 等字典应答"
+            // 那一段 10s 预算随训练字典一起删掉了，所以这里只需一个 2s 上限。
+            if (attempt >= RESPONSE_MAX_RETRIES) {
                 LOGGER.warn("[Zstd] Negotiate response not received after {}ms — closing connection"
-                                + "（字典已请求={} 字典已确认={}；字典已请求=false 表示连协商应答都没收到）",
-                        RESPONSE_RETRY_MS * maxRetries,
-                        mgr.isDictRequested(), mgr.isDictConfirmed());
+                                + "（客户端没有回 packet id 0x02 的 login plugin 应答）",
+                        RESPONSE_RETRY_MS * RESPONSE_MAX_RETRIES);
                 // ⚠️ 完全没应答只可能是异常（原版客户端也会回 success=false 走 isProtocolMismatch）。
                 // 按原版补发扣包时，对端若其实是模组客户端（应答丢了），它已切 zstd → 必断连。
                 // 明确关连接，让客户端重连一次，故障也更可见。
@@ -569,14 +515,11 @@ public class ZstdHijacker extends ChannelDuplexHandler {
             return;
         }
 
-        // ⚠️ 协议 v4 硬门控（必需，不能只依赖"应答已到"）：
-        // 客户端报告过"缺字典"，但最终没有确认字典就绪 —— 推送丢失、客户端加载失败、
-        // 或该应答在帧层被别的捕获点消费掉了。此时**绝不能激活**：客户端会因为等字典
-        // 停在 PLAIN 状态永不激活，于是服务端 zstd / 客户端 vanilla → 必断连。
-        // 宁可回落原版（少一点压缩率），也不能让玩家进不去。
-        if (mgr.isDictRequested() && !mgr.isDictConfirmed()) {
-            LOGGER.warn("[Zstd] 客户端请求了字典但未确认就绪（zstd:dict 应答缺失）"
-                    + "— 放弃 zstd 并回落原版，避免单侧 zstd 断连");
+        // ⚠️ 门控不能只看"应答已到"：客户端答复"保持原版"时同样已经应答，
+        // 但此时激活就是单侧 zstd（服务端 zstd / 客户端 vanilla → 必断连）。
+        // 唯一正面判据是 status == 0（isClientReady）。
+        if (!mgr.isClientReady()) {
+            LOGGER.warn("[Zstd] 客户端未答复就绪（status!=0）— 放弃 zstd 并回落原版，避免单侧 zstd 断连");
             giveUp(ctx); // 回落原版：补发扣下的包 + 摘掉自身
             return;
         }
@@ -638,15 +581,8 @@ public class ZstdHijacker extends ChannelDuplexHandler {
             return false;
         }
 
-        // 字典门控：仅客户端确认就绪时加载字典
-        if (mgr.isDictConfirmed()) {
-            mgr.loadTrainerDicts();
-        } else {
-            // ⚠️ 不能在这里排除"无字典"：没有字典时协商少了一轮字典往返，服务端往往
-            // 在客户端还没处理到 SetCompression 时就已激活——原版帧会晚到几个包，
-            // 正是基类 acceptsLegacyFrames 兜住的切换窗口。debug 即可，这是正常路径。
-            LOGGER.debug("[Zstd] Activating without trained dicts (client not ready) — compression still active");
-        }
+        // 这里原先要"按门控装载训练字典"，5.0.42 起训练字典整体删除：跨帧重复由协议基类的
+        // 滚动历史（每方向 64KB 滑窗）在帧边界自动维护，本端不需要任何准备动作。
 
         // ⚠️ 先在**代码路径上**把两个处理器都装上，成功了才置 replaced。
         //
@@ -681,10 +617,9 @@ public class ZstdHijacker extends ChannelDuplexHandler {
 
         mgr.setReplaced(true); // 计数已内聚在 setReplaced 内（幂等）
 
-        // ⚠️ 字段名必须如实：这里打印的是"客户端答了 READY"（isDictConfirmed），不是"装了字典"。
-        // 旧标签写 dict=，运维会以为服务端加载了训练字典；实际 negotiate 里 encId/decId 都为 0 时
-        // 两边都没字典，看到 dict=true 只会把排查方向带偏（2026-11-01 实机就差点被它误导）。
-        LOGGER.info("[Zstd] Zstd transport activated (client-ready={})", mgr.isDictConfirmed());
+        // ⚠️ 字段名必须如实：这里打印的是"客户端答了就绪"（status==0），不是"装了字典"。
+        // 训练字典已删除，任何形如 dict=true 的标签都只会把排查方向带偏。
+        LOGGER.info("[Zstd] Zstd transport activated (client-ready={})", mgr.isClientReady());
 
         // ⚠️ 切换闸门此刻正扣着登录期的大帧（例如 LoginSuccess 压缩帧），
         // 客户端在收到它之前不可能完成登录，也就没有任何东西会触发它的切换。
@@ -779,99 +714,24 @@ public class ZstdHijacker extends ChannelDuplexHandler {
                 mgr.setNegotiateTxId(txId);
             }
 
-            long encId = ZstdDictRegistry.encoderDictId();
-            long decId = ZstdDictRegistry.decoderDictId();
-
             ByteBuf buf = writeCtx.alloc().buffer();
             try {
                 ZstdVarInts.write(buf, 0x04);
                 ZstdVarInts.write(buf, txId);
                 ZstdVarInts.writeString(buf, "zstd:negotiate");
+                // 协议 v8：载荷只有协议版本（4 字节大端）。字典 id / flags 随训练字典一起删掉了，
+                // 客户端只需回一个状态字节，告诉本端"就绪"还是"保持原版"。
                 buf.writeInt(ZstdChannelManager.PROTOCOL_VERSION);
-                buf.writeLong(encId);
-                buf.writeLong(decId);
-                byte flags = 0;
-                if (encId != 0) flags |= 1;
-                if (decId != 0) flags |= 2;
-                buf.writeByte(flags);
-
-                // 协议 v4：字典不再内联——只声明 id，客户端缺哪个再单独推 zstd:dict
 
                 writeCtx.writeAndFlush(buf);
-                LOGGER.debug("[Zstd] Sent zstd:negotiate txId={} encId={} decId={}", txId, encId, decId);
+                LOGGER.debug("[Zstd] Sent zstd:negotiate txId={} version={}",
+                        txId, ZstdChannelManager.PROTOCOL_VERSION);
             } catch (Throwable t) {
                 if (buf.refCnt() > 0) buf.release();
                 throw t;
             }
         } catch (Exception e) {
             LOGGER.error("[Zstd] Failed to send negotiate", e);
-        }
-    }
-
-    /**
-     * 协议 v4：按需推送字典（仅当客户端报告某个方向缺字典时）。
-     *
-     * <p>与 negotiate 分开的原因：直连场景（Paper 端）无法预筛客户端，
-     * 若把几百 KB 的字典内联进 negotiate，不支持 zstd 的客户端也要白吃这份流量。</p>
-     *
-     * <p>包可见：帧层嗅探器（{@link ZstdNegotiateAnswerSniffer}）捕获到 negotiate 应答后
-     * 也要走这条路——它是主路径，且应答在帧层就被消费掉了，Hijacker 的包层分支看不到。</p>
-     *
-     * @return 是否确实发出；{@code false} 表示字典过大或写锚点缺失，
-     *         调用方应立即触发回落（否则只能白等满一个字典阶段的应答预算）
-     */
-    static boolean sendDictQuery(Channel channel, boolean needEncoder, boolean needDecoder) {
-        try {
-            ZstdChannelManager mgr = channel.attr(ZstdChannelManager.KEY).get();
-            if (mgr == null) return false;
-            ChannelHandlerContext writeCtx = loginQueryWriteCtx(channel.pipeline());
-            if (writeCtx == null) {
-                LOGGER.warn("[Zstd] cannot send zstd:dict — minecraft-encoder anchor missing");
-                return false;
-            }
-
-            int txId = ThreadLocalRandom.current().nextInt(1, Integer.MAX_VALUE);
-            mgr.setDictTxId(txId);
-
-            byte[] enc = needEncoder ? ZstdDictRegistry.encoderDictBytes() : null;
-            byte[] dec = needDecoder ? ZstdDictRegistry.decoderDictBytes() : null;
-            // ⚠️ 兜底：本包把两个方向的字典放在一起，而 MC 单帧上限是 2^21-1。
-            // 配置那边已按 MAX_DICT_BYTES_PER_DIRECTION 夹取，这里再挡一次——
-            // 因为字典文件是磁盘上的产物（可能是旧版本/手改过的），不能假设它守规矩。
-            // 超限时放弃推送（客户端会停在"等字典"→ 服务端随后按硬门控安全回落原版），
-            // 总好过发出一个客户端必然拒绝的超长帧（那是"进不去"，比"没压缩"严重得多）。
-            long payload = (long) (enc == null ? 0 : enc.length + 8)
-                    + (long) (dec == null ? 0 : dec.length + 8);
-            if (payload + 64 > ZstdVarInts.MC_MAX_FRAME_BYTES) {
-                LOGGER.warn("[Zstd] 字典过大，拒绝推送（enc={}B dec={}B，合帧上限 {}B）"
-                                + "— 本连接将回落原版；请调小 trainer.dict_max_bytes",
-                        enc == null ? 0 : enc.length, dec == null ? 0 : dec.length,
-                        ZstdVarInts.MC_MAX_FRAME_BYTES);
-                return false;
-            }
-            byte flags = 0;
-            if (enc != null && enc.length > 0) flags |= 1;
-            if (dec != null && dec.length > 0) flags |= 2;
-
-            ByteBuf buf = writeCtx.alloc().buffer();
-            try {
-                ZstdVarInts.write(buf, 0x04);
-                ZstdVarInts.write(buf, txId);
-                ZstdVarInts.writeString(buf, "zstd:dict");
-                buf.writeByte(flags);
-                if (enc != null && enc.length > 0) writeDictBytes(buf, enc);
-                if (dec != null && dec.length > 0) writeDictBytes(buf, dec);
-                writeCtx.writeAndFlush(buf);
-                LOGGER.info("[Zstd] 已推送 zstd:dict txId={} flags={} (enc={}B dec={}B)，等待其应答",
-                        txId, flags, enc == null ? 0 : enc.length, dec == null ? 0 : dec.length);
-                return true;
-            } catch (Throwable t) {
-                if (buf.refCnt() > 0) buf.release();
-                throw t;
-            }
-        } catch (Exception e) {
-            LOGGER.error("[Zstd] Failed to send dict query", e);
-            return false;
         }
     }
 
@@ -897,13 +757,6 @@ public class ZstdHijacker extends ChannelDuplexHandler {
             // 反射不可用：按"未知"处理，继续协商
         }
         return UNKNOWN_THRESHOLD;
-    }
-
-    /** 线上字典帧：{@code [int crc32][int len][bytes]}；crc 必须与字典 id 同源。 */
-    private static void writeDictBytes(ByteBuf buf, byte[] dict) {
-        buf.writeInt(mikumc.zstd.protocol.ZstdDictId.wireChecksum(dict));
-        buf.writeInt(dict.length);
-        buf.writeBytes(dict);
     }
 
     /**
@@ -972,20 +825,9 @@ public class ZstdHijacker extends ChannelDuplexHandler {
         }
     }
 
-    /**
-     * 客户端是否在 negotiate 应答里报告了"缺字典"（协议 v4 需要先推一次 {@code zstd:dict}）。
-     *
-     * <p><b>两条捕获点（包层 Hijacker / 帧层嗅探器）必须用同一份判断</b>——
-     * 以前帧层嗅探器少了这个分支，导致服务端跳过字典推送就直接激活，
-     * 而客户端因为"等字典"停在 PLAIN 状态永不激活 → 单侧 zstd → 断连。</p>
-     */
     /** 是否是服务器列表 ping 的响应（STATUS 阶段唯一的出站包）。 */
     private static boolean isStatusResponse(Object msg) {
         return msg != null && msg.getClass().getName().endsWith("StatusResponse");
-    }
-
-    static boolean needsDictPush(int encStatus, int decStatus) {
-        return ZstdNegotiateStatus.needsDict(encStatus) || ZstdNegotiateStatus.needsDict(decStatus);
     }
 
     /**

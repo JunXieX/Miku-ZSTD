@@ -88,8 +88,8 @@ public class ZstdHandshakeSniffer extends MessageToMessageDecoder<ByteBuf> {
                 LOGGER.debug("[Zstd] Sniffer injected spy before login processing; pipeline={}", p.names());
             }
             // 帧层应答嗅探：必须位于压缩解码器之前，否则离线模式下应答会被原版压缩
-            // 解码器当作压缩帧丢弃。它同时负责 negotiate 与 zstd:dict 两种应答
-            //（详见 ZstdNegotiateAnswerSniffer 的类注释）。
+            // 解码器当作压缩帧丢弃（详见 ZstdNegotiateAnswerSniffer 的类注释）。
+            // 协议 v8 只有 negotiate 一种应答，zstd:dict 通道已随训练字典一起删除。
             if (p.get("zstd-negotiate-answer") == null) {
                 p.addAfter(ctx.name(), "zstd-negotiate-answer", new ZstdNegotiateAnswerSniffer());
                 LOGGER.debug("[Zstd] Negotiate-answer sniffer installed at frame level");

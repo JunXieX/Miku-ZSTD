@@ -5,34 +5,20 @@ import com.github.luben.zstd.ZstdDecompressCtx;
 import mikumc.zstd.protocol.ZstdCtxPool;
 import io.netty.util.AttributeKey;
 import mikumc.zstd.protocol.ZstdCompressLock;
-import mikumc.zstd.protocol.ZstdNegotiateStatus;
-import mikumc.zstd.protocol.ZstdVarInts;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 /**
- * 每连接上下文：zstd 压缩/解压上下文、字典加载、传输状态。
+ * 每连接上下文：zstd 压缩/解压上下文与传输状态。
  *
- * <p><b>协商版本 v5</b>（{@link #PROTOCOL_VERSION}），<b>帧格式 v4</b>：
- * 客户端→服务端 {@code [rawSize][zstd(payload)|packet]}（prepender 负责外层长度）；
+ * <p><b>协商版本 v8</b>（{@link #PROTOCOL_VERSION}），<b>帧格式 v6</b>：
+ * 客户端→服务端 {@code [rawSize][zstd(payload)|packet]}（外层长度由 prepender 补）；
  * 服务端→客户端 {@code [bodyLen][rawSize][zstd(payload)|packet]}
  * （bodyLen 由服务端编码器自带，已被 frame-decoder 剥离）。{@code rawSize == 0} 表示直存：
  * 帧体恰好是一个包（{@code [0][packet]}），与原版未压缩帧逐字节同形。</p>
  *
- * <p>⚠️ 注意与 Velocity 端的语义差异——客户端的 "encoder" 字典用于<b>解压</b>
- * 服务端发来的数据，"decoder" 字典用于<b>压缩</b>发往服务端的数据。
- * 命名是从"对端那个方向"来的：服务端用它的 encoder 字典压缩，本端就用同一份去解压。</p>
- *
- * <h2>3.1.0 变更</h2>
- * <ul>
- *   <li>字典对象改由 {@link ZstdDictRegistry} 全进程共享并按引用计数释放
- *       （旧实现每次登录都重建 3.2MB 的 {@code ZstdDictCompress} 且从不释放）；</li>
- *   <li>VarInt 收敛到 {@link ZstdVarInts}；</li>
- *   <li>删除从未被赋值的 {@code expectedDictId} 与 {@code finishConfigPending}——
- *       它们是 v3 内联字典时代的残留；v4 改成"按需推送"后，这条链路由
- *       {@code ZstdLoginNetworking.handleDict} 承担（服务端确会主动推 {@code zstd:dict}，
- *       客户端收到后加载并回状态）。</li>
- * </ul>
+ * <p>5.0.42 起训练字典整套删除：不再有协商下发、本地缓存、上下文装载。两个上下文里唯一的
+ * "字典"是滚动历史——两端各自从这条连接的原始字节流现算，每帧向前引用最近 64KB，
+ * <b>不经过网络</b>（见 {@code mikumc.zstd.protocol.ZstdRollingDict}）。因此本类只剩两件事：
+ * 上下文的生命周期，以及压缩方向那把锁。</p>
  */
 public class ZstdChannelManager {
 
@@ -45,33 +31,12 @@ public class ZstdChannelManager {
     /**
      * 压缩/解压上下文。
      *
-     * <p>⚠️ 非 final：{@link #resetDicts()} 需要用新上下文来"卸载字典"
-     * （zstd 没有卸载接口）。所有读写都必须在 {@code compressLock} 内完成 —— 池线程
-     * 通过该锁取用，因此替换上下文与压缩执行互斥，不会拿到已 close 的实例。</p>
+     * <p>⚠️ 非 final：{@link #resetContexts()} 用"换一个新实例"来丢掉旧上下文里绑定的
+     * 滚动历史字典（zstd 没有卸载接口）。所有读写都必须在 {@code compressLock} 内完成 ——
+     * 池线程通过该锁取用，因此替换上下文与压缩执行互斥，不会拿到已被归还池的实例。</p>
      */
     private ZstdCompressCtx compressCtx;
     private ZstdDecompressCtx decompressCtx;
-    /**
-     * 已取用的共享字典条目，连接关闭时归还引用。
-     *
-     * <p>⚠️ volatile：{@code hasCompressDict()} 会被<b>压缩池线程</b>调用（编码器据此选
-     * 小包跳过阈值），而装载发生在 event loop 上；非 volatile 时池线程可能一直读到 null。</p>
-     */
-    private volatile ZstdDictRegistry.Entry encoderDictEntry;
-    private ZstdDictRegistry.Entry decoderDictEntry;
-
-    /**
-     * 协商阶段算出的两个方向的状态（取值见 {@link ZstdNegotiateStatus}）。
-     *
-     * <p>⚠️ 必须留着：服务端只会推送<b>客户端所缺</b>的方向（它的 flags 完全来自本端应答里的
-     * NEED_DICT），所以 {@code zstd:dict} 里<b>没被 flags 点名</b>的方向要沿用这里的状态 ——
-     * 不能当作"不可用"，那会让服务端判定客户端拒绝并让整条链路回落原版
-     * （详见 {@code ZstdLoginNetworking.handleDict}）。</p>
-     *
-     * <p>默认 {@code VANILLA}：万一没有协商过就收到字典推送，两端都会安全地保持原版。</p>
-     */
-    private volatile int encoderDirStatus = ZstdNegotiateStatus.VANILLA;
-    private volatile int decoderDirStatus = ZstdNegotiateStatus.VANILLA;
 
     public ZstdChannelManager() {
         ZstdConfig cfg = ZstdConfig.INSTANCE;
@@ -89,7 +54,7 @@ public class ZstdChannelManager {
      * <ul>
      *   <li>{@code magicless}：省 4 字节 magic（对几十字节的小包占比可观）；</li>
      *   <li>{@code contentSize=false}：省 1~4 字节——解压尺寸由协议里的 rawSize 提供；</li>
-     *   <li>{@code dictID=false}：省 1~4 字节——字典由双方显式加载。</li>
+     *   <li>{@code dictID=false}：省 1~4 字节——字典是两端各自算出的滚动历史，帧里不用带 id。</li>
      * </ul>
      *
      * <p>三者都只是"不再重复写入双方已知的信息"，语义不变。实测（每包一帧）可再省约 10.7%。
@@ -106,8 +71,9 @@ public class ZstdChannelManager {
      * 压缩上下文的互斥锁。
      *
      * <p>压缩已卸载到线程池执行，因此任何改写 {@link #compressCtx} 的操作
-     * （换字典、重申帧头参数、close）都必须与池线程互斥——{@code ZstdCompressCtx} 不是线程安全的。
-     * 编码器通过 {@code ZstdBatchEncoderBase#compressLock()} 取得同一把锁。</p>
+     * （重新协商换上下文、重申帧头参数、归还池）都必须与池线程互斥——
+     * {@code ZstdCompressCtx} 不是线程安全的。编码器通过
+     * {@code ZstdBatchEncoderBase#compressLock()} 取得同一把锁。</p>
      *
      * <p>⚠️ 类型是 {@link ZstdCompressLock} 而不是 {@code Object}：它同时承载"上下文已关闭"
      * 标志，池线程在锁内读它来避免 use-after-free（详见该类注释）。</p>
@@ -121,35 +87,14 @@ public class ZstdChannelManager {
 
     /**
      * 当前压缩上下文。<b>调用方必须已持有 {@link #compressLock()}</b>：
-     * {@link #resetDicts()} 会在锁内替换实例，锁外读取可能拿到已被 close 的旧实例。
+     * {@link #resetContexts()} 会在锁内替换实例，锁外读取可能拿到已被归还池的旧实例。
      */
     public ZstdCompressCtx getCompressCtx() {
         return compressCtx;
     }
 
     /**
-     * 压缩方向是否已装载字典。编码器据此选择"小包跳过压缩"的阈值：
-     * 实测无字典时 48B 以下压缩反而膨胀，有字典时 24B 起才有收益（见 ZstdConfig）。
-     */
-    /**
-     * 当前装载的压缩字典（分块并行的临时 ctx 用）；未装载返回 null。
-     *
-     * <p>⚠️ 客户端的方向字段名与服务端相反：{@code encoderDictEntry} 装的是对端的
-     * <b>解压</b>字典（客户端"编码"时要用它来压缩，但条目里只有解压对象），真正可用于
-     * 压缩的是 {@code decoderDictEntry}。照抄服务端实现会恒返回 null，
-     * 表现为 ≥512KB 的帧走分块时不绑字典、压缩率比同连接的小包还差。</p>
-     */
-    public com.github.luben.zstd.ZstdDictCompress compressDict() {
-        ZstdDictRegistry.Entry e = decoderDictEntry;
-        return e == null ? null : e.compressDict();
-    }
-
-    public boolean hasCompressDict() {
-        return decoderDictEntry != null;
-    }
-
-    /**
-     * 当前解压上下文。解压只在 event loop 上发生，而 {@link #resetDicts()} 也只在
+     * 当前解压上下文。解压只在 event loop 上发生，而 {@link #resetContexts()} 也只在
      * event loop（协商回调）上调用，两者天然串行。
      */
     public ZstdDecompressCtx getDecompressCtx() {
@@ -157,29 +102,22 @@ public class ZstdChannelManager {
     }
 
     /**
-     * 清空两个方向已装载的字典，让上下文回到"无字典"状态。
+     * 换一份干净的压缩/解压上下文（旧的归还池，池内 reset 会解绑字典）。
      *
-     * <p>⚠️ 必须有这一步：{@code ZstdChannelManager} 的生命周期挂在 <b>Channel</b> 上，
-     * 而同一条 Channel 可能被重放登录流程（ViaFabricPlus 协议切换、或重连到另一台
-     * 服务器）。若新服务端的某个方向 dictId=0（还没训练出字典），协商结果会直接是
-     * READY，而上下文里仍装着<b>上一轮</b>的字典 —— 于是本端带字典压缩、对端无字典
-     * 解压（或反向），必然断连。这类问题只在"之前连过带字典的服务器"时出现，
-     * 单机测试完全复现不到。</p>
+     * <p>⚠️ 为什么每一轮协商都要换：{@code ZstdChannelManager} 的生命周期挂在 <b>Channel</b> 上，
+     * 而同一条 Channel 可能被重放登录流程（ViaFabricPlus 协议切换、或重连到另一台服务器）。
+     * 滚动历史算出的字典是<b>装载进上下文</b>的，而 zstd 没有卸载接口——上一轮那份历史会一直
+     * 留在上下文里，新一轮的滑窗却从零开始。两边的 {@code dictGen} 与字典内容于是当场错位，
+     * 表现不是"压缩率变差"而是<b>解压出垃圾</b>。</p>
      *
-     * <p>zstd 的 {@code loadDict} 没有"卸载字典"接口，只能用新建上下文来清空。</p>
-     *
-     * <p>⚠️ 与压缩任务共用同一把锁：压缩跑在池线程上，若这里直接 close 上下文，
-     * 在途压缩就会写到已释放的原生内存（SIGSEGV）。解压侧只在 event loop 上跑，
-     * 而本方法在登录回调（也在 event loop）上执行，天然串行。</p>
+     * <p>⚠️ 与压缩任务共用同一把锁：压缩跑在池线程上，若这里不持锁就把上下文还回池，
+     * 在途压缩会继续写同一份原生内存（那份内存随即被别的连接借走）——数据被写坏，
+     * 极端情况下是 SIGSEGV。解压侧只在 event loop 上跑，天然与本方法串行。</p>
      */
-    public void resetDicts() {
+    public void resetContexts() {
         synchronized (compressLock) {
             if (compressLock.isClosed()) return;
-            releaseQuietly(encoderDictEntry);
-            encoderDictEntry = null;
-            releaseQuietly(decoderDictEntry);
-            decoderDictEntry = null;
-            // 清空装载状态：换一份干净上下文（旧的归还池，池内 reset 会清掉字典绑定）
+            // 换一份干净上下文（旧的归还池，池内 reset 会清掉字典绑定）
             ZstdCtxPool.returnCompress(compressCtx);
             ZstdCtxPool.returnDecompress(decompressCtx);
             ZstdConfig cfg = ZstdConfig.INSTANCE;
@@ -191,98 +129,17 @@ public class ZstdChannelManager {
         }
     }
 
-    /**
-     * 加载"服务端→客户端"方向的解压字典（客户端解压用）。
-     *
-     * @return 是否确实装载成功；{@code false} 时调用方<b>不能</b>按"已就绪"上报
-     *（否则服务端会带字典压缩、而本端无字典解压 → 断连）
-     */
-    public boolean loadEncoderDict(byte[] dictBytes, long dictId) {
-        synchronized (compressLock) {
-            // 通道已关闭（上下文已释放）：装载字典等于写已释放的原生内存，直接放弃
-            //（正常时序下不会走到这里，此判仅作为兜底，见 ZstdCompressLock 的类注释）。
-            if (compressLock.isClosed()) {
-                return false;
-            }
-            ZstdDictRegistry.Entry e = ZstdDictRegistry.acquireDecompressDict(dictBytes, dictId);
-            if (e == null) {
-                return false;
-            }
-            releaseQuietly(encoderDictEntry);
-            encoderDictEntry = e;
-            decompressCtx.loadDict(e.decompressDict());
-            applySlimFrameFormat(); // loadDict 后幂等重申，避免参数被重置
-            return true;
-        }
-    }
-
-    /**
-     * 加载"客户端→服务端"方向的压缩字典（客户端压缩用）。
-     *
-     * @return 是否确实装载成功（同上：失败必须上报"未就绪"）
-     */
-    public boolean loadDecoderDict(byte[] dictBytes, long dictId) {
-        synchronized (compressLock) {
-            // 同上：通道已关闭时上下文已释放，直接放弃
-            if (compressLock.isClosed()) {
-                return false;
-            }
-            ZstdDictRegistry.Entry e = ZstdDictRegistry.acquireCompressDict(
-                    dictBytes, dictId, ZstdConfig.INSTANCE.level);
-            if (e == null) {
-                return false;
-            }
-            releaseQuietly(decoderDictEntry);
-            decoderDictEntry = e;
-            compressCtx.loadDict(e.compressDict());
-            applySlimFrameFormat(); // loadDict 后幂等重申，避免参数被重置
-            return true;
-        }
-    }
-
-    private static void releaseQuietly(ZstdDictRegistry.Entry e) {
-        if (e != null) e.release();
-    }
-
-    /** 记录某一方向在协商阶段算出的状态（{@code READY} / {@code NEED_DICT}）。 */
-    public void setDirStatus(boolean isEncoder, int status) {
-        if (isEncoder) {
-            encoderDirStatus = status;
-        } else {
-            decoderDirStatus = status;
-        }
-    }
-
-    /**
-     * 读取某一方向在协商阶段的状态。
-     *
-     * <p>{@code zstd:dict} 阶段对"未被 flags 点名的方向"必须沿用本方法的值，而不是当作
-     * {@code VANILLA} —— 原因见 {@link #encoderDirStatus} 的注释。</p>
-     */
-    public int dirStatus(boolean isEncoder) {
-        return isEncoder ? encoderDirStatus : decoderDirStatus;
-    }
-
     public void close() {
         // ⚠️ 必须与池线程拿的是**同一把锁**：压缩在 ZstdCompressPool 的线程上执行，
-        // 若在途压缩还没回来就 close 掉 native 上下文，池线程会继续写已释放的内存 → SIGSEGV。
-        // ⚠️ 且必须**先立标志再关上下文**：标志与 close 在同一段持锁区内，池线程在锁内读到
-        // 标志即可安全放弃；顺序反了（先 close 后立标志）等于没防（详见 ZstdCompressLock 注释）。
+        // 若在途压缩还没回来就把上下文还回池，池线程会继续写同一份内存（那份随即被别人借走）
+        // → 数据错乱，极端情况下 SIGSEGV。
+        // ⚠️ 且必须**先立标志再还上下文**：标志与归还在同一段持锁区内，池线程在锁内读到
+        // 标志即可安全放弃；顺序反了（先还后立标志）等于没防（详见 ZstdCompressLock 注释）。
         synchronized (compressLock) {
             compressLock.markClosed();
             // 归还池（内部 reset 清字典）；池满/已停用时才真正 close
             ZstdCtxPool.returnCompress(this.compressCtx);
             ZstdCtxPool.returnDecompress(this.decompressCtx);
-        }
-        ZstdDictRegistry.Entry enc = encoderDictEntry;
-        if (enc != null) {
-            encoderDictEntry = null;
-            enc.release();
-        }
-        ZstdDictRegistry.Entry dec = decoderDictEntry;
-        if (dec != null) {
-            decoderDictEntry = null;
-            dec.release();
         }
     }
 

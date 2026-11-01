@@ -13,12 +13,12 @@ import org.slf4j.LoggerFactory;
  * <ol>
  *   <li>{@code Connection.setupCompression} 的 TAIL（原始时机）</li>
  *   <li>{@code ClientHandshakePacketListenerImpl.handleCompression} 的 TAIL</li>
- *   <li>{@link #activateAfterQueryResponseSent}：{@code zstd:dict} 应答写出之后。
- *       前两条都跑在 SetCompression 处理期间，而"等字典"的客户端那一刻还停在 PLAIN 被跳过，
- *       没有这一条就再也没人激活（详见该方法的注释）</li>
+ *   <li>{@link #activateAfterQueryResponseSent}：{@code zstd:negotiate} 应答写出之后的兜底。
+ *       协商正常走在 SetCompression 之前，所以它多数时候只会记一句 debug；留着它是为了防
+ *       "登录顺序被代理/模组调换"那种情况（详见该方法的注释）</li>
  * </ol>
  *
- * <h2>管线位置（协议 v7）</h2>
+ * <h2>管线位置（协议 v7 起）</h2>
  * <pre>
  *   出站：encoder → zstd_encoder → [压缩被跳过] → prepender → encrypt → socket
  *   入站：socket → decrypt → splitter → zstd_switch_sniffer → zstd_decoder → decompress → decoder
@@ -30,8 +30,8 @@ import org.slf4j.LoggerFactory;
  * <p>路径 2 的必要性随之变了：现在锚点按名字<b>逐帧</b>解析，装早装晚都不会指向错的处理器。
  * 它还留在那里的理由有两个：一是重放登录（ViaFabricPlus 协议切换、同一条连接重新协商）后
  * 原版会拆掉 {@code compress}/{@code decompress} 再按名字重装，新实例可能落到我们<b>前面</b>，
- * 需要有人把位置掰回来（见 {@link #installEncoder} / {@link #installDecoder}）；二是字典应答
- * 那条路径之外，仍需要一个"确定晚于本轮所有压缩处理器安装"的补装时机。</p>
+ * 需要有人把位置掰回来（见 {@link #installEncoder} / {@link #installDecoder}）；二是协商应答
+ * 之后仍需要一个兜底时机——顺序被调换时，它是唯一能补上激活的地方。</p>
  *
  * <p><b>与 Krypton 共存</b>：Krypton（客户端侧压缩优化模组）在 {@code setupCompression} 的
  * HEAD 就把 {@code compress}/{@code decompress} 换成基于 libdeflate 的同名 handler。
@@ -152,16 +152,16 @@ public final class ZstdClientActivation {
     }
 
     /**
-     * 登录查询应答<b>写出之后</b>调用（当前唯一调用点是 {@code zstd:dict}）：
-     * 字典装载成功、状态刚变为 {@link ZstdChannelManager.TransportState#NEGOTIATING} 时补一次激活尝试。
+     * {@code zstd:negotiate} 应答<b>写出之后</b>调用：补一次激活尝试（quiet 版）。
      *
-     * <h2>为什么必须有这个入口</h2>
-     * <p>原有的两个触发点（{@code setupCompression} 与 {@code handleCompression} 的 TAIL）都在
-     * <b>SetCompression 处理期间</b>执行。而"需要字典"的客户端在那一时刻还停在 PLAIN
-     * （见 {@code ZstdLoginNetworking.handleNegotiate}），于是两条路径都只记一句 debug 就跳过；
-     * 等 {@code zstd:dict} 到达、状态改成 NEGOTIATING 时，已经没有任何触发点了——
-     * 客户端停在 NEGOTIATING 永不切入 zstd，而服务端收到本端应答后已切换到 zstd 发帧，
-     * 形成"服务端 zstd / 客户端 vanilla"的必断连组合。</p>
+     * <h2>它现在是兜底，不是主路径</h2>
+     * <p>正常的登录顺序是「协商 → SetCompression → 激活」：协商结束时 {@link ZstdChannelManager}
+     * 的状态刚变成 NEGOTIATING，但压缩处理器还没装上，锚点一个都不存在，所以本方法多数时候
+     * 只会记一句 debug 就返回。真正决定成败的仍是那两个 TAIL 触发点。</p>
+     *
+     * <p>保留它的理由是顺序不可靠：代理重发、模组改管线、重放登录都可能让 SetCompression
+     * <b>早于</b>协商完成——那种情况下两个 TAIL 触发点当时都因为 {@code state != NEGOTIATING}
+     * 跳过了，之后再也没有人激活。这一条就是那时候唯一还能补上的时机。</p>
      *
      * <h2>⚠️ 为什么必须"应答写出之后"才能调</h2>
      * <p>本方法会真的切换出站管道。若在应答写出<b>之前</b>切换，这条应答就会以 zstd 帧
@@ -170,8 +170,8 @@ public final class ZstdClientActivation {
      * 协商直接失败。调用点因此挂在"应答包写出"的回调上（Fabric 的 {@code callbacksConsumer}）。</p>
      *
      * <h2>与 {@link #activate} 的唯一区别</h2>
-     * <p>管道里还没有压缩处理器时（字典比 SetCompression 先到）只记 debug、不报 ERROR：
-     * 那是正常时序，真正需要报警的尝试由上面那两个 TAIL 触发点负责（它们必然在 SetCompression 时执行）。</p>
+     * <p>锚点缺失时只记 debug、不报 ERROR —— 那是本方法的正常时序；真正需要报警的尝试由上面
+     * 那两个 TAIL 触发点负责（它们必然在 SetCompression 处理期间执行）。</p>
      */
     public static void activateAfterQueryResponseSent(Channel channel) {
         if (channel == null) return;
@@ -205,7 +205,7 @@ public final class ZstdClientActivation {
     }
 
     /**
-     * 本轮登录明确判定"不参与 zstd"（版本不匹配 / 载荷异常 / 客户端无法加载字典）：请激活层
+     * 本轮登录明确判定"不参与 zstd"（版本不匹配 / 载荷异常）：请激活层
      * 拆掉上一轮可能残留的 zstd 处理器。
      *
      * <p>⚠️ 同一个 {@code Channel} 可能被<b>重放登录</b>（ViaFabricPlus 协议切换、或同一条连接
@@ -398,7 +398,7 @@ public final class ZstdClientActivation {
                 || p.get("compression-decoder") != null;
         if (!encReady || !decReady) {
             if (quiet) {
-                // 字典比 SetCompression 先到：压缩处理器还没装上，属正常时序。
+                // 协商比 SetCompression 先到：压缩处理器还没装上，属正常时序。
                 // 真正决定成败的那次尝试在 setupCompression / handleCompression 的 TAIL 上，那里会报错。
                 LOGGER.debug("[Zstd] activation deferred — compression handlers not installed yet "
                         + "(encoder={}, decoder={})", encReady, decReady);

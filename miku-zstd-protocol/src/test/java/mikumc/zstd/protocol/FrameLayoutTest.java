@@ -1343,12 +1343,7 @@ class FrameLayoutTest {
         }
 
         @Override
-        protected boolean hasCompressDict() {
-            return false;
-        }
-
-        @Override
-        protected int skipCompressThreshold(boolean hasDict) {
+        protected int skipCompressThreshold() {
             return skip;
         }
 
@@ -1360,11 +1355,6 @@ class FrameLayoutTest {
         @Override
         protected int configWindowLog() {
             return 0;
-        }
-
-        @Override
-        protected com.github.luben.zstd.ZstdDictCompress compressDict() {
-            return null;
         }
 
         @Override

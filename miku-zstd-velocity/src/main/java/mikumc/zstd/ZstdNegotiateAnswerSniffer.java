@@ -22,35 +22,23 @@ import java.util.List;
  *
  * <p>实测（本地 Velocity 4.2 + 当时的 v2 模拟客户端）：</p>
  * <pre>
- *   应答按裸帧发送   -> 服务端 spy 完全看不到该包，markDictResponse 永不触发，zstd 静默不激活
- *   应答按压缩帧发送 -> "Negotiate response received: enc=0 dec=0 dictConfirmed=true"
+ *   应答按裸帧发送   -> 服务端 spy 完全看不到该包，结论永不回填，zstd 静默不激活
+ *   应答按压缩帧发送 -> "Negotiate 应答：status=0 → 客户端就绪"
  * </pre>
  *
  * <p>在线模式（用户生产环境）之所以正常，是因为 EncryptionRequest 带来一个额外 RTT，
- * 应答恰好赶在 SetCompression 之前到达；<b>离线模式代理则完全失效</b>——这是本次
- * 端到端测试才暴露出来的缺陷。</p>
+ * 应答恰好赶在 SetCompression 之前到达；<b>离线模式代理则完全失效</b>。</p>
  *
  * <h2>方案</h2>
  * <p>把嗅探点放到 <b>frame-decoder 之后、压缩解码器之前</b>：这里拿到的是解密、拆帧后的
- * 原始负载，与压缩状态无关。以协商/字典查询的随机 txId 作为唯一标识匹配，
+ * 原始负载，与压缩状态无关。以 negotiate 的随机 txId 作为唯一标识匹配，
  * 命中即消费该帧（不下传），避免 Velocity 产生"未知 login plugin 应答"噪音。</p>
  *
- * <h2>⚠️ 两种应答都必须在这里捕获（曾经只捕了一种，造成必断连）</h2>
- * <p>协议 v4 的流程是<b>两段式</b>：negotiate → 客户端回"缺字典" → 服务端推
- * {@code zstd:dict} → 客户端回"就绪"。第二段的应答与第一段走完全相同的通道，
- * 因此同样会撞上"此时压缩解码器已就绪"的问题，<b>也必须在帧层捕获</b>。</p>
- *
- * <p>旧实现只匹配 {@code negotiateTxId}，且在命中协商应答后无条件
- * {@code markDictResponse} 并自移除，于是：</p>
- * <ol>
- *   <li>客户端答"缺字典"(status=1) 被当成"最终结论"，服务端<b>从不推送字典</b>；</li>
- *   <li>客户端在等字典，状态停在 PLAIN，<b>永不激活</b>；</li>
- *   <li>服务端却按"应答已到、无协议不匹配"照常激活 zstd → 单侧 zstd → <b>断连</b>。</li>
- * </ol>
- * <p>现在：命中协商应答且需要字典时，走 {@link ZstdHijacker#sendDictQuery} 推字典，
- * <b>不自移除、也不下结论</b>，继续等字典应答；结论只由最后那一次应答给出。
- * 另外在 ZstdHijacker 的激活路径上还有一道硬门控兜底（见 activateZstd），
- * 即使这里的应答真的丢了，也只会回落原版而不会断连。</p>
+ * <h2>协议 v8 的应答格式</h2>
+ * <p>{@code [0x02][varint txId][bool success][varint status]}。5.0.42 删掉训练字典后
+ * <b>只剩一个</b>状态字段：{@code 0 = 就绪}、{@code 2 = 保持原版}（旧客户端可能仍回
+ * {@code 1 = 需要字典}，{@link ZstdNegotiateStatus#sanitize} 会把它按 2 处理）。
+ * {@code zstd:dict} 通道整体消失，因此本类只认这一种应答，命中即回填结论并自移除。</p>
  */
 public class ZstdNegotiateAnswerSniffer extends MessageToMessageDecoder<ByteBuf> {
 
@@ -67,17 +55,9 @@ public class ZstdNegotiateAnswerSniffer extends MessageToMessageDecoder<ByteBuf>
      *
      * <p>⚠️ 这不是为了省一次判断，而是为了堵住一条<b>无上限的热路径开销</b>：
      * {@link #asRawPacket} 在"裸帧 / 直存帧"分支里会 {@code new byte[len]} 把<b>整帧</b>拷出来。
-     * 而本嗅探器的帧数上限在「等待字典应答」期间是<b>刻意关闭</b>的（见 {@link #decode}），
-     * 于是只要出现"服务端推了 {@code zstd:dict}、客户端始终没回"的连接
-     * （模组处理字典时崩了、应答丢了、或客户端根本不认识这个查询却仍连着），
-     * 本嗅探器就会<b>永久驻留</b>，对进入 play 阶段后的<b>每一个入站帧</b>都做一次全帧拷贝
-     * ——区块帧动辄几百 KB，等于给这条连接的每个包都加一次同尺寸分配。</p>
-     *
-     * <p>取 4096 的依据：登录查询应答只有几字节（{@code [0x02][varint txId][bool][varint][varint]}），
-     * 即使被原版压缩帧或 zstd 帧包一层也只有十几字节，余量给得宽松一些。
-     * 而 play 阶段的区块/地图数据帧远大于此值，会被这条判断直接挡在 {@code asRawPacket} 之外。
-     * （帧格式 v4 起"带内层长度前缀的直存帧"已不存在——直存帧一帧一包；上面提到的
-     * 「应答与其它包合批」场景也随之消失，这里保留余量只是不想再为此改动阈值。）</p>
+     * 登录查询应答只有几字节（{@code [0x02][varint txId][bool][varint]}），即使被原版压缩帧
+     * 或 zstd 帧包一层也只有十几字节；而 play 阶段的区块/地图数据帧动辄几百 KB，
+     * 会被这条判断直接挡在 {@code asRawPacket} 之外。</p>
      */
     private static final int MAX_ANSWER_FRAME_BYTES = 4096;
 
@@ -86,54 +66,41 @@ public class ZstdNegotiateAnswerSniffer extends MessageToMessageDecoder<ByteBuf>
     @Override
     protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) {
         ZstdChannelManager mgr = ctx.channel().attr(ZstdChannelManager.KEY).get();
-        if (mgr == null || mgr.isReplaced() || mgr.isDictResponseReceived()) {
+        if (mgr == null || mgr.isReplaced() || mgr.isAnswerReceived()) {
+            // 已经激活 / 已定结论：使命结束，热路径上不再有任何解析
             ctx.pipeline().remove(this);
             out.add(in.retain());
             return;
         }
 
-        framesChecked++;
-        // 帧上限只是"这件事彻底没戏了"的安全阀。**等待字典推送应答期间不启用**：
-        // 那一段要等客户端收完几十~几百 KB 并算完 CRC 才回包，很容易越过原本的 16 帧。
-        // 真正的收尾由"结论已回填"或通道关闭负责。
-        if (!awaitingDict(mgr) && framesChecked >= MAX_FRAMES) {
+        if (++framesChecked > MAX_FRAMES) {
+            // 前 64 帧都没等到应答：这条连接多半压根没装模组，收工
             ctx.pipeline().remove(this);
             out.add(in.retain());
             return;
         }
 
         if (tryHandleAnswer(ctx, in, mgr)) {
-            // 结论已定才自移除；若刚发完字典推送，则继续留在帧层等它的应答
-            if (mgr.isDictResponseReceived()) {
-                ctx.pipeline().remove(this);
-            }
+            ctx.pipeline().remove(this);
             return; // 已消费，不下传
         }
         out.add(in.retain());
     }
 
-    /** 是否正在等待 {@code zstd:dict} 推送的应答。 */
-    private static boolean awaitingDict(ZstdChannelManager mgr) {
-        return mgr.isDictRequested() && !mgr.isDictResponseReceived();
-    }
-
     /**
-     * 匹配登录查询应答：{@code [0x02][varint txId][bool success][varint encStatus][varint decStatus]}，
-     * txId 与 negotiate 或 dict 查询任一相符即命中。
+     * 匹配登录查询应答并回填结论。
      *
      * <p>⚠️ 帧的<b>外层形态有三种</b>（见 {@link #asRawPacket}），全部都要认得：漏掉任何一种，
-     * 应答就永远回填不上 —— 服务端 2 秒后回落原版，而客户端此刻已经装载字典并切到 zstd，
+     * 应答就永远回填不上 —— 服务端 2 秒后回落原版，而客户端那边已经切到 zstd，
      * 于是形成单侧 zstd → 必断连。</p>
      *
      * @return 是否命中并已消费该帧
      */
     private boolean tryHandleAnswer(ChannelHandlerContext ctx, ByteBuf in, ZstdChannelManager mgr) {
         int negotiateTxId = mgr.getNegotiateTxId();
-        int dictTxId = mgr.getDictTxId();
-        if (negotiateTxId <= 0 && dictTxId <= 0) return false;
+        if (negotiateTxId <= 0) return false;
 
         // ⚠️ 必须在 asRawPacket 之前挡住大帧：那个方法对"裸帧 / 直存帧"分支会整帧拷贝。
-        // 详见 MAX_ANSWER_FRAME_BYTES 的注释（等待字典应答期间本嗅探器会长期驻留）。
         int readable = in.writerIndex() - in.readerIndex();
         if (readable > MAX_ANSWER_FRAME_BYTES) return false;
 
@@ -141,55 +108,24 @@ public class ZstdNegotiateAnswerSniffer extends MessageToMessageDecoder<ByteBuf>
         if (packet == null || packet.length < 3) return false;
         if ((packet[0] & 0xFF) != PACKET_ID_ANSWER) return false;
 
-        // 包结构： [packetId 0x02][varint txId][bool success][varint encStatus][varint decStatus]
+        // 包结构： [packetId 0x02][varint txId][bool success][varint status]
         int[] cursor = {1};
         int txId = ZstdVarInts.readOr(packet, cursor, ZstdVarInts.INVALID);
-        if (txId < 0) return false;
-
-        boolean isNegotiate = negotiateTxId > 0 && txId == negotiateTxId;
-        boolean isDict = dictTxId > 0 && txId == dictTxId;
-        if (!isNegotiate && !isDict) return false;
+        if (txId != negotiateTxId) return false;
 
         boolean success = cursor[0] < packet.length && packet[cursor[0]] != 0;
         cursor[0]++;
-        int encStatus = ZstdNegotiateStatus.VANILLA;
-        int decStatus = ZstdNegotiateStatus.VANILLA;
+        int status = ZstdNegotiateStatus.FALLBACK;
         if (success && cursor[0] < packet.length) {
-            encStatus = ZstdNegotiateStatus.sanitize(
-                    ZstdVarInts.readOr(packet, cursor, ZstdNegotiateStatus.FALLBACK));
-            decStatus = ZstdNegotiateStatus.sanitize(
+            status = ZstdNegotiateStatus.sanitize(
                     ZstdVarInts.readOr(packet, cursor, ZstdNegotiateStatus.FALLBACK));
         }
 
-        if (isNegotiate && ZstdHijacker.needsDictPush(encStatus, decStatus)) {
-            // 协议 v4：客户端缺字典。推一次 zstd:dict，**先不下结论**——
-            // 门控必须等这次推送的应答，否则服务端会先于客户端激活（单侧 zstd）。
-            // ⚠️ 必须用返回值去重：客户端对同一条 negotiate 可能回两次（帧层与包层各捕获一次），
-            // 重复推送会把整份字典再发一遍并覆盖 dictTxId，让先前的应答从此无人认领。
-            if (!mgr.markDictRequested()) {
-                LOGGER.debug("[Zstd] 重复的字典请求，已推过 — 忽略");
-                return true;
-            }
-            if (!ZstdHijacker.sendDictQuery(ctx.channel(),
-                    ZstdNegotiateStatus.needsDict(encStatus), ZstdNegotiateStatus.needsDict(decStatus))) {
-                // 推送没发出去（字典过大 / 锚点缺失）：按"客户端保持原版"回填结论，
-                // 让激活流程立刻走回落分支 —— 否则本连接要白等满 10 秒的字典阶段预算，
-                // 期间扣住的登录包一直不发出，玩家表现为长时间卡在登录界面。
-                LOGGER.warn("[Zstd] zstd:dict 未能发出 — 立即回落原版（不等字典应答预算）");
-                mgr.markDictResponse(ZstdNegotiateStatus.VANILLA, ZstdNegotiateStatus.VANILLA, true);
-                ZstdHijacker.notifyDictResponse(ctx.channel());
-                return true;
-            }
-            LOGGER.debug("[Zstd] negotiate 应答要求字典（enc={} dec={}），已推送 zstd:dict，继续等待其应答",
-                    encStatus, decStatus);
-            return true;
-        }
-
-        LOGGER.debug("[Zstd] {} 应答已在帧层捕获（txId={}, enc={}, dec={}, success={}）",
-                isDict ? "zstd:dict" : "negotiate", txId, encStatus, decStatus, success);
-        mgr.markDictResponse(encStatus, decStatus, success);
+        LOGGER.debug("[Zstd] negotiate 应答已在帧层捕获（txId={}, status={}, success={}）",
+                txId, status, success);
+        mgr.markNegotiateResponse(status, success);
         // 立即触发激活（若 SetCompression 已写出），省掉最长 100ms 的轮询等待
-        ZstdHijacker.notifyDictResponse(ctx.channel());
+        ZstdHijacker.notifyAnswerReceived(ctx.channel());
         return true;
     }
 
@@ -235,9 +171,7 @@ public class ZstdNegotiateAnswerSniffer extends MessageToMessageDecoder<ByteBuf>
 
         // 其余情况按压缩帧处理：先读声明长度，再解压。
         // ⚠️ 声明长度上限必须收紧到 64：这里声明的就是"解压后的包长"，而我们的应答只有
-        // 几字节（两个 varint）。放宽到 64KB 会让**每一个**常规压缩入站帧（默认压缩阈值
-        // 256B 起就被压缩）都走一次 new Inflater() + 解压尝试 —— 那是原生分配，
-        // 而本嗅探器在"等待字典应答"期间是长期驻留的，等于给这条连接白加一份永久开销。
+        // 几字节。放宽会让每一个常规压缩入站帧都走一次 new Inflater() + 解压尝试 —— 那是原生分配。
         try {
             int declared = -1;
             int idx = start;

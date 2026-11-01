@@ -11,7 +11,7 @@ import mikumc.zstd.protocol.ZstdTrafficCounter;
  *
  * <p>批处理、建帧、promise 编排等全部逻辑在共享基类
  * {@link ZstdBatchEncoderBase} 中（两端同一份源码）；本类只声明服务端的
- * 差异点：外层长度归属、统计出口、配置来源、字典状态查询、锁，
+ * 差异点：外层长度归属、统计出口、配置来源、锁，
  * 外加一处<b>位置</b>差异——成帧结果写到原版压缩处理器的 context（见 {@link #downstream}）。</p>
  *
  * <p>⚠️ <b>安装位置</b>：本类由 {@code ZstdChannelManager#installEncoder} 以
@@ -44,18 +44,16 @@ public class ZstdBatchEncoder extends ZstdBatchEncoderBase {
         return m == null ? super.compressLock() : m.compressLock();
     }
 
+    /**
+     * 小包跳过压缩的阈值。
+     *
+     * <p>5.0.42 删掉训练字典后只剩这一个值（原来按"有没有训练字典"二选一）。
+     * 滚动历史生效后小包同样能压出收益，但判据仍是"这一批有多大"；
+     * 协议层另有 16B 硬地板，保证切换握手包永远直存。</p>
+     */
     @Override
-    protected boolean hasCompressDict() {
-        ZstdChannelManager m = manager;
-        return m != null && m.hasCompressDict();
-    }
-
-    @Override
-    protected int skipCompressThreshold(boolean hasCompressDict) {
-        ZstdVelocityConfig cfg = ZstdVelocityConfig.INSTANCE;
-        return hasCompressDict
-                ? cfg.skipCompressBelowBytesWithDict
-                : cfg.skipCompressBelowBytes;
+    protected int skipCompressThreshold() {
+        return ZstdVelocityConfig.INSTANCE.skipCompressBelowBytes;
     }
 
     @Override
@@ -66,12 +64,6 @@ public class ZstdBatchEncoder extends ZstdBatchEncoderBase {
     @Override
     protected int configWindowLog() {
         return ZstdVelocityConfig.INSTANCE.windowLog;
-    }
-
-    @Override
-    protected com.github.luben.zstd.ZstdDictCompress compressDict() {
-        ZstdChannelManager m = manager;
-        return m == null ? null : m.compressDict();
     }
 
     /**
@@ -115,25 +107,6 @@ public class ZstdBatchEncoder extends ZstdBatchEncoderBase {
         if (m != null) {
             m.stats.record(rawBytes, wireBytes);
         }
-    }
-
-    /**
-     * 采样：把整批原始字节交给训练器，由它在锁外按包拆开、过滤、只为入库样本拷贝
-     * （见 {@code ZstdSampleTrainer#addBatch}）。
-     *
-     * <p>不能把整批当成"一个样本"：那样 1MB 数据只有 26 个样本，永远够不到 min_samples；
-     * 也不该在这里逐包拆分——那会把解析与过滤搬到 event loop 上。</p>
-     */
-    @Override
-    protected void onRawBatch(io.netty.buffer.ByteBuf raw, int length) {
-        // ⚠️ 先问训练器要不要：这份拷贝跑在 event loop 上，环满后（到下一轮训练之间
-        // 是分钟级）每批都会白拷一份。代理是所有玩家流量的汇聚点，量级比单实例大得多。
-        if (!ZstdSampleTrainer.wantsEncoderSample()) {
-            return;
-        }
-        byte[] copy = new byte[length];
-        raw.getBytes(raw.readerIndex(), copy, 0, length);
-        ZstdSampleTrainer.submitEncoderBatch(copy, length);
     }
 
     @Override

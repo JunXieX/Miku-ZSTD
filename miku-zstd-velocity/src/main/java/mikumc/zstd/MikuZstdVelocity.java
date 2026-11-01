@@ -40,7 +40,6 @@ public class MikuZstdVelocity {
     public void onProxyInitialization(ProxyInitializeEvent event) {
         Path dataDir = resolveDataDir(dataDirectory);
         ZstdVelocityConfig.load(dataDir.resolve("config.yml"));
-        ZstdSampleTrainer.init(dataDir);
         ZstdCompressPool.init(ZstdVelocityConfig.INSTANCE.compressThreads, 5);
         if (ZstdVelocityConfig.INSTANCE.debug) {
             applyDebugLogLevel();
@@ -114,8 +113,9 @@ public class MikuZstdVelocity {
      * <p>这里改用注入路径的<b>父目录</b>（即 {@code plugins/}）去拼 {@code Miku-ZSTD}，
      * 既保住合法的 id，又让目录名与插件显示名一致。</p>
      *
-     * <p>首次切换时把旧目录（{@code plugins/miku-zstd}，含 {@code config.yml} 与
-     * {@code zstd_dicts/}）整体搬过来，避免丢配置与已训练的字典。</p>
+     * <p>首次切换时把旧目录（{@code plugins/miku-zstd}，含 {@code config.yml}）整体搬过来，
+     * 避免丢配置。5.0.42 起训练字典已删除，旧目录里的 {@code zstd_dicts/} 不再被读写，
+     * 迁移时顺手带过去也无害（可以直接删掉）。</p>
      */
     private Path resolveDataDir(Path injected) {
         Path parent = injected.getParent();
@@ -142,7 +142,6 @@ public class MikuZstdVelocity {
     public void onProxyShutdown(ProxyShutdownEvent event) {
         ZstdBossBarMonitor.stop();
         ZstdBandwidthProfiler.shutdown();
-        ZstdSampleTrainer.shutdown();
         // 压缩池必须显式关：init 是"只生效一次"的，留着旧池会让重载后的代理继续用
         // 旧 worker 线程（并持有旧类加载器）。
         try {
@@ -156,7 +155,7 @@ public class MikuZstdVelocity {
         } catch (Throwable t) {
             logger.warn("[Zstd] failed to shut down ctx pool", t);
         }
-        logger.info("[Zstd] Samples saved on shutdown");
+        logger.info("[Zstd] Miku-ZSTD shut down");
     }
 
     @Subscribe
@@ -169,7 +168,7 @@ public class MikuZstdVelocity {
             // ⚠️ 必须是 debug：这条路径是**每个 zstd 客户端每次进服都会命中**的正常流程，
             // 用 INFO 会让服务器日志被"每人一行"刷满（200 人在线就是 200 行噪音），
             // 而它本身不携带任何需要人工介入的信息 —— 真正值得 INFO 的是激活成功那一行。
-            // 主机名末尾是 {@code  ZSTD } 标记，直接打印会在日志里渲染成几个空格，
+            // 主机名末尾是 {@code \\0ZSTD\\0} 标记，直接打印会在日志里渲染成几个空格，
             // 看起来像"配置里多了空格"。转义一下，观感才和真实字节一致。
             logger.debug("[Zstd] Connection already negotiated by sniffer: host={}",
                     inbound.getRawVirtualHost().orElse("").replace("\u0000", "\\0"));
