@@ -668,13 +668,13 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
      *
      * <p>滑窗 + 当前字典共 128KB，挂在连接上会一直留到 GC；挂机玩家的连接可能挂几个小时，
      * 200 人在线就是几十 MB 的纯浪费。必须走 {@code super}：{@code ByteToMessageDecoder}
-     * 在那里释放累积缓冲。</p>
+     * 在那里释放累积缓冲（{@code ByteToMessageDecoder#handlerRemoved} 是 final，
+     * 子类的扩展点是 {@code handlerRemoved0}）。</p>
      */
     @Override
-    public void handlerRemoved(ChannelHandlerContext ctx) throws Exception {
+    protected void handlerRemoved0(ChannelHandlerContext ctx) throws Exception {
         rolling.reset();
         appliedRollingDict = null;
-        super.handlerRemoved(ctx);
     }
 
     /** 是否为连接层 I/O 异常（对端重置/中断），而不是协议或解压错误。 */
