@@ -44,10 +44,10 @@ public class ZstdBatchDecoder extends ZstdBatchDecoderBase {
      */
     @Override
     protected ChannelHandlerContext decodeForwardTarget(ChannelHandlerContext ctx) {
-        io.netty.channel.ChannelHandlerContext c = ctx.pipeline().context("compression-decoder");
-        if (c != null) return c;
-        io.netty.channel.ChannelHandlerContext c = ctx.pipeline().context("decompress");
-        if (c != null) return c;
+        for (String name : new String[]{"compression-decoder", "decompress"}) {
+            io.netty.channel.ChannelHandlerContext c = ctx.pipeline().context(name);
+            if (c != null) return c;
+        }
         return null;
     }
 
