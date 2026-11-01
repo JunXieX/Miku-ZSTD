@@ -22,9 +22,14 @@ import java.util.List;
  * <h2>⚠️ 安装位置只能是压缩解码器之前</h2>
  * <p>本类处理的是 {@code ByteBuf}（帧）。挂到 {@code packet_handler} 之前时，它收到的
  * 是已经解码的 {@code Packet} 对象，{@code decode} 根本不会被调用；更糟的是那个位置
- * 已经过 {@code zstd_decoder}，裸的询问包会被当成 zstd 帧解析错乱。因此只在
- * {@code decompress} / {@code compression-decoder} 之前安装，找不到锚点就返回 false，
- * 由调用方稍后再试。</p>
+ * 已经过 {@code zstd_decoder}，裸的询问包会被当成 zstd 帧解析错乱。</p>
+ *
+ * <p>协议 v7 起 {@code zstd_decoder} 与 {@code decompress} <b>并存</b>（我们不再替换原版），
+ * 所以锚点顺序是 {@code zstd_decoder} → {@code decompress} → {@code compression-decoder}：
+ * 必须排在<b>我们的解码器上游</b>。若被插到我们下游，这条询问会被我们的解码器当"直存帧"
+ * 处理——既喂进了滚动历史（服务端那条询问绕过编码器写、没有喂，两端历史当场分叉），
+ * 又会被原版 {@code decompress} 透传到包解码器，客户端按未注册通道回一条 {@code success=false}。
+ * 锚点都不在时安装方只记 debug 等下一次触发，不做兜底位置。</p>
  *
  * <h2>为什么继承 {@code MessageToMessageDecoder}</h2>
  * <p>⚠️ 不能用 {@code ByteToMessageDecoder} + {@code out.add(in.retain())}：那个基类要求

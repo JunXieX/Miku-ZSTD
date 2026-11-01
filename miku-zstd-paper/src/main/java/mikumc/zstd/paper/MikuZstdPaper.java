@@ -24,7 +24,8 @@ import mikumc.zstd.protocol.ZstdCompressPool;
  *
  * <h2>为什么要碰 NMS</h2>
  * <p>Paper API 不暴露 netty 管线（{@code io.papermc.paper.connection.PlayerLoginConnection}
- * 只有 profile 方法，拿不到 Channel），而接管压缩必须替换 {@code compress}/{@code decompress}。
+ * 只有 profile 方法，拿不到 Channel），而接管压缩必须把处理器插到 {@code compress} /
+ * {@code decompress} 旁边（插在它们旁边、再从它们的 context 往下写，不拆掉它们）。
  * MC 26.x 未混淆，反射访问 {@code Connection.channel} 与管线锚点是稳定可行的。</p>
  *
  * <h2>注入时机：连接建立时（不是登录事件）</h2>
@@ -62,12 +63,12 @@ public class MikuZstdPaper extends JavaPlugin {
 
         // ⚠️ 服务端关闭原版压缩（network-compression-threshold=-1）时本插件无法工作：
         // zstd 需要借原版的 SetCompression 做双端同步信号、借它装好的 compress/decompress
-        // 做替换锚点；该配置下这二者都不存在（伪造切换信号会导致协议切换期异常、无法进服）。
+        // 做插入锚点；该配置下这二者都不存在（伪造切换信号会导致协议切换期异常、无法进服）。
         // 与其静默失效，不如明确停用并说明原因。
         int compressionThreshold = ZstdPaperCommandSupport.readCompressionThreshold();
         if (compressionThreshold < 0) {
             LOGGER.error("[Zstd] 检测到 network-compression-threshold={}（服务端已关闭原版压缩）。", compressionThreshold);
-            LOGGER.error("[Zstd] 本插件依赖原版压缩流程作为切换信号与替换锚点，该配置下无法工作，");
+            LOGGER.error("[Zstd] 本插件依赖原版压缩流程作为切换信号与插入锚点，该配置下无法工作，");
             LOGGER.error("[Zstd] 因此自动停用（不影响正常进服）。如需 zstd，请把该值设为 >= 0，推荐 256。");
             getServer().getPluginManager().disablePlugin(this);
             return;
@@ -154,16 +155,17 @@ public class MikuZstdPaper extends JavaPlugin {
     }
 
     /**
-     * 还原挂钩：把原始 {@code childHandler} 放回去，并摘掉仍在线连接上的协商器。
+     * 还原挂钩：把原始 {@code childHandler} 放回去，并收掉仍在线连接上的本插件处理器。
      *
      * <p>这样插件被重载时不会残留：已建立的连接立即回到原版路径（不再协商），
      * 新连接也不会再被注入，被替换的字段不再持有本插件的类加载器。</p>
      *
-     * <p>⚠️ <b>已经激活 zstd 的连接不能"拆回原版"</b>：激活时原版 {@code compress}/{@code decompress}
-     * 实例是被 {@code pipeline.replace} <b>移除</b>过的，而 Netty 对非 {@code @Sharable} handler 的
-     * {@code added} 标志永不复位——同一个实例再也放不回管线。所以这里只摘协商器，
-     * 让那条连接继续用"它自己那套"zstd 处理器跑完生命周期（持有旧类加载器的时间以该连接关闭为界）。
-     * 强行移除 zstd 处理器只会得到"管线里既没有原版压缩、也没有 zstd"的必断连状态。</p>
+     * <p>⚠️ 已激活的连接要把 zstd 处理器<b>一起摘掉并断开</b>。摘得掉是协议 v7 换来的：
+     * 我们当初是插进管线的，原版 {@code compress}/{@code decompress} 一直都在，
+     * 所以 {@code uninstallZstd} 之后管线就是一条标准原版连接；旧实现用 replace 拿走过
+     * 原版实例，非 {@code @Sharable} 的 handler 放不回去，当时只能指望连接自己关掉。
+     * 还必须断开的理由：停用流程随后会关掉压缩线程池，留在管线里的编码器再也压不出帧，
+     * 对端看到的是"人还在、包再也不动"——比断线重连难查得多。</p>
      */
     private void uninstallHook() {
         for (HookedField hook : hookedFields) {
@@ -180,13 +182,46 @@ public class MikuZstdPaper extends JavaPlugin {
         // 于是这段"摘掉在线连接的协商器"的承诺根本没兑现——插件重载后，老协商器仍挂在
         // 每一条在线连接的出/入站热路径上，对每个包跑字符串判定，并继续持有旧类加载器。
         try {
-            forEachLiveConnectionChannel(channel -> {
-                if (channel.pipeline().get("miku-zstd-negotiator") != null) {
-                    channel.pipeline().remove("miku-zstd-negotiator");
-                }
-            });
+            forEachLiveConnectionChannel(MikuZstdPaper::revertConnection);
         } catch (Throwable t) {
             LOGGER.debug("[Zstd] 摘除在线连接的协商器失败（忽略）", t);
+        }
+    }
+
+    /**
+     * 收掉一条在线连接上的本插件处理器（幂等），激活过的连接顺带断开。
+     *
+     * <p>⚠️ 必须在<b>该连接的 event loop</b> 上做：管线改动要与在途的成帧/解帧串行，
+     * 否则可能摘掉一个正被 {@code downstream()} 按名字查找的锚点。</p>
+     */
+    private static void revertConnection(Channel channel) {
+        if (channel == null || !channel.isActive()) return;
+        Runnable task = () -> {
+            var p = channel.pipeline();
+            if (p.get("miku-zstd-negotiator") != null) {
+                try {
+                    p.remove("miku-zstd-negotiator");
+                } catch (Throwable t) {
+                    LOGGER.debug("[Zstd] 摘除协商器失败（忽略）: {}", t.toString());
+                }
+            }
+            ZstdPaperChannelManager mgr = channel.attr(ZstdPaperChannelManager.KEY).get();
+            if (mgr == null) return;
+            // ⚠️ 先记下是否已激活：uninstallZstd 内部会把该状态清成 false。
+            boolean activated = mgr.isReplaced();
+            mgr.uninstallZstd(channel);
+            if (activated) {
+                // 对端此刻仍按 zstd 收发，原版管线发过去它只会解不开；断开让客户端重连，
+                // 重连后插件已停用，自然走原版 zlib。
+                LOGGER.debug("[Zstd] 插件停用：断开已激活的连接 {}（客户端重连后走原版压缩）",
+                        channel.remoteAddress());
+                channel.close();
+            }
+        };
+        if (channel.eventLoop().inEventLoop()) {
+            task.run();
+        } else {
+            channel.eventLoop().execute(task);
         }
     }
 

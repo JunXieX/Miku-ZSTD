@@ -30,7 +30,7 @@ import java.util.concurrent.TimeUnit;
  *       反射访问，见下方字段注释），解析字典状态回填
  *       {@link ZstdChannelManager#markDictResponse}——该包的 txId
  *       不属于 Velocity 内核 inflight 列表，在此消费最干净；</li>
- *   <li><b>激活</b>：检测到 SetCompression 写出时启动管线替换。激活前按门控
+ *   <li><b>激活</b>：检测到 SetCompression 写出时启动管线接管（插入而非替换）。激活前按门控
  *       等待协商应答（100ms × 20 重试，超时/版本不匹配则放弃 zstd 回落原版）；
  *       激活完成后<b>自移除</b>，热路径不再有任何开销。</li>
  * </ol>
@@ -42,7 +42,7 @@ import java.util.concurrent.TimeUnit;
  *       拿不到编译期常量，但二者同为 JVM 内建、开销同量级）
  *       ——该判断在激活前会对每个出站包执行，字符串比较（含 getSimpleName 的反射开销）
  *       是不必要的热路径成本；</li>
- *   <li>激活前<b>先校验两端锚点齐备</b>再动手替换，避免"只换上编码器"这类
+ *   <li>激活前<b>先校验两端锚点齐备</b>再动手安装，避免"只装上编码器"这类
  *       单侧 zstd 的必断连组合；</li>
  *   <li>VarInt 与字典读取统一走 {@link ZstdVarInts} / {@link ZstdDictRegistry}。</li>
  * </ul>
@@ -162,6 +162,12 @@ public class ZstdHijacker extends ChannelDuplexHandler {
      * ①外层长度由更早加入的处理器补齐；②压缩一旦启用，原版 compression-encoder 会<b>自己按阈值</b>
      * 处理（小包直存 / 大包 deflate）—— 所以我们既不需要、也不应该手工拼 MC 的压缩帧。</p>
      *
+     * <p>⚠️ 协议 v7 把编码器改成"插在原版压缩处理器旁边"之后，这两处（negotiate / dict）
+     * <b>仍然不能</b>挪到 {@code compression-encoder} 的 context：它们写的是<b>裸 MC 包</b>，
+     * 长度前缀与压缩都得靠管线补齐；从压缩处理器之后写出等于把这一层补全一起跳过，
+     * 又回到上面那个"帧长为 0"的崩法。真正的"写帧"位置是另一个方法
+     *（见 {@link #compressionWriteCtx}）—— 两者的区别是"写包"还是"写帧"。</p>
+     *
      * @return 写入位置；{@code null} 表示锚点不存在（极端的管线差异），调用方按"发不出去"处理
      */
     private static ChannelHandlerContext loginQueryWriteCtx(ChannelPipeline pipeline) {
@@ -192,7 +198,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
      * 立即触发激活——省掉最长 100ms 的轮询等待。
      *
      * <p>只有当 SetCompression 已经写出（{@code pipelineActivated}）时才动手：
-     * 否则我们会先于 Velocity 的 setupCompression 替换管道，随后被原版压缩处理器覆盖。</p>
+     * 否则我们会先于 Velocity 的 setupCompression 改动管线，随后被原版压缩处理器覆盖。</p>
      */
     public void onDictResponseReceived() {
         ChannelHandlerContext c = this.selfCtx;
@@ -501,6 +507,15 @@ public class ZstdHijacker extends ChannelDuplexHandler {
         } catch (Throwable t) {
             LOGGER.error("[Zstd] activation flow failed (attempt={}) — releasing held packets, staying vanilla",
                     attempt, t);
+            // ⚠️ 安装只做到一半就抛异常时，管线里可能躺着 zstd_encoder/zstd_decoder：
+            // 它们会继续按 zstd 编解码，而客户端还没收到 zstd:switch，仍然按原版解释入站帧。
+            // 这里必须先把它们摘干净，再补发扣住的包（补发走的才是完整原版路径）。
+            // ⚠️ 判据是 isReplaced()：一旦已激活成功（切换通知也已发出），对端就是 zstd 了，
+            // 此时拆掉我们的处理器才是真正的单侧 zstd —— 那种情况只能保持现状。
+            ZstdChannelManager m = ctx.channel().attr(ZstdChannelManager.KEY).get();
+            if (m != null && !m.isReplaced()) {
+                m.uninstallZstd(ctx.channel());
+            }
             releaseHeld(ctx);
             // ⚠️ 同时摘掉自身：本端与 Paper 不同，回落分支若不显式移除，处理器就会
             // 永久留在每个出站包的热路径上（write 里每次都做 attr 查询与 SetCompression 判定），
@@ -615,7 +630,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
             giveUp(ctx); // 不可激活：补发扣住的包 + 摘掉自身，否则连接卡死
             return false;
         }
-        // 先确认两端都能替换，再动手——避免只装上一侧造成单侧 zstd 的必断连组合
+        // 先确认两端锚点都齐备，再动手——避免只装上一侧造成单侧 zstd 的必断连组合
         if (!hasEncoderAnchor(p) || !hasDecoderAnchor(p)) {
             LOGGER.error("[Zstd] Cannot activate zstd — pipeline anchors missing (encoder={}, decoder={}); "
                     + "pipeline={}", hasEncoderAnchor(p), hasDecoderAnchor(p), p.names());
@@ -653,16 +668,14 @@ public class ZstdHijacker extends ChannelDuplexHandler {
             }
             LOGGER.error("[Zstd] zstd handler installation failed after {} attempts; pipeline={}",
                     installAttempt, p.names());
-            // ⚠️ 若编码器已经换上、解码器没有，管线停在"出站 zstd / 入站原版"的必断连状态：
-            // 此时把扣住的包按原路径发出去，对端一样解不开（它已经在 SetCompression 后切到
-            // zstd 了）。而且"换回原版实例"这条路不存在（原版处理器已被移除过一次，Netty 对
-            // 非 @Sharable handler 的 added 标志永不重置）。所以只能明确关闭连接。
-            if (p.get("zstd_encoder") != null && p.get("zstd_decoder") == null) {
-                LOGGER.error("[Zstd] 半装管线（仅编码器为 zstd）— 关闭连接，避免必断连");
-                channel.close();
-                return false;
-            }
-            giveUp(ctx); // 回落原版：补发扣住的包 + 摘掉自身（此时管线仍是完整原版）
+            // ⚠️ 不再有"半装死局"：v7 起原版压缩处理器从来没被摘掉（只插入、不替换），
+            // 所以"只装上编码器、解码器没装上"这种中间态是可以撤销的 —— 把我们的四个
+            // handler 全摘掉，管线就回到完整原版形态。
+            // 这一步必须做：残留的 zstd_encoder 会继续把出站包编成 zstd 帧，
+            // 而客户端此刻还没收到 zstd:switch（那条通知在安装成功之后才发），
+            // 它按原版解释入站帧 → 第一帧就错乱。
+            mgr.uninstallZstd(channel);
+            giveUp(ctx); // 回落原版：补发扣住的包 + 摘掉自身（此时管线已是完整原版）
             return false;
         }
 
@@ -690,15 +703,14 @@ public class ZstdHijacker extends ChannelDuplexHandler {
     }
 
     /**
-     * 出站方向是否有**可替换**的锚点。
+     * 出站方向是否有**可插入**的锚点。
      *
      * <p>⚠️ 必须与 {@link ZstdChannelManager#installEncoder} 支持的锚点集合完全一致。</p>
      *
-     * <p>早期这里还把 {@code cipher-encoder} / {@code minecraft-encoder} 当成可用锚点，
-     * 而安装逻辑（曾用 addAfter/addBefore）把它们当成"在旁边加一层"——
-     * 那等于**保留原版压缩编码器**，本端的 zstd 帧会被它再压一遍（双层压缩）。
-     * 现在安装只做替换，因此这里也只能认原版压缩处理器；否则门控会认为可以安装、
-     * 实际却必然失败，白白重试 20 次才回落。</p>
+     * <p>只认原版<b>压缩</b>编码器：本端的插法是"加在它 tail 侧、再从它的 context 往下写"，
+     * 它的存在就是这套写法的前提。{@code cipher-encoder} 在它 head 侧（更早被加密，
+     * 那我们就得自己处理加密层），{@code minecraft-encoder} 拿到的还是 MC 包对象而不是帧。
+     * 若把这两种也算成锚点，门控会认为"可以装"、实际必然失败，白白重试 20 次才回落。</p>
      */
     private static boolean hasEncoderAnchor(ChannelPipeline p) {
         return p.get("zstd_encoder") != null || p.get(COMPRESSION_ENCODER) != null
@@ -706,15 +718,35 @@ public class ZstdHijacker extends ChannelDuplexHandler {
     }
 
     /**
-     * 入站方向是否有**可替换**的锚点。
+     * 入站方向是否有**可插入**的锚点。
      *
      * <p>⚠️ 同上：绝不能把 {@code minecraft-decoder} 算作锚点。在它之前插入一层会让
-     * 本解码器输出的裸包被它再当成外层帧解析一次，症状是 Velocity 打出
+     * 本解码器输出的包被它再当成外层帧解析一次，症状是 Velocity 打出
      * "A packet frame decoder failed" 并断连。</p>
      */
     private static boolean hasDecoderAnchor(ChannelPipeline p) {
         return p.get("zstd_decoder") != null || p.get(COMPRESSION_DECODER) != null
                 || p.get("decompress") != null;
+    }
+
+    /**
+     * "已经成好形的帧"该从哪个 context 写出：原版压缩处理器的 context。
+     *
+     * <p>⚠️ 这一步不能省：从 {@code zstd_encoder} 的 ctx 往下写会先撞上原版压缩处理器，
+     * 我们的帧被 zlib 再压一遍，对端把 zlib 头当成 dataLength 读 → 第一帧就解析失败。
+     * 写完的帧已经是最终形态（自带 bodyLen），只该继续往下游走（加密 / socket）。</p>
+     *
+     * <p>两种叫法都要认（{@code compression-encoder} / {@code compress}），且必须与
+     * {@code ZstdBatchEncoder#downstream} 用同一套锚点：两处一旦不一致，编码器发出的帧
+     * 和这里发出的握手帧就会落在管线不同位置，其中一边必然被原版再处理一次（错层）。</p>
+     *
+     * <p>兜底退回 {@code zstd_encoder} 的 context：走到那说明原版压缩处理器已被第三方插件
+     * 摘走，管线里不再有能把这一帧再压一遍的处理器，从我们自己的 ctx 往下写仍是最终形态。</p>
+     */
+    private static ChannelHandlerContext compressionWriteCtx(ChannelPipeline pipeline) {
+        ChannelHandlerContext ctx = pipeline.context(COMPRESSION_ENCODER);
+        if (ctx == null) ctx = pipeline.context("compress");
+        return ctx != null ? ctx : pipeline.context("zstd_encoder");
     }
 
     /**
@@ -874,9 +906,9 @@ public class ZstdHijacker extends ChannelDuplexHandler {
     /**
      * 通知客户端"服务端已切换到 zstd，请切换并发确认"（{@code zstd:switch}，载荷 4 字节魔数）。
      *
-     * <p>⚠️ <b>必须经 {@code zstd_encoder} 的 context 写出</b>：此刻原版压缩编码器
-     * 已被替换，外层长度也是由更早的处理器按 zstd 帧补齐的。它会被编码成一个 zstd 直存帧
-     * （几十字节，远低于压缩阈值），对端（已切换的解码器）按 zstd 直存帧读出裸包。</p>
+     * <p>⚠️ <b>从原版压缩处理器的 context 写出</b>（与 {@code ZstdBatchEncoder#downstream}
+     * 同一个位置）：本帧是<b>已经成好形</b>的 zstd 直存帧，不能再让任何编码器处理它；
+     * 对端（已切换到 zstd 的解码器）按直存帧读出裸包。</p>
      *
      * <p>⚠️ 接收方要看<b>包 id 之后</b>的魔数，而不是通道名：本端写的是完整登录查询包
      * {@code [0x04][txId][channelName][magic]}，但客户端一侧的"裸包"只包含
@@ -885,16 +917,19 @@ public class ZstdHijacker extends ChannelDuplexHandler {
      * @return 是否确实发出
      */
     static boolean sendSwitchRequest(Channel channel) {
-        // ⚠️ 从 zstd_encoder 的 ctx 写出，并<b>自己把内容编码成 zstd 直存帧</b>：
-        //   · ctx.write 会跳过 zstd_encoder 本身，所以不能再让它编码一次；
-        //   · 闸门位于压缩编码器<b>之前</b>，从它之后写出不会被自己扣住；
-        //   · Velocity 没有独立 prepender / frame-encoder：外层 bodyLen 由本方法自己写
-        //     （见下面 writeBodyLen 那段），再往 head 走只剩帧长度处理器。
-        //     若照旧注释去"补 frame-encoder"，会写出双层长度前缀 —— 正是 2.0.0 的断连回归形态。
+        // ⚠️ 写出位置是<b>原版压缩处理器的 context</b>，理由逐条：
+        //   · 本帧已是最终形态的 zstd 直存帧，不能再被任何编码器处理一次；
+        //   · 从 zstd_encoder 的 ctx 写会落到原版压缩处理器上——它会把我们的帧再包一层
+        //     [dataLength>0][deflate]，而客户端此刻已经切到 zstd，解出来还是 zstd 帧，
+        //     解析必然错乱（2.0.0 的断连回归就是这个形态）；
+        //   · 从原版压缩处理器之后写，闸门（挂在 minecraft-encoder 的 tail 侧）也不会扣住它；
+        //   · Velocity 侧写外层长度的就是这个「长度 + 压缩」合一的处理器，它被跳过后没人
+        //     替我们补长度，所以下面的帧必须自带 bodyLen —— 若照旧注释去"补 frame-encoder"，
+        //     会写出双层长度前缀，同样回到 2.0.0 的回归形态。
         // 几十字节远低于压缩阈值，直存即可。
-        ChannelHandlerContext writeCtx = channel.pipeline().context("zstd_encoder");
+        ChannelHandlerContext writeCtx = compressionWriteCtx(channel.pipeline());
         if (writeCtx == null) {
-            LOGGER.debug("[Zstd] cannot send switch request — zstd_encoder anchor missing");
+            LOGGER.debug("[Zstd] cannot send switch request — compression anchor missing");
             return false;
         }
         try {
@@ -907,10 +942,11 @@ public class ZstdHijacker extends ChannelDuplexHandler {
                 mikumc.zstd.protocol.ZstdStepFrames.writeQuery(packet, txId,
                         mikumc.zstd.protocol.ZstdSwitchGate.CHANNEL);
 
-                // Velocity 端没有独立 prepender：外层 bodyLen 只由 ZstdBatchEncoder 写。
-                // 我们从编码器之后写出（跳过它），所以必须自己把 bodyLen 补上，
+                // Velocity 端没有独立补外层长度的处理器在我们之后：外层 bodyLen 只能由
+                // "写帧的一方"自带（本方法、以及 ZstdBatchEncoder 里的 writeBodyLen）。
+                // 既然我们从原版压缩处理器之后写，就必须自己把 bodyLen 补上，
                 // 否则客户端 frame-decoder 会把首字节 0x00 当成"帧长为 0"直接抛异常。
-                // 帧格式（v4）：[bodyLen][rawSize=0][packet] —— 直存帧一帧一包、不带内层长度前缀，
+                // 帧格式（v6）：[bodyLen][rawSize=0][packet] —— 直存帧一帧一包、不带内层长度前缀，
                 // 与原版未压缩帧逐字节同形（见 ZstdBatchEncoderBase 的帧格式说明）。
                 int bodyLen = 1 /*rawSize=0*/ + packet.readableBytes();
                 mikumc.zstd.protocol.ZstdVarInts.write(frame, bodyLen);

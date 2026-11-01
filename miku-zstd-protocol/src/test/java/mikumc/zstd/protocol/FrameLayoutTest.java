@@ -44,10 +44,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * 纯 {@code java} 插件，代价最小。</p>
  *
  * <h2>时序确定性</h2>
- * <p>批处理窗口设成 60s（测试期间不会到期），靠"攒够 batch_max_packets 立即成帧"来
- * 精确控制帧边界。注意 <b>直存帧一帧一包</b>（帧格式 v4）：写 N 个小包会得到 N 个帧，
- * 只有压缩帧才会把多个包合成一帧。这样既不依赖虚拟时钟推进，也不会有随机时序抖动。
- * 压缩路径本身是异步的（提交到压缩线程池），那条用例才需要等待。</p>
+ * <p>协议 v7 起<b>攒批边界是 flush</b>：一次 flush 成一帧，兜底定时器设成 60s（测试期间不会到期）。
+ * 所以帧边界由 {@code write()} / {@code flush()} 的调用序列精确决定：
+ * {@code writeOutbound()} 是"write + flush"，每次都会独立成一帧；要验证"多包合一帧"必须
+ * 连续 {@code write()} 再手动 {@code flush()}。注意 <b>直存帧一帧一包</b>：写 N 个小包会得到
+ * N 个帧，只有压缩帧才会把多个包合成一帧。压缩路径本身是异步的（提交到压缩线程池），
+ * 那条用例才需要等待。</p>
  */
 class FrameLayoutTest {
 
@@ -216,9 +218,12 @@ class FrameLayoutTest {
         byte[] p1 = repetitive(300);
         byte[] p2 = repetitive(500);
         byte[] p3 = repetitive(700);
-        ch.writeOutbound(packet(p1));
-        ch.writeOutbound(packet(p2));
-        ch.writeOutbound(packet(p3));
+        // ⚠️ 协议 v7 起攒批边界是 flush：要验证"多包合一帧"，必须 write 三次再 flush 一次
+        // （writeOutbound 每次都会 flush，那会得到三帧）。
+        ch.write(packet(p1));
+        ch.write(packet(p2));
+        ch.write(packet(p3));
+        ch.flush();
 
         ByteBuf frame = readFrame(ch, 5000);
         assertNotNull(frame, "压缩走线程池，需要等待回到 event loop");
@@ -810,6 +815,7 @@ class FrameLayoutTest {
 
         ByteBuf frame = Unpooled.buffer();
         ZstdVarInts.write(frame, body.length); // 声明解压后长度
+        ZstdVarInts.write(frame, 0);              // dictGen（本帧不用滚动历史）
         ZstdVarInts.write(frame, 1);              // blockCount
         ZstdVarInts.write(frame, body.length);    // blockRawLen
         ZstdVarInts.write(frame, compressed.length);
@@ -839,6 +845,7 @@ class FrameLayoutTest {
 
         ByteBuf frame = Unpooled.buffer();
         ZstdVarInts.write(frame, payload.length); // 声明解压后长度
+        ZstdVarInts.write(frame, 0);              // dictGen
         ZstdVarInts.write(frame, 1);              // blockCount
         ZstdVarInts.write(frame, payload.length); // blockRawLen
         ZstdVarInts.write(frame, compressed.length);
@@ -863,6 +870,7 @@ class FrameLayoutTest {
 
         ByteBuf frame = Unpooled.buffer();
         ZstdVarInts.write(frame, payload.length); // 声明解压后长度
+        ZstdVarInts.write(frame, 0);              // dictGen
         ZstdVarInts.write(frame, 1);              // blockCount
         ZstdVarInts.write(frame, payload.length); // blockRawLen
         ZstdVarInts.write(frame, compressed.length);
@@ -900,8 +908,174 @@ class FrameLayoutTest {
 
         ByteBuf frame = Unpooled.buffer();
         ZstdVarInts.write(frame, payload.length);
+        ZstdVarInts.write(frame, 0);              // dictGen
+        ZstdVarInts.write(frame, 1);              // blockCount
+        ZstdVarInts.write(frame, payload.length); // blockRawLen
+        ZstdVarInts.write(frame, compressed.length);
         frame.writeBytes(compressed);
         assertRejectedCompressed(frame);
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // 协议 v7 新增语义：滚动历史 / flush 成帧 / 屏障保序 / 直存地板
+    // ────────────────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("v7 拒绝：帧头 dictGen 与本地代数不一致时必须 fail-fast（不得把脏数据喂给包解码器）")
+    void dictGenerationMismatchRejectsFrame() {
+        // 回归点：dictGen 是两端的"历史是否同源"校验。它一旦被忽略，症状不是压缩率下降，
+        // 而是解压出垃圾 —— 表现为"莫名断连 + 客户端协议错误"，几乎无法归因。
+        TestEncoder encoder = new TestEncoder(true, 0 /* 一律压缩 */, 1);
+        EmbeddedChannel out = new EmbeddedChannel(encoder);
+        out.writeOutbound(packet(repetitive(2048)));
+        ByteBuf frame = readFrame(out, 5000);
+        assertNotNull(frame, "压缩帧应能产出");
+
+        ByteBuf probe = frame.duplicate();
+        int rawSize = ZstdVarInts.tryRead(probe, ZstdVarInts.DEFAULT_MAX_VALUE);
+        assertTrue(rawSize > 0, "用例前提：产出的必须是压缩帧");
+        int genIndex = probe.readerIndex();
+        assertEquals(0, ZstdVarInts.tryRead(probe, 1 << 20), "编码器应写 dictGen=0");
+
+        ByteBuf tampered = frame.retainedDuplicate();
+        tampered.setByte(genIndex, 1); // 冒充 gen=1：本地仍是 0
+
+        TestDecoder decoder = new TestDecoder(decompressCtx);
+        EmbeddedChannel in = new EmbeddedChannel(decoder);
+        in.writeInbound(tampered);
+        in.runPendingTasks();
+        assertNull(in.readInbound(), "代数不符的帧不得产出任何包");
+        assertFalse(in.isOpen(), "代数不符必须 fail-fast 关闭连接");
+        in.finishAndReleaseAll();
+        frame.release();
+        out.finishAndReleaseAll();
+    }
+
+    @Test
+    @DisplayName("v7 对称：同一批帧经过编码器与解码器后，两端滚动历史的代数与字典必须逐字节一致")
+    void rollingHistorySymmetricAcrossTwoEnds() {
+        // 这是整条 v7 的核心不变量：字典不经网络传输，两端各自重建。一旦喂入点/粒度不同，
+        // 代数会分叉 —— 所以必须真的跑过一轮轮换（256KB）再比对，而不是只看第一帧。
+        TestEncoder encoder = new TestEncoder(true, 0, 1);
+        EmbeddedChannel out = new EmbeddedChannel(encoder);
+        TestDecoder decoder = new TestDecoder(decompressCtx);
+        EmbeddedChannel in = new EmbeddedChannel(decoder);
+
+        byte[] chunk = repetitive(8 * 1024);
+        for (int i = 0; i < 48; i++) { // 48 × 8KB ≈ 384KB > 256KB 轮换阈值
+            out.writeOutbound(packet(chunk));
+            ByteBuf frame = readFrame(out, 5000);
+            assertNotNull(frame, "第 " + i + " 帧应产出");
+            feed(in, frame);
+            assertEquals(1, drainInbound(in).size(), "第 " + i + " 帧应还原成 1 个包");
+        }
+
+        assertTrue(encoder.rollingDict().generation() >= 1, "用例前提：应当已经轮换过至少一次");
+        assertEquals(encoder.rollingDict().generation(), decoder.rollingDict().generation(),
+                "两端的字典代数必须一致（这是 dictGen 校验能过的前提）");
+        assertArrayEquals(encoder.rollingDict().activeDict(), decoder.rollingDict().activeDict(),
+                "两端用于压缩/解压的历史字典必须逐字节一致");
+        in.finishAndReleaseAll();
+        out.finishAndReleaseAll();
+    }
+
+    @Test
+    @DisplayName("v7 攒批：连续 write + 一次 flush 只产出一帧（多包合一），且紧接第二帧不应存在")
+    void flushBoundaryProducesOneFrame() {
+        TestEncoder encoder = new TestEncoder(true, 0, 64);
+        EmbeddedChannel ch = new EmbeddedChannel(encoder);
+        ch.write(packet(repetitive(300)));
+        ch.write(packet(repetitive(500)));
+        ch.write(packet(repetitive(700)));
+        ch.flush();
+
+        ByteBuf frame = readFrame(ch, 5000);
+        assertNotNull(frame, "flush 必须成帧");
+        ByteBuf probe = frame.duplicate();
+        int rawSize = ZstdVarInts.tryRead(probe, ZstdVarInts.DEFAULT_MAX_VALUE);
+        assertTrue(rawSize > 0, "三包应合成一帧压缩");
+        assertEquals(1, encoder.frames.size(), "一次 flush 只应产出一帧");
+        assertNull(readFrame(ch), "不应出现第二帧（那样说明 flush 边界没生效）");
+        frame.release();
+        ch.finishAndReleaseAll();
+    }
+
+    @Test
+    @DisplayName("v7 兜底：上游只 write 不 flush 时，兜底定时器必须成帧（否则数据永久滞留）")
+    void fallbackTimerEmitsWithoutFlush() {
+        TestEncoder encoder = new TestEncoder(true, Integer.MAX_VALUE, 64, 10 /* ms */);
+        EmbeddedChannel ch = new EmbeddedChannel(encoder);
+        ch.write(packet(ascii("no-flush"))); // 关键：不 flush
+
+        ByteBuf frame = null;
+        long deadline = System.currentTimeMillis() + 3000;
+        while (frame == null && System.currentTimeMillis() < deadline) {
+            ch.runScheduledPendingTasks();
+            frame = readFrame(ch);
+            if (frame == null) {
+                try {
+                    Thread.sleep(2);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }
+        assertNotNull(frame, "兜底定时器必须把"只写不 flush"的数据送出去");
+        frame.release();
+        ch.finishAndReleaseAll();
+    }
+
+    @Test
+    @DisplayName("v7 保序：非 ByteBuf 出站消息（协议切换任务）必须排在已攒下的帧之后，不得插队")
+    void nonByteBufOutboundKeepsOrder() {
+        // 回归点：协议切换任务是"从出站方向写下来的对象"，一旦它抢在还没写出（异步压缩中）的帧
+        // 前面到达下游，对端就会"协议先切、帧后到"，按新协议解旧帧 → 直接断连。
+        TestEncoder encoder = new TestEncoder(true, 0, 64);
+        EmbeddedChannel ch = new EmbeddedChannel(encoder);
+
+        Object task = new Object(); // 模拟 UnconfiguredPipelineHandler 的任务对象
+        ch.write(packet(repetitive(4096))); // 先攒一个走异步压缩的包
+        ch.write(task);                     // 随后写任务：应被屏障拦住
+        ch.flush();
+
+        Object first = null;
+        long deadline = System.currentTimeMillis() + 5000;
+        while (first == null && System.currentTimeMillis() < deadline) {
+            ch.runPendingTasks();
+            first = ch.readOutbound();
+            if (first == null) {
+                try {
+                    Thread.sleep(2);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }
+        assertTrue(first instanceof ByteBuf, "第一件写出的必须是帧，而不是被推迟的任务");
+        ((ByteBuf) first).release();
+        assertEquals(task, ch.readOutbound(), "任务必须排在帧之后（插队就是协议切换期断连）");
+        ch.finishAndReleaseAll();
+    }
+
+    @Test
+    @DisplayName("v7 地板：直存阈值配成 0 时，握手级小包仍必须直存（否则帧层嗅探器认不出）")
+    void storedThresholdFloorKeepsHandshakeStored() {
+        // zstd:switch 的询问/确认只有十几字节，靠"直存帧 [0][packet]"被帧层嗅探器识别。
+        // 若把它们压成 zstd 帧，嗅探器就认不出，闸门只能等满 5s 超时才放行。
+        TestEncoder encoder = new TestEncoder(true, 0 /* 配成"一律压缩" */, 1);
+        EmbeddedChannel ch = new EmbeddedChannel(encoder);
+        ch.writeOutbound(packet(ascii("swc"))); // 包 id + 3 字节 = 4B，远低于 16B 地板
+
+        ByteBuf frame = readFrame(ch);
+        assertNotNull(frame, "应产出一帧");
+        ByteBuf probe = frame.duplicate();
+        assertEquals(0, ZstdVarInts.tryRead(probe, ZstdVarInts.DEFAULT_MAX_VALUE),
+                "低于 16B 地板时必须直存（rawSize=0），不得被压成 zstd 帧");
+        assertFalse(encoder.lastCompressed, "地板之下的批次不得走压缩");
+        frame.release();
+        ch.finishAndReleaseAll();
     }
 
     // ────────────────────────────────────────────────────────────────
@@ -958,12 +1132,22 @@ class FrameLayoutTest {
         }
     }
 
+    /**
+     * 取出解码器下传的包。
+     *
+     * <p>⚠️ 协议 v7 起解码器<b>不再</b>替换原版 {@code decompress}，它发出的是"原版未压缩帧"
+     * {@code [varint dataLength = 0][packet]}（让下游原版解压器原样透传）。这里把那 1 字节
+     * 前缀剥掉，断言的就是"真实到达包解码器的包体"。</p>
+     */
     private static List<byte[]> drainInbound(EmbeddedChannel in) {
         List<byte[]> out = new ArrayList<>();
         Object o;
         while ((o = in.readInbound()) != null) {
             ByteBuf b = (ByteBuf) o;
             try {
+                int dataLength = ZstdVarInts.tryRead(b, ZstdVarInts.DEFAULT_MAX_VALUE);
+                assertEquals(0, dataLength,
+                        "解码器下传的必须是原版未压缩帧（dataLength=0），否则下游解压器会再解一次");
                 byte[] data = new byte[b.readableBytes()];
                 b.getBytes(b.readerIndex(), data);
                 out.add(data);
@@ -1094,6 +1278,7 @@ class FrameLayoutTest {
         private final boolean bodyLen;
         private final int skip;
         private final int maxPackets;
+        private final int windowMs;
 
         final List<int[]> frames = new ArrayList<>();
         boolean lastCompressed;
@@ -1102,9 +1287,14 @@ class FrameLayoutTest {
         final ZstdCompressLock lock = new ZstdCompressLock();
 
         TestEncoder(boolean bodyLen, int skip, int maxPackets) {
+            this(bodyLen, skip, maxPackets, NEVER_DUE_MS);
+        }
+
+        TestEncoder(boolean bodyLen, int skip, int maxPackets, int windowMs) {
             this.bodyLen = bodyLen;
             this.skip = skip;
             this.maxPackets = maxPackets;
+            this.windowMs = windowMs;
         }
 
         @Override
@@ -1155,10 +1345,10 @@ class FrameLayoutTest {
             lastWire = wireBytes;
         }
 
-        /** 窗口大到测试期间不会到期：成帧只发生在"攒够 max_packets"这一刻。 */
+        /** 默认大到测试期间不会到期：成帧只发生在 flush / 攒够 max_packets 这一刻。 */
         @Override
         protected int configBatchWindowMs() {
-            return NEVER_DUE_MS;
+            return windowMs;
         }
 
         @Override

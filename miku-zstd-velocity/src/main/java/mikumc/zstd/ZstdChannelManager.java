@@ -17,10 +17,12 @@ import org.slf4j.LoggerFactory;
  * <p>持有 zstd 压缩/解压上下文与协商状态机。生命周期：嗅探器检测到
  * {@code \0ZSTD\0} 握手标记时创建，连接关闭时释放本地资源。</p>
  *
- * <h2>帧格式（v4；协商版本见 {@link #PROTOCOL_VERSION}）</h2>
+ * <h2>帧格式（v6；协商版本见 {@link #PROTOCOL_VERSION}）</h2>
  * <ul>
  *   <li>服务端 → 客户端帧：{@code [varint bodyLen][varint rawSize][zstd(payload) | packet]}
- *       —— Velocity 4.x 管线无独立 frame-encoder，编码器<b>自带</b> bodyLen 外层长度。</li>
+ *       —— Velocity 把「写外层长度」与「压缩」放在<b>同一个</b>处理器里，我们的帧要从它
+ *       之后写出（才能跳过它），于是 bodyLen 由编码器<b>自带</b>
+ *       （见 {@code ZstdBatchEncoder#writeBodyLen}）。</li>
  *   <li>客户端 → 服务端帧：{@code [varint rawSize][zstd(payload) | packet]}
  *       —— 外层长度由客户端管线的 prepender 负责，服务端 frame-decoder 剥离后
  *       本解码器收到的即完整帧负载。</li>
@@ -356,26 +358,37 @@ public class ZstdChannelManager {
     // ── 管线安装 ──
 
     /**
-     * 用 zstd 编码器替换原版压缩编码器。
+     * 把 zstd 编码器插到原版压缩编码器的 <b>tail 侧</b>（出站先经过我们）。
+     *
+     * <p>⚠️ 这里是<b>插入</b>，不是"替换"。出站事件从 tail 走向 head，{@code addAfter}
+     * 让本处理器排在原版压缩处理器<b>前面</b>：包先被我们收进批次，成帧后从
+     * <b>原版处理器的 context</b> 往下写（见 {@code ZstdBatchEncoder#downstream}），
+     * 等于绕过它、但不拆它。</p>
+     *
+     * <p>为什么不再替换：原版处理器一旦被摘掉就<b>装不回去</b>（Netty 对非
+     * {@code @Sharable} 实例的 added 标志永不重置），于是任何一次"只装上一半"都只能
+     * 以关连接收场；而且按名字查它的一批插件会直接落空。插入形态下回落只是"把自己摘掉"，
+     * 原版那两个处理器从头到尾都在原位（见 {@link #uninstallZstd}）。</p>
+     *
+     * <p>⚠️ 也不能插到 {@code minecraft-encoder} 旁边：那里消息还是 MC 包对象，不是帧；
+     * 更不能用 {@code addBefore} 插到原版压缩处理器的 head 侧——那样出站会<b>先被原版
+     * 压一遍</b>再交给我们，对端解一层后仍是 zstd 帧（双层压缩，解析错乱）。</p>
      *
      * @return 是否确实安装成功（false 表示管线中找不到任何可用锚点）
      */
     public boolean installEncoder(Channel channel) {
         if (channel == null) return false;
         var p = channel.pipeline();
+        // ⚠️ 幂等：激活重试会反复调用，已经装过就直接成功（不能再插一份同名处理器）
         if (p.get("zstd_encoder") != null) return true;
         // Velocity 4.x 的原版压缩编码器可能叫 compression-encoder 或 compress
         for (String anchor : new String[]{"compression-encoder", "compress"}) {
             if (p.get(anchor) != null) {
-                p.replace(anchor, "zstd_encoder", new ZstdBatchEncoder());
+                p.addAfter(anchor, "zstd_encoder", new ZstdBatchEncoder());
                 return true;
             }
         }
-        // ⚠️ 同理，绝不能 addAfter("cipher-encoder") / addBefore("minecraft-encoder")：
-        // 那会**保留**原版压缩编码器，本编码器产出的 zstd 帧会被它再压缩一遍（双层压缩），
-        // 对端解一层后得到的仍是 zstd 帧，表现为解析错乱/断连。
-        // "接管压缩"的唯一正确形态是**替换**原版压缩处理器。
-        LOGGER.warn("[Zstd] encoder not installed — no replaceable anchor found in pipeline {}", p.names());
+        LOGGER.warn("[Zstd] encoder not installed — compression anchor missing in pipeline {}", p.names());
         return false;
     }
 
@@ -390,8 +403,9 @@ public class ZstdChannelManager {
      *       的 tail 侧，出站才会"先经过闸门（拿到 Packet）、再到编码器"；</li>
      *   <li>被扣的包在放行时走的是"当时的"编码器 —— 激活后就是 zstd 编码器，
      *       因此客户端收到的一定是 zstd 帧（而确认之前客户端收到的都是原版帧）；</li>
-     *   <li>切换请求由服务端经 {@code zstd_encoder} 的 ctx 写出，那是本闸门<b>更靠 head</b>
-     *       的一侧，不会回头经过它，握手不会自扣留。</li>
+     *   <li>切换请求由服务端经<b>原版压缩处理器的 context</b> 写出（见
+     *       {@code ZstdHijacker#sendSwitchRequest}）—— 那是本闸门<b>更靠 head</b> 的一侧，
+     *       不会回头经过它，握手不会自扣留。</li>
      * </ul>
      *
      * <p>⚠️ 锚点<b>不能</b>是压缩编码器（{@code compression-encoder}）：它消费的是 ByteBuf，
@@ -426,11 +440,16 @@ public class ZstdChannelManager {
         switchGate = mikumc.zstd.protocol.ZstdSwitchGate.create();
         p.addAfter("minecraft-encoder", "zstd_switch_gate", switchGate);
 
-        // 确认嗅探器挂在压缩解码器之前（帧层）：确认包可能被原版压缩或直存
+        // 确认嗅探器挂在<b>我们解码器的上游</b>（帧层）：确认包可能被原版压缩或直存
         if (p.get("zstd_switch_confirm") == null) {
-            // ⚠️ 也要认 zstd_decoder：解码器可能已经被替换，原名字已不存在。
+            // ⚠️ 锚点顺序 = 我们上游优先。嗅探器按"对端发来的原始帧形态"识别确认包
+            //（{@code [0][packet]} 或 {@code [dataLength][packet]}），所以它必须排在
+            // {@code zstd_decoder} <b>之前</b>：一旦落到我们解码器下游，它看到的已经是
+            // 重新封装过的输出，一个字节都对不上，闸门只能干等满 5 秒超时。
+            // 首次激活时解码器还没装，就先挂到原版压缩解码器之前——随后 installDecoder 的
+            // addBefore 会把 zstd_decoder 插进两者之间，相对位置仍然在上游。
             boolean installed = false;
-            for (String anchor : new String[]{"compression-decoder", "decompress", "zstd_decoder"}) {
+            for (String anchor : new String[]{"zstd_decoder", "compression-decoder", "decompress"}) {
                 if (p.get(anchor) != null) {
                     p.addBefore(anchor, "zstd_switch_confirm", new ZstdSwitchConfirmSniffer());
                     installed = true;
@@ -504,37 +523,98 @@ public class ZstdChannelManager {
     }
 
     /**
-     * 安装编解码器（先装闸门，再装编码器，最后装解码器）。
+     * 安装编解码器（先装闸门，再装编码器，最后装解码器）。任一步失败都<b>整体回滚</b>。
      *
      * <p>⚠️ 顺序不可调换：</p>
      * <ol>
-     *   <li>闸门必须先于 {@code zstd_encoder} 插入——否则激活之后到确认之前，
+     *   <li>闸门必须先于 {@code zstd_encoder} 就位——否则激活之后到确认之前，
      *       出站帧会以 zstd 形态直接发给还没切换的客户端；而它同时必须先于
      *       {@code zstd_decoder} 就位：解码器在确认之前只按原版规则解释；</li>
      *   <li>{@code zstd_encoder} 的 {@code handlerAdded} 会立即解析压缩上下文，
      *       因此必须在字典装载之后插入。</li>
      * </ol>
      *
-     * <p>⚠️ <b>闸门装不上就必须整体放弃激活</b>：闸门的锚点集合与编码器完全相同
-     * （{@code compression-encoder} / {@code compress}），所以正常不该出现"闸门失败、
-     * 编码器成功"。真出现时后果极严重——没有闸门就没有"确认"这个信号，
+     * <p>⚠️ <b>闸门装不上就必须整体放弃激活</b>：没有闸门就没有"确认"这个信号，
      * {@code isSwitchConfirmed()} 恒为 false，解码器会<b>永久停在"原版兼容窗口"</b>：
      * 客户端切换后发来的 zstd 压缩帧会被当作原版 deflate 帧解压 → 失败 → 断连。
      * 宁可回落原版。</p>
+     *
+     * <p>失败路径一律 {@link #uninstallZstd} 收场而不是关连接：原版处理器从来没被摘掉
+     *（v7 起只插入不替换），摘干净我们自己的四个 handler 之后管线就是完整原版形态，
+     * 调用方可以按原版压缩补发扣住的登录包；而且此刻客户端还没收到 {@code zstd:switch}，
+     * 两边对"用哪种压缩"的理解必然一致。</p>
      *
      * @return 是否确实安装成功
      */
     public boolean installHandlers(Channel channel) {
         if (!installSwitchGate(channel)) {
             LOGGER.warn("[Zstd] 切换闸门安装失败（锚点缺失）— 放弃本次激活，回落原版 zlib");
+            uninstallZstd(channel);
             return false;
         }
-        if (!installEncoder(channel)) return false;
-        return installDecoder(channel);
+        if (!installEncoder(channel)) {
+            uninstallZstd(channel);
+            return false;
+        }
+        if (!installDecoder(channel)) {
+            uninstallZstd(channel);
+            return false;
+        }
+        return true;
     }
 
     /**
-     * 用 zstd 解码器替换原版压缩解码器。
+     * 摘掉本插件装上的所有 handler（幂等），管线回到完整原版形态。
+     *
+     * <p>协议 v7 起原版压缩处理器<b>从来没有被移除过</b>（只插入、不替换），所以"回落原版"
+     * 就等于"把自己摘干净"：{@code compression-encoder} / {@code compression-decoder}
+     * 一直在原位，摘掉之后入站出站都回到原版 zlib 路径。旧实现替换掉了它们，回落时
+     * 无处理器可装回（Netty 对非 {@code @Sharable} 实例的 added 标志永不重置），
+     * 只能关连接——那正是这次改掉的东西。</p>
+     *
+     * <p>⚠️ 必须先于 {@code giveUp} 的补发：补发的包要按"当时的"管线编码，
+     * 而摘掉之后管线里剩下的就是原版压缩处理器。</p>
+     *
+     * <p>⚠️ 只按名字摘<b>自己的</b>东西：绝不能顺手碰 {@code compression-encoder} /
+     * {@code compression-decoder} / {@code frame-decoder}，那些都是原版的。</p>
+     *
+     * <p>⚠️ 只能在 event loop 上调用（与安装同一条路径）：移除 ByteToMessageDecoder
+     * 会触发它的 {@code handlerRemoved}，那里面要做释放，跨线程摘会被 Netty 拒绝。</p>
+     */
+    public void uninstallZstd(Channel channel) {
+        if (channel == null) return;
+        var p = channel.pipeline();
+        for (String name : new String[]{"zstd_encoder", "zstd_decoder",
+                "zstd_switch_gate", "zstd_switch_confirm"}) {
+            // remove 对不存在的名字会抛 NoSuchElementException，先判存在
+            if (p.get(name) != null) {
+                p.remove(name);
+            }
+        }
+        // 闸门实例已经离开管线：字段必须一起清空，否则 isSwitchConfirmed() 仍在读一个
+        // 已脱离管线的实例（它的内部状态停在"已确认"，与被摘除的事实相反）。
+        switchGate = null;
+        // 本连接不再走 zstd：计数与状态一起回退（setReplaced 幂等，未激活时是空操作）
+        setReplaced(false);
+    }
+
+    /**
+     * 把 zstd 解码器插到原版压缩解码器的 <b>上游</b>（入站先经过我们）。
+     *
+     * <p>入站事件从 head 走向 tail，{@code addBefore} 让本处理器排在原版解压处理器
+     * <b>前面</b>：帧由我们拆、包由我们解，然后每个包以<b>原版未压缩帧</b>
+     * {@code [0][packet]} 交给原版 {@code decompress}——它对 {@code dataLength == 0}
+     * 是原样透传，于是它仍然在管线里"干活"，只是什么都不改
+     *（见 {@code ZstdBatchDecoderBase} 的 {@code vanillaFrame}）。</p>
+     *
+     * <p>⚠️ 必须是"插在它上游"，既不能替换也不能插在它下游：替换会回到"摘掉装不回"的
+     * 死局；而插到下游则完全无效——原版会先把我们的 zstd 帧当成原版压缩帧去解，
+     * 一帧都过不去。</p>
+     *
+     * <p>⚠️ 绝不能 {@code addBefore("minecraft-decoder")}：那是在<b>保留</b> MC 帧解码器的
+     * 前提下再加一层，本解码器输出的包会被它当成外层帧<b>再解析一次</b>，必然失败 ——
+     * 症状是 Velocity 打出 "A packet frame decoder failed"（QuietRuntimeException）并断连，
+     * 而我们自己的解码器不会报任何 "frame rejected"，极难归因。</p>
      *
      * <p>⚠️ 调用前 {@link #installSwitchGate} 必须已执行（见 {@link #installHandlers}）。</p>
      *
@@ -544,20 +624,13 @@ public class ZstdChannelManager {
         if (channel == null) return false;
         var p = channel.pipeline();
         if (p.get("zstd_decoder") != null) return true;
-        if (p.get("compression-decoder") != null) {
-            p.replace("compression-decoder", "zstd_decoder", new ZstdBatchDecoder());
-            return true;
+        for (String anchor : new String[]{"compression-decoder", "decompress"}) {
+            if (p.get(anchor) != null) {
+                p.addBefore(anchor, "zstd_decoder", new ZstdBatchDecoder());
+                return true;
+            }
         }
-        if (p.get("decompress") != null) {
-            p.replace("decompress", "zstd_decoder", new ZstdBatchDecoder());
-            return true;
-        }
-        // ⚠️ 绝不能 addBefore("minecraft-decoder")：那是在**保留** Minecraft 帧解码器的
-        // 前提下再加一层，本解码器输出的裸包会被 minecraft-decoder 当成外层帧**再解析一次**，
-        // 必然失败 —— 症状是 Velocity 打出 "A packet frame decoder failed"
-        // （QuietRuntimeException）并断连，而我们自己的解码器不会报任何 "frame rejected"，
-        // 极难归因。正确做法与上面两条一致：**替换**，让"拆外层帧 + 解压"只由一层负责。
-        LOGGER.warn("[Zstd] decoder not installed — no replaceable anchor found in pipeline {}", p.names());
+        LOGGER.warn("[Zstd] decoder not installed — compression anchor missing in pipeline {}", p.names());
         return false;
     }
 

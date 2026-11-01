@@ -40,7 +40,13 @@ public class ZstdConfig {
     public final int compressThreads;
     public final boolean hudEnabled;
 
-    /** 帧格式 v3 的批处理窗口（毫秒）：窗口内发出的多个包合成一帧 */
+    /**
+     * 兜底窗口（毫秒）：仅在"上游只 {@code write} 不 flush"时才轮得到。
+     *
+     * <p>协议 v7 起攒批边界是上游自己的 {@code flush}（一次 flush 成一帧），
+     * 本值不再是"攒包时长"——正常流量下 flush 总是先到，定时器会被取消。详见
+     * {@code ZstdBatchEncoderBase} 的类注释。</p>
+     */
     public final int batchWindowMs;
     /** 单帧最多合并多少个包 */
     public final int batchMaxPackets;
@@ -61,7 +67,7 @@ public class ZstdConfig {
         this.level = clamp(getInt(c, "level", 3), 1, 22);
         this.windowLog = clamp(getInt(c, "window_log", 20), 10, 27);
         this.compressThreads = clamp(getInt(c, "threads", 0), 0, 256);
-        this.batchWindowMs = clamp(getInt(c, "batch_window_ms", 2), 0, 1000);
+        this.batchWindowMs = clamp(getInt(c, "batch_window_ms", 50), 0, 1000);
         this.batchMaxPackets = clamp(getInt(c, "batch_max_packets", 64), 1, 4096);
         this.skipCompressBelowBytes = clamp(getInt(c, "skip_compress_below_bytes", 48), 0, 65536);
         this.skipCompressBelowBytesWithDict =
@@ -165,16 +171,19 @@ public class ZstdConfig {
                       # 一般保持 0（自动）即可，只有在日志里看到压缩明显排队时才考虑调整。
                       threads: 0
 
-                      # ── 批处理（帧格式 v3 引入）──
-                      # 把时间窗内发出的多个包合成一帧再压缩。
+                      # ── 批处理（协议 v7 起以 flush 为界）──
+                      # 一次 flush 成一帧：上游（tick 末尾、区块发送完成、登录期写包）本来就在
+                      # 这些时机 flush，帧边界与它们天然对齐，不额外增加任何延迟。
                       # 实测收益很大：每包单独成帧时，帧头与熵表的重复发送几乎吃掉小包的全部收益
-                      #（小包甚至会膨胀到 105%，只能直存）；合批后可再省约 34% 线路字节。
+                      #（小包甚至会膨胀到 105%，只能直存）；跨帧重复则由滚动历史字典补回来。
                       #
-                      # batch_window_ms 是"攒包"的时长，代价是等量的延迟。
-                      # ⚠️ 这是【每个包都要等】的固定开销，ping 往返会翻倍计：
-                      #     3ms → 往返 +6ms；1ms → 往返 +2ms。取 1 几乎不损失带宽收益。
-                      # ⚠️ 不要设 0：那等于关闭批处理（每包一帧），带宽收益会消失。
-                      batch_window_ms: 2
+                      # batch_window_ms 只是【兜底】：上游若只 write 不 flush（少数插件会这么干），
+                      # 包不能无限期滞留在管线里，到点强制成帧。
+                      # ⚠️ 正常流量下这个定时器【永远轮不到】——flush 会先到并把它取消，
+                      #    所以它不产生任何额外延迟；调大它也不会"攒更多包"（攒批边界是 flush）。
+                      # ⚠️ 取 0 表示"只写即出帧"：这时每个包单独成帧，等于放弃跨包合批，
+                      #    只在上游确实从不 flush、又要求最低延迟时才这么设。
+                      batch_window_ms: 50
 
                       # 单帧最多合并多少个包（防止极端流量下内存与延迟失控）。
                       batch_max_packets: 64

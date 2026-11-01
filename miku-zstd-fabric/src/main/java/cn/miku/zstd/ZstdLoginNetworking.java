@@ -93,7 +93,7 @@ public final class ZstdLoginNetworking {
             // ⚠️ 这里<b>不</b>安装切换嗅探器：此刻压缩处理器还没装，唯一的锚点会是
             // packet_handler —— 那里收到的是已解码的 Packet 对象，帧层识别根本不会执行，
             // 而且之后再也不会被挪到正确位置（安装幂等）。正确时机在
-            // ZstdClientActivation.activateInEventLoop 替换出 zstd_decoder 之后。
+            // ZstdClientActivation.activateInEventLoop 装上 zstd_decoder 之后。
 
             // 每个方向：READY = 已就绪（无需字典或本地已缓存），NEED_DICT = 需要服务端推送
             byte encoderStatus = resolve(mgr, encoderDictId, true);
@@ -183,13 +183,12 @@ public final class ZstdLoginNetworking {
                         .set(ZstdChannelManager.TransportState.NEGOTIATING);
                 // ⚠️ 状态刚变成 NEGOTIATING，但客户端原有的两个激活触发点
                 //（setupCompression / handleCompression 的 TAIL）是 SetCompression 处理时跑的，
-                // 那时本端还停在 PLAIN 而跳过了 —— 必须在这里补一次，否则客户端永不替换管线，
+                // 那时本端还停在 PLAIN 而跳过了 —— 必须在这里补一次，否则客户端永不切入 zstd，
                 // 而服务端收到本条应答后已开始发 zstd 帧 → 单侧 zstd → 必断连。
-                // 回调挂在"本条应答写出"之后：提前替换出站管道会让这条应答以 zstd 帧发出去，
+                // 回调挂在"本条应答写出"之后：提前切换出站管道会让这条应答以 zstd 帧发出去，
                 // 而服务端此时还没有 zstd 解码器、帧层嗅探器也只认裸帧 → 协商直接失败。
-                // ⚠️ 只补装切换嗅探器，不提前替换编解码器：客户端要等服务端的
-                // zstd:switch 才切（见 prepareForSwitch 的说明）。提前切会让"服务端回落原版"
-                // 时的补发包全部解不开。
+                // 补的是完整激活（插编解码器 + 装切换嗅探器）：嗅探器负责把"已切换"的确认
+                // （带魔数）回给服务端的闸门，让它立刻放行扣住的登录包，而不是干等 5 秒超时。
                 listenerConsumer.accept(operation ->
                         ZstdClientActivation.prepareForSwitch(channel));
             } else {

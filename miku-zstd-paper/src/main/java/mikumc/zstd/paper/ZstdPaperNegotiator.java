@@ -471,9 +471,10 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
     /**
      * 安装 zstd 编解码器（独立重试循环，预算 {@link #MAX_RETRIES}）。
      *
-     * <p>先确认<b>两端都能替换</b>再动手：若先装编码器、再发现解码器锚点缺失就返回，
-     * 管道会停在"zstd 出站 / 原版入站"的半装状态——客户端以 zstd 发帧、却按原版解帧，
-     * 是必然的乱码断连，且两侧日志都显示"激活过"，极难定位。</p>
+     * <p>先确认<b>两端都有可插入的锚点</b>再动手：虽然协议 v7 起随时可以用
+     * {@link ZstdPaperChannelManager#uninstallZstd(io.netty.channel.Channel)} 回滚，
+     * 但"只装上一侧"的中间态本来就是单侧 zstd（客户端按 zstd 发、我们按原版解），
+     * 没必要先制造出来再修——两侧日志都会显示"激活过"，事后极难归因。</p>
      *
      * <p>原版 compress/decompress 是在 SetCompression 写出<b>之后</b>才安装的，
      * 所以首轮必然找不到锚点——必须重试，但重试期间要保持 holding，
@@ -531,27 +532,29 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
                         RETRY_MS, TimeUnit.MILLISECONDS);
                 return;
             }
-            LOGGER.warn("[Zstd] zstd 编码器安装失败（锚点在位却替换失败）— 回落原版; pipeline={}",
+            LOGGER.warn("[Zstd] zstd 编码器安装失败（锚点在位却插入失败）— 回落原版; pipeline={}",
                     channel.pipeline().names());
             finishVanilla(ctx);
             return;
         }
         if (!mgr.installDecoder(channel)) {
-            // 解码器安装失败（锚点刚校验过却仍失败，多为竞态）：先按 100ms 重试；
-            // ⚠️ 这里<b>不能</b>"回滚已装的编码器"——原版处理器实例已被移除过一次，
-            // Netty 对非 @Sharable handler 的 added 标志永不重置，重新插入必抛
-            // ChannelPipelineException。重试耗尽时只能收尾（见下）。
+            // 解码器安装失败（锚点刚校验过却仍失败，多为竞态）：先按 100ms 重试。
             if (installAttempt < MAX_RETRIES) {
                 channel.eventLoop().schedule(() -> installHandlers(ctx, mgr, installAttempt + 1),
                         RETRY_MS, TimeUnit.MILLISECONDS);
                 return;
             }
-            // ⚠️ 重试耗尽时<b>不能</b> finishVanilla：编码器已经被换成 zstd，管线停在
-            // "出站 zstd / 入站原版"的必断连状态，把扣住的包按原路径发出去等于对端解不开。
-            // 只能明确收尾（补发 promise 由闸门侧负责，这里直接关连接）。
-            LOGGER.error("[Zstd] zstd 解码器安装失败（锚点在位却替换失败）— 关闭连接; pipeline={}",
+            // ⚠️ 重试耗尽：摘掉已装上的编码器再收尾。协议 v7 起原版 compress/decompress
+            // 从来没被拆过，"回滚"就是把自己那几个处理器摘干净（uninstallZstd），管线随即
+            // 回到标准原版形态，不会再停在"出站 zstd / 入站原版"的必断连中间态。
+            // 旧实现做不到这一步：它用 pipeline.replace 把原版实例拿走过，而非 @Sharable
+            // 的 handler 一旦移除就再也放不回去，所以当时这里只能关连接。
+            // 注意 finishVanilla 在扣包窗口内仍会关连接（客户端在 SetCompression 时就已经
+            // 切过 zstd，两侧只能同时放弃），但此时管线是原版形态，收尾不会写出半截 zstd 帧。
+            LOGGER.error("[Zstd] zstd 解码器安装失败（锚点在位却插入失败）— 摘除自身并回落原版; pipeline={}",
                     channel.pipeline().names());
-            channel.close();
+            mgr.uninstallZstd(channel);
+            finishVanilla(ctx);
             return;
         }
         mgr.setReplaced(true); // 计数已内聚在 setReplaced 内（幂等，避免重复 +1）
@@ -723,17 +726,27 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
     /**
      * 发送"服务端已切换，请切换并发确认"（{@code zstd:switch}，4 字节魔数）。
      *
-     * <p>⚠️ 经 {@code zstd_encoder} 的 context 写出：此刻原版压缩编码器已被替换，
-     * 外层长度由 prepender 负责，对端（已切换的解码器）按 zstd 直存帧读出裸包。</p>
+     * <p>⚠️ 必须经<b>原版压缩处理器</b>的 context 写出。协议 v7 起它还在管线里（我们只是
+     * 插在它出站方向的 tail 侧），从它的 context 往下写等于跳过它自己、继续走 prepender。
+     * 若改从 {@code zstd_encoder} 的 context 写，这一帧会被原版 {@code compress} 再压一遍
+     * ——对端读到的 {@code dataLength} 就成了 zlib 流的头几个字节，必然解析失败。</p>
+     *
+     * <p>帧本身仍是直存形态 {@code [0][packet]}，外层长度由 prepender 补。对端在
+     * <b>原版压缩</b>状态下也能读它（与原版未压缩帧逐字节同形）——"先切换再确认"的时序
+     * 就建立在这条同形性上。</p>
      */
     private static void sendSwitchRequest(Channel channel) {
-        // ⚠️ 从 zstd_encoder 的 ctx 写出，并自己编码成 zstd 直存帧：
-        //   · ctx.write 会跳过 zstd_encoder 本身，所以不能再让它编码一次；
-        //   · 闸门位于压缩编码器之前，从它之后写出不会被自己扣住；
-        //   · 外层长度由 prepender 负责（Paper 有独立 prepender）。
-        io.netty.channel.ChannelHandlerContext writeCtx = channel.pipeline().context("zstd_encoder");
+        // ⚠️ 写出位置：原版压缩处理器的 context（跳过它，保留 prepender）。
+        //   · 闸门在更靠 tail 的一侧（出站先经过它），从这里写出不会被自己扣住；
+        //   · 帧是手工编好的，绝不能再见一次压缩器（理由见方法注释）；
+        //   · 找不到原版处理器时退回 zstd_encoder 的 ctx —— 那一格之后再无压缩器，
+        //     帧不会被压第二遍（这种管线本来也是第三方改过的）。
+        var pipeline = channel.pipeline();
+        io.netty.channel.ChannelHandlerContext writeCtx = pipeline.context("compress");
+        if (writeCtx == null) writeCtx = pipeline.context("compression-encoder");
+        if (writeCtx == null) writeCtx = pipeline.context("zstd_encoder");
         if (writeCtx == null) {
-            LOGGER.debug("[Zstd] cannot send switch request — zstd_encoder anchor missing");
+            LOGGER.debug("[Zstd] cannot send switch request — no compression anchor in pipeline");
             return;
         }
         ByteBuf packet = writeCtx.alloc().buffer();
@@ -744,7 +757,7 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
             if (mgr != null) mgr.expectSwitchTxId(txId);
             mikumc.zstd.protocol.ZstdStepFrames.writeQuery(packet, txId,
                     mikumc.zstd.protocol.ZstdSwitchGate.CHANNEL);
-            // 帧格式（v4）：[rawSize=0][packet] —— 直存帧一帧一包、不带内层长度前缀，
+            // 帧格式（v6）：[rawSize=0][packet] —— 直存帧一帧一包、不带内层长度前缀，
             // 与原版未压缩帧逐字节同形（见 ZstdBatchEncoderBase 的帧格式说明）。
             ZstdVarInts.write(frame, 0);
             frame.writeBytes(packet);

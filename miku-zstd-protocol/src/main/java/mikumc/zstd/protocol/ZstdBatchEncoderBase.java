@@ -16,15 +16,21 @@ import java.util.concurrent.TimeUnit;
 import java.nio.channels.ClosedChannelException;
 
 /**
- * Miku-ZSTD 出站编码器基类（帧格式 <b>v4</b>，协商版本 v5）——三端共享实现。
+ * Miku-ZSTD 出站编码器基类（帧格式 <b>v6</b>，协商版本 v7）——三端共享实现。
  *
- * <h2>帧格式（v4）</h2>
+ * <h2>帧格式（v6）</h2>
  * <pre>
- *   [varint bodyLen?][varint rawSize][zstd(payload) | packet]
- *   payload = [varint pktLen][pkt] [varint pktLen][pkt] ...   // 仅 rawSize > 0
+ *   [varint bodyLen?][varint rawSize][varint dictGen][varint blockCount] + block...
+ *   block = [varint blockRawLen][varint chunkLen][chunk]
+ *   payload（解压后）= [varint pktLen][pkt] [varint pktLen][pkt] ...
  * </pre>
  * <p>{@code rawSize == 0} 表示未压缩直存：此时帧体<b>恰好是一个包</b>（{@code [0][packet]}），
  * 与原版未压缩帧<b>逐字节同形</b>。</p>
+ *
+ * <p>⚠️ {@code dictGen} <b>只出现在压缩帧里</b>（{@code rawSize > 0} 之后），直存帧一个字节都不多。
+ * 这不是随手定的顺序：直存帧"与原版未压缩帧逐字节同形"是<b>整个切换窗口的安全前提</b>
+ * （见下文的协议保证），一旦给它加字段，这条同形性就没了，窗口内"按原版解释"的兼容路径
+ * 立刻失效。直存帧本来也不使用字典（低于跳过阈值），不需要代数。</p>
  *
  * <p>⚠️ <b>直存帧必须一帧一包，且不能带任何内层长度前缀</b>。原版 {@code CompressionDecoder}
  * 及其后的包解码器会把 dataLength 之后的<b>全部</b>字节当成<b>一个</b>包；在 0 之后多写一层
@@ -34,15 +40,42 @@ import java.nio.channels.ClosedChannelException;
  * 当包 id 查注册表），判据与上者相同。逐字节同形后，任何一层（本插件解码器 / 原版解码器 /
  * 包解码器 / Velocity 的校验器）都能正确解释，<b>不存在任何字节级启发式</b>。</p>
  *
- * <p>{@code bodyLen} 只由 <b>服务端</b>写（Velocity 管线无独立 frame-encoder）；客户端侧由
+ * <p>{@code bodyLen} <b>只由 Velocity 写</b>：它 4.x 的压缩编码器把"外层长度 + 压缩"合在同一个
+ * 处理器里，跳过它就必须自带长度。Paper / Fabric 的 {@code prepender} 仍在写帧路径下游，由它负责；客户端侧由
  * prepender 负责外层长度，子类通过 {@link #writeBodyLen()} 声明。</p>
  *
- * <h2>批处理</h2>
- * <p>把时间窗（各端配置项决定，默认 1ms）内发出的多个包合成一帧 —— <b>只对压缩帧有效</b>：实测
- * 每包单独压缩成帧时，帧头与熵表重复发送几乎吃掉小包的全部收益（小包甚至膨胀到 105%，只能
- * 直存）；而直存帧按定义本就是"小到不值得压缩"的包，一帧一包多摊的 2~3 字节帧头可以忽略。</p>
- * <p>为不破坏批处理，窗口等待期间的 {@code flush()} 被<b>吞掉</b>（数据由窗口
- * 到期后的统一 flush 送出）；无待发包时 flush 照常透传。</p>
+ * <h2>批处理：以 flush 为界</h2>
+ * <p><b>一个 flush 成出一帧</b>：{@code flush()} 到达时把攒下的包合成一帧、写出并 flush。
+ * 这样攒批边界就是<b>上游本来就在发生的 flush</b>——服务端在 tick 末尾、区块发送完成、
+ * 登录期写包时都会 flush，帧边界天然与它们对齐，<b>不额外增加任何延迟</b>。</p>
+ *
+ * <p>历史沿革（为什么不是定时器）：旧实现是"吞掉 {@code flush()}，再用一个 2ms 定时器成帧"。
+ * 那是纯粹的固定开销：每个包都要等满窗口（往返 +4ms），却<b>并不对齐</b> tick ——
+ * 一 tick 内多次 flush 照样被切成多帧；而窗口到期的那一帧还会与 tick 末尾的 flush 撞车。
+ * 更要命的是它在"上游只 write 不 flush"和"上游 writeAndFlush 极频繁"两种极端下都表现最差。</p>
+ *
+ * <p>保留一个<b>兜底窗口</b>（{@code configBatchWindowMs()}，默认 50ms）：上游若只 {@code write()}
+ * 不 flush（少数插件会这么干），包不能无限期滞留，到点强制成帧。正常流量下这个定时器
+ * <b>永远轮不到</b>——flush 会比它先到，届时定时器被取消。</p>
+ *
+ * <p>为什么"每 flush 一帧"不会把压缩率做烂：帧是独立压缩的，单看一帧，帧头与熵表确实要重复
+ * 发送（实测每包单独成帧时小包甚至会膨胀到 105%，只能直存）。但这个损失已被
+ * {@link ZstdRollingDict} 的<b>跨帧历史</b>补回来——每一帧都能向前引用最多 64KB 的原始历史，
+ * 上一帧发过的内容这一帧直接匹配，不再依赖"同一帧内合批"来摊薄熵表。两条改动必须
+ * <b>一起</b>上：只改成 flush 成帧而不引入历史字典，带宽会退回到"每包一帧"的水平。</p>
+ *
+ * <h2>安装位置（协议 v7 起）</h2>
+ * <p>本处理器<b>不替换</b>原版压缩处理器，而是插在它<b>tail 侧</b>（出站先经过本类），
+ * 然后把成帧结果从<b>原版处理器的 context</b> 往下写 —— 绕开它，但不拆它。
+ * 这样做换来三件事：</p>
+ * <ul>
+ *   <li>原版 {@code compress} / {@code prepender} 一直留在管线里，ViaVersion / PacketEvents /
+ *       Grim 这类<b>按名字查找</b>它们的插件照常工作；</li>
+ *   <li>回落原版只是"把自己摘掉"，不存在"原版处理器已被移除、Netty 非 {@code @Sharable}
+ *       实例无法重新插入"的死局（旧实现因此只能关连接）；</li>
+ *   <li>不再有"只装上一半"的中间态——最坏情况是这一帧没走 zstd，而不是单侧 zstd 必断连。</li>
+ * </ul>
+ * <p>具体写到哪个 context 由子类的 {@link #downstream(ChannelHandlerContext)} 决定。</p>
  *
  * <h2>为什么放在共享模块</h2>
  * <p>本类与 {@link ZstdBatchDecoderBase} 是两端唯一需要"逐字节对称"的代码：
@@ -98,7 +131,7 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
      *
      * <p>⚠️ 这是防「一条连接拖垮整个服务端」的最后一道闸：压缩任务在途时
      * （{@code compressing=true}）{@code emitBatch} 会直接返回，而上游仍可继续写包，
-     * {@code pending} 因此<b>没有天然上限</b>。正常流量下 1ms 窗口 + 几毫秒压缩
+     * {@code pending} 因此<b>没有天然上限</b>。正常流量下"一个 flush 一批" + 几毫秒压缩
      * 只会积压几十个包；但若某个大包压缩异常慢（或线程池被其它连接占满），
      * 积压会无界增长——而这是<b>堆内存</b>，最终 OOM 的是整个服务端进程，
      * 不是这一条连接。</p>
@@ -109,6 +142,21 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
      */
     private static final long MAX_PENDING_BYTES = 128L * 1024 * 1024;
 
+    /**
+     * 直存阈值的地板。
+     *
+     * <p>为什么不能允许配置把它压到 0：切换握手（{@code zstd:switch} 询问 / 确认）是
+     * <b>十几个字节</b>的小包，而且是<b>帧层嗅探器</b>按"直存帧 {@code [0][packet]} /
+     * 裸帧 / 原版 zlib 帧"三种形态识别的（见 {@code ZstdStepFrames.asBarePacket}）。
+     * 一旦这类小包被压成 zstd 帧，嗅探器认不出来，闸门就只能等满超时才放行——
+     * 每次登录白等 5 秒（不致命，但会让人误判成"卡登录"）。</p>
+     *
+     * <p>16 字节是个保守的地板：低于它的批次压缩后几乎必然膨胀（实测 16B 带字典仍膨胀到
+     * 103.5%），本来就该直存；钉在这里而不是靠各端配置记得调，是为了让"协议能不能被识别"
+     * 不依赖运维配置。</p>
+     */
+    private static final int MIN_STORED_THRESHOLD = 16;
+
     /** 低于这个原始大小不切块：切了只会多摊块头，并行收益抵不过块头的带宽成本。 */
     private static final int PARALLEL_MIN_BYTES = 256 * 1024;
 
@@ -117,6 +165,35 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
 
     private final List<ByteBuf> pending = new ArrayList<>();
     private final List<ChannelPromise> pendingPromises = new ArrayList<>();
+
+    /**
+     * "非 ByteBuf 出站消息"的屏障队列（顺序保证，见 {@link #write}）。
+     *
+     * <p>典型成员是原版切协议时从<b>出站方向</b>写下来的任务对象
+     * （{@code UnconfiguredPipelineHandler} 的 lambda，要一路走到头侧 decoder 位置的
+     * {@code inbound_config} 才被吃掉）。它们不是包字节，不能塞进 {@link #pending}
+     * （那是压缩对象），但又<b>必须排在"已经攒下的包、以及它们的压缩结果"之后</b>——
+     * 压缩是异步的，如果这时直接 {@code ctx.write}，任务对象就会插到还没写出的帧前面，
+     * 等于"协议先切、帧后到"，对端按新协议解旧帧 → 直接断连。</p>
+     *
+     * <p>数量极少（每条连接只切两次协议），用线性表足够。</p>
+     */
+    private final List<Object> barriers = new ArrayList<>();
+    private final List<ChannelPromise> barrierPromises = new ArrayList<>();
+
+    /**
+     * "屏障<b>之后</b>"写入的包。
+     *
+     * <p>⚠️ 光把任务塞进 {@link #barriers} 还不够：任务进队之后到它真正写出之间，上游可能
+     * 继续写包。那些包<b>语义上排在任务之后</b>（包层 encoder 在本处理器上游，它们的序列化
+     * 用的是切换前还是切换后的协议取决于任务何时执行），因此必须先攒在这里，等
+     * {@link #drainBarriers} 把任务写出去、再按原顺序交回 {@link #pending} 成帧。</p>
+     *
+     * <p>数量同样极少（只覆盖"协议切换任务落地 + 紧随其后的若干个包"这一瞬）。</p>
+     */
+    private final List<ByteBuf> afterBarrier = new ArrayList<>();
+    private final List<ChannelPromise> afterBarrierPromises = new ArrayList<>();
+    private long afterBarrierBytes;
     /** {@link #pending} 中 ByteBuf 的总可读字节数（仅 event loop 线程读写） */
     private long pendingBytes;
     private ScheduledFuture<?> windowTask;
@@ -127,6 +204,17 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
     private List<ChannelPromise> inflightPromises;
     /** handler 被移除后，异步压缩回调不得再向当前 pipeline 写帧。 */
     private boolean removed;
+
+    /**
+     * handlerRemoved 时若仍有在途压缩，把 scratch 释放推迟到 {@code backToEventLoop}。
+     *
+     * <p>⚠️ 否则会踩到 use-after-free：{@code handlerRemoved} 里可能刚通过
+     * {@code emitBatch} 起了一个压缩任务，池线程此时正要读 {@code rawBuf}；而
+     * {@code releaseScratch()} 会把它还给池化分配器，同一块内存立刻可能被别的连接取走改写。
+     * 加 {@code compressLock} 并不够——池线程可能还没进临界区，会在我们释放<b>之后</b>才进去
+     * （锁只保护"正在压缩"的那一段，不保护"即将开始"）。</p>
+     */
+    private boolean deferredScratchRelease;
 
     /**
      * 独享锁（子类钩子为默认值 {@link #compressLock()} 时使用）。
@@ -147,16 +235,55 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
     //
     // 池的规模、活跃/排队数、单次耗时都在 ZstdCompressPool 里统一统计，
     // 命令层可直接取摘要——"要不要降 level / 加线程"只能靠这些数字判断。
-    //（这里原本挂了一段 javadoc，但其后紧跟的是别的字段，等于一段没有归属的注释。）
+
 
     /**
-     * 批处理窗口与单帧包数上限。这里的初值只是"{@code handlerAdded} 之前万一被读到"的兜底
+     * 兜底窗口与单帧包数上限。这里的初值只是"{@code handlerAdded} 之前万一被读到"的兜底
      * ——真正生效的值在任何写操作都可能发生之前就已由 {@code handlerAdded} 从各端配置写入
      *（见该处的 {@code Math.max(...)}）。因此不要把配置默认值写在这里：两处一旦不一致，
      * 读代码的人无法判断哪个才是生效值。
+     *
+     * <p>⚠️ {@code batchWindowMs} 自协议 v7 起<b>只</b>是"上游不发 flush 时的兜底"，
+     * 不再是攒批窗口——正常的攒批边界是 {@code flush()} 本身（见类注释）。</p>
      */
-    private int batchWindowMs = 1;
+    private int batchWindowMs = 50;
     private int batchMaxPackets = 64;
+
+    /**
+     * 本方向的滚动历史字典（协议 v7）。
+     *
+     * <p>⚠️ 喂入点、喂入内容、轮换时机必须与<b>对端解码器</b>严格对称——两边算出的字典
+     * 与代数必须逐字节相同，否则解压出的是垃圾。README / 帧格式里的约定见
+     * {@link ZstdRollingDict} 的类注释。</p>
+     */
+    private final ZstdRollingDict rolling = new ZstdRollingDict();
+
+    /** 已经 {@code loadDict} 进 zstd 上下文的那份历史字典（同一份不重复装载）。 */
+    private byte[] appliedRollingDict;
+
+    /**
+     * 本方向是否已"武装"（= 允许真正产出 zstd 帧并记账）。
+     *
+     * <p>⚠️ 这是滚动历史正确性的前提，不是性能开关。两端必须对<b>同一批帧</b>记账，
+     * 而"哪些帧是 zstd 帧"这件事，在<b>直存帧</b>上从字节层面根本看不出来（它故意与原版
+     * 未压缩帧同形）。所以只能约定：<b>未武装期间一律透传、不产帧、不记账</b>。</p>
+     *
+     * <p>谁需要关掉它：<b>客户端</b>。它在 SetCompression 时就把编码器挂进了管线，
+     * 但要到回出切换确认那一刻才真正该开始产 zstd 帧；在这之前对端还处在"按原版解释"的
+     * 窗口里（它只会放行、不记账）。若这段时间本端产了帧，就会出现"一端记了、一端没记"，
+     * 之后 {@code dictGen} 必然分叉。</p>
+     *
+     * <p>服务端两侧默认 {@code true}：它们只在自己已经激活之后才可能产帧，天然对齐。</p>
+     */
+    private volatile boolean armed = true;
+
+    /**
+     * 在途批次使用的字典代数，{@code buildCompressedFrame} 写进帧头。
+     *
+     * <p>用字段而不是参数传递：同一时刻只允许一个在途批次（{@code compressing} 门），
+     * 而写帧发生在该批次回到 event loop 的回调里——语义上仍属于"这一批"。</p>
+     */
+    private int inflightDictGen;
 
     // ────────────────────────────────────────────────────────────────
     // 子类钩子：两端唯一的差异点
@@ -184,8 +311,69 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
     /** 本连接的压缩字典（可能为 null）。 */
     protected abstract com.github.luben.zstd.ZstdDictCompress compressDict();
 
-    /** 帧头是否写外层 {@code bodyLen}（服务端 true；客户端 false——prepender 负责） */
+    /** 帧头是否写外层 {@code bodyLen}（只有 Velocity true；Paper / Fabric 由 prepender 负责） */
     protected abstract boolean writeBodyLen();
+
+    /**
+     * 成帧结果要写到哪个 context 的<b>下游</b>。
+     *
+     * <p>默认就是本处理器的 ctx（"替换原版压缩处理器"的老形态）。协议 v7 起三端都应覆写为
+     * <b>被绕过的原版压缩处理器的 context</b>：{@code ctx.write()} 从那个 context 出发，
+     * 恰好跳过它自己，继续走本该走的下游（prepender / encrypt / socket）。
+     * 这样原版处理器<b>留在管线里不被拆掉</b>，详见类注释的"安装位置"。</p>
+     *
+     * <p>⚠️ 覆写方返回 {@code null}（锚点此刻不在管线里）时，本类退回 {@code ctx}——
+     * 宁可多经一层（原版压缩会按阈值处理我们的帧，结果多半是对端解不开），也不要静默丢包；
+     * 真实场景里这一步只在管线被第三方插件拆改的瞬间可能发生。</p>
+     */
+    protected ChannelHandlerContext downstream(ChannelHandlerContext ctx) {
+        return ctx;
+    }
+
+    /** 本方向的滚动历史（只读用途：子类可在诊断命令里读代数/命中情况）。 */
+    protected final ZstdRollingDict rollingDict() {
+        return rolling;
+    }
+
+    /** 是否已武装（允许产 zstd 帧并记账）。 */
+    protected final boolean isArmed() {
+        return armed;
+    }
+
+    /**
+     * 武装本方向：此后产出的帧才算 zstd 帧、才进滚动历史。
+     *
+     * <p>⚠️ 调用点必须与对端"离开兼容窗口"的时刻对齐（客户端 = 切换确认写出成功之后）。</p>
+     */
+    public final void arm() {
+        armed = true;
+    }
+
+    /**
+     * 解除武装：装作一台"不参与 zstd"的编码器——全部原样透传、不记账。
+     *
+     * <p>用于客户端在 SetCompression 时就装上编码器、但还不该产帧的那段时间。</p>
+     */
+    public final void disarm() {
+        armed = false;
+    }
+
+    /**
+     * 把"当前生效的字典"装进给定压缩上下文。
+     *
+     * <p>滚动历史优先（gen ≥ 1），否则回落到子类提供的静态字典（gen 0，协商阶段下发的那份）。</p>
+     */
+    private void loadActiveDict(ZstdCompressCtx c) {
+        byte[] bytes = rolling.activeDict();
+        if (bytes != null) {
+            c.loadDict(bytes);
+            return;
+        }
+        com.github.luben.zstd.ZstdDictCompress dict = compressDict();
+        if (dict != null) {
+            c.loadDict(dict);
+        }
+    }
 
     /**
      * 一帧产出后的统计回调。
@@ -265,11 +453,39 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
             return;
         }
         if (!(msg instanceof ByteBuf packet)) {
-            ctx.write(msg, promise);
+            // 非包字节（协议切换任务等）：没有积压时直接透传，零成本；
+            // 有积压（或压缩在途）时作为屏障排队，等帧写出后再按序放行。
+            if (pending.isEmpty() && !compressing) {
+                ctx.write(msg, promise);
+                return;
+            }
+            barriers.add(msg);
+            barrierPromises.add(promise);
+            emitBatch(ctx);
             return;
         }
-        if (compressCtx == null) {
-            ctx.write(packet, promise); // 透传：不缓冲，保持原语义
+        if (compressCtx == null || !armed) {
+            // 透传：不缓冲、不产帧、不记账。下游的原版压缩处理器仍在管线里，
+            // 因此这一帧会按原版规则（zlib 或直存）发出去——正是对端兼容窗口需要的形态。
+            ctx.write(packet, promise);
+            return;
+        }
+        if (!barriers.isEmpty()) {
+            // 屏障（协议切换任务）还没落地：本包必须排在它后面，不能进 pending 抢跑。
+            afterBarrier.add(packet);
+            afterBarrierPromises.add(promise);
+            afterBarrierBytes += packet.readableBytes();
+            if (afterBarrierBytes + pendingBytes > MAX_PENDING_BYTES) {
+                // 与 pending 同一个硬上限：长期不落地同样会把堆拖爆
+                LOGGER.error("[Zstd] outbound backlog (post-barrier) exceeds {}B — closing connection {}",
+                        MAX_PENDING_BYTES, ctx.channel().remoteAddress());
+                releaseAfterBarrier();
+                failAll(afterBarrierPromises, new ClosedChannelException());
+                afterBarrierPromises.clear();
+                ctx.close();
+                return;
+            }
+            scheduleFallback(ctx);
             return;
         }
         pending.add(packet);
@@ -297,24 +513,47 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
             emitBatch(ctx);
             return;
         }
-        scheduleWindow(ctx);
+        scheduleFallback(ctx);
     }
 
     /**
-     * 窗口等待期间吞掉 flush（由窗口到期统一 flush），否则 writeAndFlush 会让每批只剩 1 个包。
-     * 无待发包时保持原语义透传。
+     * <b>攒批边界就是这里</b>：一次 flush 成出一帧。
+     *
+     * <p>上游的 {@code writeAndFlush} / tick 末尾的批量 flush / 登录期写包时的 flush，
+     * 都在这个时机把"这段时间攒下的包"变成<b>一帧</b>——帧边界与上游的 flush 语义对齐，
+     * 本类不额外引入任何等待（见类注释的"批处理：以 flush 为界"）。</p>
+     *
+     * <p>⚠️ 成帧后<b>不再</b>在这里补 {@code ctx.flush()}：</p>
+     * <ul>
+     *   <li>直存路径（{@link #writeStoredFrames}）在 event loop 上同步写完并自己 flush；</li>
+     *   <li>压缩路径（{@link #emitBatch} 交给池线程）在批次回到 event loop 时才写帧，
+     *       那里同样自带 flush；</li>
+     *   <li>若此刻正好有在途批次（{@code compressing} 门），{@link #emitBatch} 会直接返回，
+     *       积压会在在途批次收尾后立刻被接手并 flush —— 此时补 flush 也没有数据可送。</li>
+     * </ul>
+     * <p>无待发包时保持原语义透传，否则下游（encrypt / socket）永远等不到 flush，
+     * 表现为"发了但对方收不到"。</p>
      */
     @Override
     public void flush(ChannelHandlerContext ctx) {
-        if (windowTask == null) {
-            ctx.flush();
+        if (!removed && !pending.isEmpty()) {
+            emitBatch(ctx);
+            return;
         }
+        ctx.flush();
     }
 
-    private void scheduleWindow(ChannelHandlerContext ctx) {
+    /**
+     * 兜底定时器：<b>只在"上游只 {@code write()} 而不 flush"时</b>才会真正触发。
+     *
+     * <p>正常流量下每次 {@code writeAndFlush} 都会先走 {@link #flush(ChannelHandlerContext)}
+     * 把包成帧并取消本定时器，所以它不会带来任何额外延迟；而一旦少了它，不发 flush 的调用方
+     * 会让包无限期滞留在这里（对端表现为"卡住不动"，比掉线更难排查）。</p>
+     */
+    private void scheduleFallback(ChannelHandlerContext ctx) {
         if (windowTask != null) return;
         if (batchWindowMs <= 0) {
-            emitBatch(ctx); // 窗口为 0：退化为"立刻成帧"
+            emitBatch(ctx); // 兜底窗口为 0：退化为"写即成帧"
             return;
         }
         windowTask = ctx.executor().schedule(() -> {
@@ -376,7 +615,12 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
             // 分配失败等）。此时 pending 里仍压着已 retain 的 ByteBuf：不在这里释放并清空，
             // 它们永远没人释放（引用计数泄漏），而且下一批会把这批残缺数据一并发出去，
             // 同时让 pendingPromises 与 pending 彻底失去对应关系。
-            batchRaw = null; // 失败批次的缓冲也不再被本 handler 引用（大帧可立即回收）
+            // 失败批次的缓冲也不再被本 handler 引用；大帧那份是临时分配，
+            // 不显式 release 就直接泄漏（池化直存缓冲不会被 GC 回收）。
+            if (batchRaw != null && batchRaw != rawBuf) {
+                batchRaw.release();
+            }
+            batchRaw = null;
             // removePendingPrefix 现在自带 release，不能再额外 releasePackets（会双重释放）
             removePendingPrefix(batchCount);
             failAll(promises, t);
@@ -393,9 +637,12 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
         // ── 小包直存 ──
         // 实测：无字典时 ≤32B 压缩后膨胀到 102~113%，48B 起才有收益；
         // 有字典时 24B 起才有收益。低于阈值直接直存，省一次 zstd 调用且线路字节更少。
+        // ⚠️ 滚动历史生效时也算"有字典"：gen ≥ 1 之后两端用的就是那份 64KB 历史，
+        // 此时 24B 起压缩确实有收益——按无字典的 48B 判会白丢这一段（见配置里的实测值）。
         // ⚠️ 直存帧一帧一包、不带内层长度前缀（见类注释的"帧格式"一节），所以这里
         // 不能把上面那份带长度前缀的拼接缓冲直接当一个帧发出去。
-        if (rawTotal < skipCompressThreshold(hasCompressDict())) {
+        if (rawTotal < Math.max(MIN_STORED_THRESHOLD,
+                skipCompressThreshold(rolling.activeDict() != null || hasCompressDict()))) {
             try {
                 writeStoredFrames(ctx, raw, rawTotal, withBodyLen, promises);
             } catch (Throwable t) {
@@ -409,6 +656,11 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
         }
 
         // ── 压缩路径：交给线程池 ──
+        // 帧头要写的代数在这里定格：本批可能压缩较久，期间上一帧的收尾会触发历史轮换，
+        // 而这个批次用的仍是"开始压缩时"那份字典。
+        inflightDictGen = rolling.generation();
+        // 兜底：确保上下文里装的确实是当前代数对应的字典（轮换发生时已经装过，这里是幂等复查）。
+        applyRollingDict();
         compressing = true;
         inflightPromises = promises;
         final ZstdCompressLock lock = compressLock();
@@ -536,10 +788,9 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
         c.setMagicless(true);
         c.setContentSize(false);
         c.setDictID(false);
-        com.github.luben.zstd.ZstdDictCompress dict = compressDict();
-        if (dict != null) {
-            c.loadDict(dict);
-        }
+        // 字典必须与本帧头里的 dictGen 一致：滚动历史优先，否则用静态字典。
+        // 每块一份独立的 ctx，所以这里必须逐块装载（不能指望主 ctx 上已装好）。
+        loadActiveDict(c);
         return c;
     }
 
@@ -586,13 +837,12 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
             compressing = false;
             inflightPromises = null;
             try {
-                if (removed) {
-                    failAll(promises, new ClosedChannelException());
-                } else if (failure != null) {
-                    failAll(promises, failure);
-                } else if (!ctx.channel().isActive()) {
-                    // 通道已关：结果无处可去，promise 也已由 channelInactive 失败化（tryFailure 幂等）
-                    failAll(promises, new ClosedChannelException());
+                if (removed || failure != null || !ctx.channel().isActive()) {
+                    // 三种收尾共用一个出口：处理器已移除 / 本批压缩失败 / 通道已关。
+                    // 屏障队列也必须一起收尾，否则排队中的协议切换任务会永久悬着。
+                    Throwable cause = failure != null ? failure : new ClosedChannelException();
+                    failAll(promises, cause);
+                    failBarriers(cause);
                 } else {
                     int wireTotal = 0;
                     for (Block b : blocks) {
@@ -602,12 +852,19 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
                     // 逐字节不同形，对端靠 rawSize==0 分支识别，所以这条回退是协议内的。
                     if (wireTotal > 0 && wireTotal < rawTotal) {
                         writeFrame(ctx, buildCompressedFrame(ctx, blocks, rawTotal, withBodyLen), promises);
+                        // 压缩帧在历史里按"整批原始负载"记账：一次性喂入，与对端解码后
+                        // 拿到的同一个 byte[] 完全一致。
+                        feedHistory(raw, raw.readerIndex(), rawTotal);
                     } else {
+                        // 直存路径在每写出一帧后自己喂（一帧一包，两端粒度相同），
+                        // 所以这里<b>不能</b>再喂一次，否则两端的记账点会分叉。
                         writeStoredFrames(ctx, raw, rawTotal, withBodyLen, promises);
                     }
                 }
             } catch (Throwable t) {
                 failAll(promises, t);
+                // 屏障队列也必须一起收尾：否则协议切换任务的 promise 永久悬着
+                failBarriers(t);
                 LOGGER.error("[Zstd] encoder frame build failed", t);
             } finally {
                 releaseBlocks(blocks);
@@ -615,6 +872,13 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
                 // 判据用成帧时记下的 rawTemporary：此处 rawBuf 可能已被 handlerRemoved 释放。
                 if (rawTemporary && raw != null) {
                     raw.release();
+                }
+                // handler 已移除且当时有在途压缩：scratch 必须等这里才释放（见字段说明）
+                if (deferredScratchRelease) {
+                    deferredScratchRelease = false;
+                    synchronized (compressLock()) {
+                        releaseScratch();
+                    }
                 }
                 // 压缩期间攒下的包：立刻接着发（不设 compressing 了，可以再走一轮）。
                 // handler 已移除时不能再碰 pipeline。
@@ -696,9 +960,62 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
         return rawTotal;
     }
 
+    /**
+     * 成帧结果的实际写出位置：跳过被绕开的原版压缩处理器（见 {@link #downstream}）。
+     *
+     * <p>⚠️ 写与 flush 都必须用<b>同一个</b> target：从本处理器 ctx 发 flush 虽然也能一路走到
+     * socket，但它会先经过我们已经绕开的那个处理器，把"它自己的"待发数据一起刷出去
+     * —— 在那条路径上我们没有向它写过任何东西，语义上纯属多余；统一用下游 ctx 更干净。</p>
+     */
+    private ChannelHandlerContext out(ChannelHandlerContext ctx) {
+        ChannelHandlerContext d = downstream(ctx);
+        return d == null ? ctx : d;
+    }
+
+    /**
+     * 喂入本帧的原始字节，并（必要时）把新算出的历史字典装进压缩上下文。
+     *
+     * <p>⚠️ <b>必须在帧边界、以与对端完全相同的粒度调用</b>：对端解码器在同一帧处理完后
+     * 喂同样的字节。粒度一旦不同（例如这里按整批喂、对端按包喂），两端的历史与代数就会分叉，
+     * 后果是解压出垃圾而不是压缩率下降。详见 {@link ZstdRollingDict} 的类注释。</p>
+     *
+     * <p>未武装时不记账（见 {@link #armed}）：那种帧不是 zstd 帧，对端在兼容窗口里也是
+     * 只放行不记账。这一支理论上走不到（{@code write()} 已提前透传），留作第二道保险。</p>
+     */
+    private void feedHistory(ByteBuf raw, int index, int len) {
+        if (!armed) {
+            return;
+        }
+        rolling.feed(raw, index, len);
+        applyRollingDict();
+    }
+
+    /** 把滚动历史算出的字典装载进压缩上下文（同一份只装一次）。 */
+    private void applyRollingDict() {
+        byte[] dict = rolling.activeDict();
+        if (dict == null || dict == appliedRollingDict) {
+            return;
+        }
+        ZstdCompressLock lock = compressLock();
+        synchronized (lock) {
+            // 上下文已释放（连接已关）：写已释放的原生内存是 SIGSEGV，这里必须放弃
+            if (lock.isClosed()) return;
+            ZstdCompressCtx c = compressContextForBatch();
+            if (c == null) return;
+            c.loadDict(dict);
+            // 与 ChannelManager 装载静态字典后一致：帧头精简参数必须重设一遍
+            c.setMagicless(true);
+            c.setContentSize(false);
+            c.setDictID(false);
+        }
+        appliedRollingDict = dict;
+        LOGGER.debug("[Zstd] 滚动历史字典已更新 gen={} ({}B)", rolling.generation(), dict.length);
+    }
+
     /** 写出帧并完成这一批的 promise。 */
     private void writeFrame(ChannelHandlerContext ctx, ByteBuf frame, List<ChannelPromise> promises) {
-        ctx.write(frame).addListener(f -> {
+        ChannelHandlerContext target = out(ctx);
+        target.write(frame).addListener(f -> {
             for (ChannelPromise p : promises) {
                 if (f.isSuccess()) {
                     p.trySuccess();
@@ -707,7 +1024,8 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
                 }
             }
         });
-        ctx.flush();
+        target.flush();
+        drainBarriers(ctx, target);
     }
 
     private static void releaseBlocks(Block[] blocks) {
@@ -725,6 +1043,63 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
         for (ChannelPromise p : promises) {
             p.tryFailure(cause);
         }
+    }
+
+    /**
+     * 把排队的"非包消息"按序交给下游——<b>只能在帧写出之后调用</b>。
+     *
+     * <p>{@code target.write()} 是入队而非落盘，所以"先写帧、再写屏障"在同一个 event loop
+     * 任务里就是确定的先后关系，不需要等 write future 完成。</p>
+     */
+    private void drainBarriers(ChannelHandlerContext ctx, ChannelHandlerContext target) {
+        if (barriers.isEmpty()) {
+            return;
+        }
+        for (int i = 0; i < barriers.size(); i++) {
+            target.write(barriers.get(i), barrierPromises.get(i));
+        }
+        barriers.clear();
+        barrierPromises.clear();
+        target.flush();
+        // 屏障之后的包现在才轮得到：按原顺序交回待成帧队列，并立刻成帧。
+        // 顺序保证来自"屏障已经 write 出去、且本处理器 ctx 上的写同样从 tail 方向排队"。
+        if (!afterBarrier.isEmpty()) {
+            pending.addAll(afterBarrier);
+            pendingPromises.addAll(afterBarrierPromises);
+            pendingBytes += afterBarrierBytes;
+            afterBarrier.clear();
+            afterBarrierPromises.clear();
+            afterBarrierBytes = 0;
+            emitBatch(ctx);
+        }
+    }
+
+    /** 丢弃屏障队列：释放消息、失败化 promise（通道关闭 / 批次失败时使用）。 */
+    private void failBarriers(Throwable cause) {
+        for (Object o : barriers) {
+            ReferenceCountUtil.release(o);
+        }
+        barriers.clear();
+        for (ChannelPromise p : barrierPromises) {
+            p.tryFailure(cause);
+        }
+        barrierPromises.clear();
+        if (!afterBarrier.isEmpty()) {
+            releaseAfterBarrier();
+            for (ChannelPromise p : afterBarrierPromises) {
+                p.tryFailure(cause);
+            }
+            afterBarrierPromises.clear();
+        }
+    }
+
+    /** 释放"屏障之后"攒下的包（通道关闭 / 溢出）。 */
+    private void releaseAfterBarrier() {
+        for (ByteBuf b : afterBarrier) {
+            ReferenceCountUtil.release(b);
+        }
+        afterBarrier.clear();
+        afterBarrierBytes = 0;
     }
 
     /**
@@ -760,7 +1135,9 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
 
         cursor[0] = base;
         int promiseIndex = 0;
+        final ChannelHandlerContext target = out(ctx);
         while (cursor[0] < end) {
+            int pktStart = cursor[0];
             int pktLen = ZstdVarInts.readOr(raw, cursor, ZstdVarInts.INVALID, end);
             int bodyOff = cursor[0];
             int bodyLen = 1 /* rawSize=0 */ + pktLen;
@@ -780,25 +1157,34 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
             // 所以每个 promise 挂到<b>自己那一帧</b>的 write future 上——不能统一挂到
             // "最后一次 flush"，那样单帧失败会被同批其它帧的成功掩盖。
             final ChannelPromise promise = promises.get(promiseIndex++);
-            ctx.write(frame).addListener(f -> {
-                if (f.isSuccess()) {
-                    promise.trySuccess();
-                } else {
-                    promise.tryFailure(f.cause());
-                }
-            });
+            try {
+                target.write(frame).addListener(f -> {
+                    if (f.isSuccess()) {
+                        promise.trySuccess();
+                    } else {
+                        promise.tryFailure(f.cause());
+                    }
+                });
+            } catch (Throwable t) {
+                // 下游 handler 抛异常（例如别的插件用 CancelPacketException 取消出站包）时，
+                // frame 还没被任何人持有，必须由这里释放，否则每被取消一帧泄漏一个 direct 缓冲。
+                frame.release();
+                throw t;
+            }
             cursor[0] = bodyOff + pktLen;
+            // 直存帧在历史里按 {@code [varint pktLen][pkt]} 记账 —— 与对端解码器补上前缀后的
+            // 形态一致（两端的滑窗必须逐字节相同，见 ZstdRollingDict 类注释）。
+            feedHistory(raw, pktStart, (bodyOff + pktLen) - pktStart);
         }
         // 一批对应多个帧：全部写完后只 flush 一次（不会因此多出 TCP 段）。
-        ctx.flush();
+        target.flush();
+        // 排队的协议切换任务必须排在这一批帧之后（见 barriers 字段的说明）
+        drainBarriers(ctx, target);
     }
 
     /**
-     * 压缩帧：{@code [bodyLen?][rawSize>0][zstd(payload)]}，
-     * {@code payload} 保持批格式 {@code [varint pktLen][pkt]...}（多包合批只发生在这里）。
-     */
-    /**
-     * 压缩帧：{@code [bodyLen?][rawSize][blockCount]} + 每块 {@code [blockRawLen][chunkLen][chunk]}。
+     * 压缩帧：{@code [bodyLen?][rawSize][dictGen][blockCount]} + 每块
+     * {@code [blockRawLen][chunkLen][chunk]}。
      *
      * <p>单块（blockCount=1）与分块并行共用同一格式，解码端无需区分。每块自带原文长度，
      * 是因为 zstd 帧头里的 contentSize 被关掉了（省字节），没有它就不知道该解出多少。</p>
@@ -810,7 +1196,8 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
             payloadLen += ZstdVarInts.length(b.rawLen) + ZstdVarInts.length(b.chunk.readableBytes())
                     + b.chunk.readableBytes();
         }
-        int innerLen = ZstdVarInts.length(rawTotal) + ZstdVarInts.length(blocks.length) + payloadLen;
+        int innerLen = ZstdVarInts.length(rawTotal) + ZstdVarInts.length(inflightDictGen)
+                + ZstdVarInts.length(blocks.length) + payloadLen;
 
         ByteBuf frame;
         if (withBodyLen) {
@@ -820,6 +1207,7 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
             frame = ctx.alloc().directBuffer(innerLen);
         }
         ZstdVarInts.write(frame, rawTotal);
+        ZstdVarInts.write(frame, inflightDictGen);
         ZstdVarInts.write(frame, blocks.length);
         for (Block b : blocks) {
             ZstdVarInts.write(frame, b.rawLen);
@@ -975,16 +1363,30 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
             failPending(new ClosedChannelException());
         }
         pendingPromises.clear();
+        failBarriers(new ClosedChannelException());
         failInflight(new ClosedChannelException());
         inflightPromises = null;
+        // 上面那次 emitBatch 可能真的起了一个压缩任务：那就不能在这里释放 scratch
+        //（池线程可能还没进临界区，会在我们释放之后才读到 rawBuf）。交给回调收尾。
+        boolean inflight = compressing;
         compressing = false;
         // ⚠️ 必须在压缩锁内释放：置 compressing=false 只是"不再开新批"，池线程可能仍读着
         // rawBuf 在压缩。此时把它还给 PooledByteBufAllocator，同一块内存会立刻被别的连接
         // 取走改写 —— 池线程读到的是别人的数据（产物随后被丢弃，不会污染对端，但这是一次
-        // 跨线程的未定义读写）。加锁等它退出，代价是最多一次批压缩的时间。
+        // 跨线程的未定义读写）。
+        if (inflight) {
+            deferredScratchRelease = true;
+            // 滑窗可以先放掉：它只被本类的记账路径读，而 removed 已经置位，不会再有新帧
+            rolling.reset();
+            appliedRollingDict = null;
+            return;
+        }
         synchronized (compressLock()) {
             releaseScratch();
         }
+        // 滑窗 + 当前字典共 128KB，这条连接（或这个方向）不会再用了，立刻释放
+        rolling.reset();
+        appliedRollingDict = null;
     }
 
     /**
@@ -1013,6 +1415,7 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
         releasePending();
         failPending(new ClosedChannelException());
         pendingPromises.clear();
+        failBarriers(new ClosedChannelException());
         failInflight(new ClosedChannelException());
         // 注意不在这里 releaseScratch()：channelInactive 之后 handlerRemoved 仍会执行，
         // 放在两处会 double-release（池化缓冲释放两次会让分配器状态错乱）。

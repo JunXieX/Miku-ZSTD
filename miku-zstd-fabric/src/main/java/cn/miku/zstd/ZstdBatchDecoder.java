@@ -5,11 +5,23 @@ import io.netty.channel.ChannelHandlerContext;
 import mikumc.zstd.protocol.ZstdBatchDecoderBase;
 
 /**
- * Miku-ZSTD 解码器（Velocity → 客户端）帧格式 <b>v4</b>（协商版本 v5）。
+ * Miku-ZSTD 解码器（服务端 → 客户端）帧格式 <b>v6</b>（协商版本 v7）。
  *
  * <p>帧解析、内层切包、两道防护（压缩比上限 / scratch 上限）、fail-fast 协议
- * 全部在共享基类 {@link ZstdBatchDecoderBase} 中（两端同一份源码）；
+ * 全部在共享基类 {@link ZstdBatchDecoderBase} 中（三端同一份源码）；
  * 本类只声明解压上下文来源与 HUD 统计口径。</p>
+ *
+ * <h2>安装位置与顺序前提</h2>
+ * <p>本类挂在原版 {@code decompress} 的<b>上游</b>（{@code addBefore}），不替换它：解出的每个包
+ * 都以原版未压缩帧 {@code [0][packet]} 交出，由原版 {@code decompress} 原样透传下去。完整的
+ * 入站顺序是：</p>
+ * <pre>
+ *   socket → decrypt → splitter → zstd_switch_sniffer → zstd_decoder（本类）→ decompress → decoder
+ * </pre>
+ * <p>⚠️ 这个顺序是本类的<b>隐含前提</b>：<b>正版加密</b>时 {@code decrypt} 插在 {@code splitter}
+ * 之前，所以本类拿到的必然是"已解密、且外层长度已被 {@code splitter} 剥掉"的完整帧——它才能
+ * 把首字节当 {@code rawSize} 读。若别的模组把解密挪到 {@code splitter} 之后（或干脆挪到本类
+ * 下游），进到这里的会是密文，帧头必然是非法 varint，表现为"一连服务器就断"。</p>
  *
  * <h2>统计口径</h2>
  * <p>两个方向都按"帧体线下字节"与"解压后字节"记账，且<b>两侧都计入 rawSize 标记</b>

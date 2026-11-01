@@ -11,13 +11,27 @@ import org.slf4j.LoggerFactory;
 import java.util.List;
 
 /**
- * Miku-ZSTD 入站解码器基类（帧格式 <b>v4</b>，协商版本 v5）——三端共享实现。
+ * Miku-ZSTD 入站解码器基类（帧格式 <b>v6</b>，协商版本 v7）——三端共享实现。
  *
- * <h2>帧格式（v4）</h2>
+ * <h2>帧格式（v6）</h2>
  * <pre>
- *   [varint rawSize][zstd(payload) | packet]
- *   payload = [varint pktLen][pkt] [varint pktLen][pkt] ...   // 仅 rawSize > 0
+ *   [varint rawSize][varint dictGen][varint blockCount] + block...     // rawSize > 0（压缩帧）
+ *   [0][packet]                                                        // rawSize == 0（直存帧）
+ *   block    = [varint blockRawLen][varint chunkLen][chunk]
+ *   payload  = [varint pktLen][pkt] [varint pktLen][pkt] ...           // 解压后
  * </pre>
+ *
+ * <h2>本类在管线里的位置（协议 v7 起）</h2>
+ * <p>本处理器<b>不替换</b>原版 {@code decompress}，而是插在它<b>上游</b>（入站先经过本类），
+ * 解出的每个包都以<b>原版未压缩帧</b>的形态 {@code [0][packet]} 交给下游——原版
+ * {@code CompressionDecoder} 对 {@code dataLength == 0} 的分支是<b>原样透传</b>，于是
+ * 它继续留在管线里却什么都不用做：</p>
+ * <ul>
+ *   <li>ViaVersion / PacketEvents / Grim 这类<b>按名字查找</b> {@code decompress} 的插件照常工作；</li>
+ *   <li>回落原版只需把自己摘掉，不存在"原版处理器已被移除、Netty 非 {@code @Sharable}
+ *       实例无法重新插入"的死局（旧实现因此只能关连接）；</li>
+ *   <li>代价是每包多 1 字节前缀与一次原版透传——入站是玩家操作流量，可忽略。</li>
+ * </ul>
  * <p>{@code rawSize == 0} 表示未压缩直存：帧体<b>恰好是一个包</b>（{@code [0][packet]}），
  * 与原版未压缩帧<b>逐字节同形</b>。因此"按原版解释"与"按 zstd 解释"对这段字节得到的结果
  * <b>完全相同</b>——切换窗口内外的处理不需要任何形状判断（见 {@link #acceptsLegacyFrames()}）。</p>
@@ -105,7 +119,26 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
                 SCRATCH_KEEP_LIMIT / 1024, n, bytes / 1048576.0);
     }
 
+    /** 未压缩帧的 dataLength 前缀，复用一个常量数组（避免每包一次分配）。 */
+    private static final byte[] STORED_PREFIX = {0};
+
+    /** 字典代数上限：仅用于 varint 越界判定（滑窗最多几秒轮换一次，远小于此）。 */
+    private static final int MAX_DICT_GEN = 1 << 20;
+
     private ZstdDecompressCtx decompressCtx;
+
+    /**
+     * 本方向的滚动历史（协议 v7）。
+     *
+     * <p>⚠️ 必须与<b>对端编码器</b>逐字节对称地喂入：它在成帧后喂"这一帧的原始字节"，
+     * 本类在解码出同一帧后喂同一个 {@code byte[]}。两端由此算出相同的字典与代数，
+     * 见 {@link ZstdRollingDict} 的类注释。</p>
+     */
+    private final ZstdRollingDict rolling = new ZstdRollingDict();
+
+    /** 已装载进解压上下文的那份历史字典。 */
+    private byte[] appliedRollingDict;
+
     /** 压缩输入 scratch（方法内即用即弃，可安全复用） */
     private byte[] scratch = new byte[0];
     /**
@@ -137,6 +170,11 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
     protected static final int MAX_BLOCK_HEADER_BYTES = 5 + MAX_BLOCK_COUNT * 10;
 
     protected abstract ZstdDecompressCtx resolveDecompressContext(ChannelHandlerContext ctx);
+
+    /** 本方向的滚动历史（只读用途：诊断命令里读代数）。 */
+    protected final ZstdRollingDict rollingDict() {
+        return rolling;
+    }
 
     /**
      * 本帧实际要使用的解压上下文（每帧调用）。
@@ -254,8 +292,16 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
             return;
         }
 
+        // 帧起点：任何"半帧"返回都必须把读指针退回到这里。
+        // ⚠️ 只对第一个 varint 退是不够的：后面的 dictGen / blockCount 同样可能读到半截，
+        // 而那时 rawSize 已经被消费掉 —— 直接 return 会让下一次 decode 把帧体首字节当成新帧的
+        // rawSize，整条连接从此错位（表现为成片 "illegal frame header"）。
+        // 正常管线里 splitter 只交完整帧，这条路径理论上走不到，但它是"读一半就返回"的唯一正确写法。
+        int frameStart = in.readerIndex();
+
         int rawSize = ZstdVarInts.tryRead(in, ZstdVarInts.DEFAULT_MAX_VALUE);
         if (rawSize == ZstdVarInts.NEED_MORE) {
+            in.readerIndex(frameStart);
             return; // 半帧：等待更多数据
         }
         if (rawSize == ZstdVarInts.INVALID) {
@@ -276,18 +322,21 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
             //（{@code [0][packet]}，见 ZstdBatchEncoderBase 的帧格式一节）：两种解释结果相同，
             // 因此不存在任何"看起来像不像 zstd 帧"的启发式判断（那正是残留风险的来源）。
             if (legacyFallbackAllowed()) {
-                out.add(in.readRetainedSlice(remaining));
+                // 窗口内收到的就是原版帧：原样交给下游的原版 decompress（本处理器现在在它上游）
+                out.add(vanillaFrame(in.readRetainedSlice(remaining)));
                 return;
             }
 
             sawZstdFrame = true;
             onStoredFrame(remaining);
+            // 历史记账的形态是 {@code [varint pktLen][pkt]}，与编码器喂进去的完全一致；
+            // 直存帧按定义一定不大，这一次拷贝可忽略（采样顺手复用同一个数组）。
+            byte[] batch = singlePacketBatch(in, remaining);
             if (wantsStoredPayload()) {
-                // 直存帧按定义一定不大（超过阈值就会被压缩），整帧拷一份的代价可忽略；
-                // 但采样方要求"独占数组"（帧缓冲会被复用），所以这里必须拷。
-                onStoredPayload(singlePacketBatch(in, remaining));
+                onStoredPayload(batch);
             }
-            out.add(in.readRetainedSlice(remaining));
+            feedHistory(batch);
+            out.add(vanillaFrame(in.readRetainedSlice(remaining)));
             return;
         }
 
@@ -317,8 +366,33 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
             return;
         }
 
-        // 协议 v6：rawSize 之后是 blockCount，其后逐块 [blockRawLen][chunkLen][chunk]。
+        // 协议 v7：rawSize 之后是 dictGen（滚动历史代数）。
+        // ⚠️ 这不是"可选的优化字段"，而是<b>一致性校验</b>：两端的滑窗必须逐字节相同，
+        // 一旦代数对不上就说明历史已经分叉（版本不一致 / 某一端的喂入点被改坏），
+        // 此时解压出来的是垃圾。宁可在这一帧上按协议错乱关连接并留一条可归因的日志，
+        // 也不能让脏数据流进包解码器 —— 后者表现为"莫名断连 + 客户端协议错误"，几乎无法定位。
+        int dictGen = ZstdVarInts.tryRead(in, MAX_DICT_GEN);
+        if (dictGen == ZstdVarInts.NEED_MORE) {
+            in.readerIndex(frameStart); // 半帧：整帧退回去等更多字节
+            return;
+        }
+        if (dictGen == ZstdVarInts.INVALID) {
+            protocolError(ctx, "illegal dictGen in frame header (rawSize=" + rawSize + ")");
+            return;
+        }
+        if (dictGen != rolling.generation()) {
+            protocolError(ctx, "dict generation mismatch: frame=" + dictGen
+                    + ", local=" + rolling.generation()
+                    + " (两端历史已分叉，多半是一端版本不一致)");
+            return;
+        }
+
+        // 其后是 blockCount，再逐块 [blockRawLen][chunkLen][chunk]。
         int blockCount = ZstdVarInts.tryRead(in, MAX_BLOCK_COUNT);
+        if (blockCount == ZstdVarInts.NEED_MORE) {
+            in.readerIndex(frameStart); // 同上：半帧整帧退回
+            return;
+        }
         if (blockCount <= 0) {
             protocolError(ctx, "illegal blockCount in frame header (rawSize=" + rawSize + ")");
             return;
@@ -336,6 +410,13 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
             for (int i = 0; i < blockCount; i++) {
                 int blockRaw = ZstdVarInts.tryRead(in, rawSize);
                 int chunkLen = ZstdVarInts.tryRead(in, in.readableBytes());
+                // 与前三处帧头读取保持同一语义：半帧就把整帧退回去等更多字节，不能当非法帧关连接。
+                // 正常管线里 splitter 只交完整帧，这一支走不到——但它存在的意义是"语义一致"，
+                // 而不是靠"理论上不会发生"来保证正确性。
+                if (blockRaw == ZstdVarInts.NEED_MORE || chunkLen == ZstdVarInts.NEED_MORE) {
+                    in.readerIndex(frameStart);
+                    return;
+                }
                 if (blockRaw <= 0 || chunkLen <= 0
                         || blockRaw > rawSize - off || chunkLen > in.readableBytes()) {
                     protocolError(ctx, "illegal block " + i + " (blockRaw=" + blockRaw
@@ -358,6 +439,8 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
             sawZstdFrame = true;
             onCompressedFrame(remaining, data.length);
             onDecodedPayload(data); // 采样（data 为本帧独占数组，可安全持有）
+            // 历史记账：与编码器同一帧、同一份字节、同样一次喂入
+            feedHistory(data);
             splitAndEmit(ctx, data, out);
         } catch (Exception e) {
             protocolError(ctx, "decompress failed (rawSize=" + rawSize + ", compressed=" + remaining
@@ -403,7 +486,7 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
             // 必须恰好解满：半截数据当完整包下传会让上层包解码器错位
             if (got != declared) return false;
             in.skipBytes(remaining);
-            out.add(Unpooled.wrappedBuffer(data, 0, got));
+            out.add(vanillaFrame(Unpooled.wrappedBuffer(data, 0, got)));
             return true;
         } catch (Throwable t) {
             LOGGER.debug("[Zstd] vanilla inflate failed: {}", t.toString());
@@ -425,6 +508,51 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
         return out;
     }
 
+    /**
+     * 把一个包包成"原版未压缩帧"的<b>帧体</b>：{@code [varint dataLength = 0][packet]}。
+     *
+     * <p>为什么要这一步：本处理器现在挂在原版 {@code decompress} 的<b>上游</b>（协议 v7），
+     * 解出的包必须交给它继续往下走。而它对 {@code dataLength == 0} 的分支是<b>原样透传</b>——
+     * 于是我们只要补上这个 1 字节前缀，就既能借它把包送到包解码器，又让它"什么都不做"。
+     * 这比"从它的 context 直接 fireChannelRead 跳过它"更省事：不需要换掉
+     * {@code ByteToMessageDecoder} 的基类语义（后者自带累积、半帧、异常收敛一整套行为）。</p>
+     */
+    private static ByteBuf vanillaFrame(ByteBuf packet) {
+        // 用 CompositeByteBuf 而不是 wrappedBuffer(byte[], ByteBuf)：前者保证"包缓冲零拷贝"
+        // 且引用计数随复合缓冲一起释放。分配器取默认（不碰池化），因为它只是两个组件的壳。
+        return Unpooled.compositeBuffer(2)
+                .addComponents(true, Unpooled.wrappedBuffer(STORED_PREFIX), packet);
+    }
+
+    /**
+     * 喂入本帧的原始字节，并（必要时）把新算出的历史字典装进解压上下文。
+     *
+     * <p>⚠️ 粒度为"<b>一帧一次、整帧喂入</b>"，必须与对端编码器严格相同
+     * （压缩帧喂整批原始负载；直存帧喂 {@code [varint pktLen][pkt]}）。粒度一旦不同，
+     * 两端历史就会分叉 —— 表现为 {@code dictGen} 校验失败（这是我们刻意做出来的
+     * fail-fast，而不是解压出垃圾）。</p>
+     */
+    private void feedHistory(byte[] raw) {
+        rolling.feed(raw, 0, raw.length);
+        applyRollingDict();
+    }
+
+    /** 把滚动历史算出的字典装载进解压上下文（同一份只装一次）。 */
+    private void applyRollingDict() {
+        byte[] dict = rolling.activeDict();
+        if (dict == null || dict == appliedRollingDict) {
+            return;
+        }
+        ZstdDecompressCtx c = decompressContextForFrame();
+        if (c == null) {
+            return;
+        }
+        c.loadDict(dict);
+        c.setMagicless(true);
+        appliedRollingDict = dict;
+        LOGGER.debug("[Zstd] 解压侧历史字典已更新 gen={} ({}B)", rolling.generation(), dict.length);
+    }
+
     /** 压缩帧：把解压出来的 byte[] 按内层长度前缀切成多个包。 */
     private void splitAndEmit(ChannelHandlerContext ctx, byte[] data, List<Object> out) {
         int off = 0;
@@ -443,8 +571,9 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
                         + off + "+" + pktLen + " > " + data.length + ")");
                 return;
             }
-            // data 是本帧独占的新数组，wrappedBuffer 共享它是安全的（零拷贝）
-            out.add(Unpooled.wrappedBuffer(data, off, pktLen));
+            // data 是本帧独占的新数组，wrappedBuffer 共享它是安全的（零拷贝）；
+            // 外面再套一层"原版未压缩帧"[0] 前缀，交给下游的原版 decompress 透传。
+            out.add(vanillaFrame(Unpooled.wrappedBuffer(data, off, pktLen)));
             off += pktLen;
             packets++;
         }
@@ -532,6 +661,20 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
         if (ctx.channel().isOpen()) {
             ctx.close();
         }
+    }
+
+    /**
+     * 处理器被移除（连接关闭 / 回落原版）时释放滑窗。
+     *
+     * <p>滑窗 + 当前字典共 128KB，挂在连接上会一直留到 GC；挂机玩家的连接可能挂几个小时，
+     * 200 人在线就是几十 MB 的纯浪费。必须走 {@code super}：{@code ByteToMessageDecoder}
+     * 在那里释放累积缓冲。</p>
+     */
+    @Override
+    public void handlerRemoved(ChannelHandlerContext ctx) throws Exception {
+        rolling.reset();
+        appliedRollingDict = null;
+        super.handlerRemoved(ctx);
     }
 
     /** 是否为连接层 I/O 异常（对端重置/中断），而不是协议或解压错误。 */

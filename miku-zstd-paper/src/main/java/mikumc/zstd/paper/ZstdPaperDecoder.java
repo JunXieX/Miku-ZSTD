@@ -5,9 +5,13 @@ import io.netty.channel.ChannelHandlerContext;
 import mikumc.zstd.protocol.ZstdBatchDecoderBase;
 
 /**
- * Miku-ZSTD 解码器（客户端 → Paper）帧格式 v4（协商版本 v5）。
+ * Miku-ZSTD 解码器（客户端 → Paper）帧格式 v6（协商版本 v7）。
  *
  * <p>帧解析、切包、压缩比上限、fail-fast 全部由共享基类提供，本类只声明解压上下文来源。</p>
+ *
+ * <p>安装位置：原版 {@code decompress} 的<b>上游</b>。解出的每个包都以原版未压缩帧
+ * {@code [0][packet]} 交出，由原版 {@code decompress} 原样透传下去——它一直留在管线里，
+ * 我们不拆它（见 {@link ZstdPaperChannelManager#installDecoder(io.netty.channel.Channel)}）。</p>
  */
 public class ZstdPaperDecoder extends ZstdBatchDecoderBase {
 
