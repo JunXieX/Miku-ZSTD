@@ -327,37 +327,32 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
         // 上把扣住的包逐条写出。若写包线程（Folia 上是区域线程）就地放行，新包会插到
         // 那批旧包之前，登录期包顺序被打乱。
         // 只在"窗口内"或"本包是 SetCompression"时才投递，正常出站路径没有额外开销。
+        // ⚠️ 一旦进入扣包窗口，本 handler 的所有出站写都必须排到 event loop，
+        // 保证与 releaseHeld 串行、登录期包序不被打乱。
+        //（不能只在"当前是 SetCompression"时排队：窗口开启后同线程紧随的 LoginSuccess
+        // 会就地写出，排到仍在排队的 SetCompression 前面 —— 客户端先收 LoginSuccess
+        // 再收 0x03 就是未知包。）
         if (!ctx.executor().inEventLoop()) {
-            // ⚠️ 必须在<b>调用线程</b>就把 holding 置起来，不能留给投递的任务去做。
-            // WriteSetCompression 与 LoginSuccess 由同一个主线程先后发出：若 holding 只在
-            // 任务里置位，紧随的 LoginSuccess 会看到 holding=false 而就地写出，直接排到
-            // 仍在排队的 SetCompression 前面 —— 客户端在 LOGIN 态先收到 LoginSuccess，
-            // 再收到 0x03 就是未知包，连接断开（且与是否装模组无关，全量连接都会走）。
-            boolean startHoldNow = false;
             synchronized (holdLock) {
                 if (!holding && isCompressionPacket(msg)) {
                     holding = true;
-                    startHoldNow = true;
                 }
             }
-            if (startHoldNow || holding) {
-                final boolean startHold = startHoldNow;
-                ctx.executor().execute(() -> {
-                    try {
-                        writeInEventLoop(ctx, msg, promise, startHold);
-                    } catch (Throwable t) {
-                        io.netty.util.ReferenceCountUtil.release(msg);
-                        promise.tryFailure(t);
-                    }
-                });
-                return;
-            }
+            ctx.executor().execute(() -> {
+                try {
+                    writeInEventLoop(ctx, msg, promise);
+                } catch (Throwable t) {
+                    io.netty.util.ReferenceCountUtil.release(msg);
+                    promise.tryFailure(t);
+                }
+            });
+            return;
         }
-        writeInEventLoop(ctx, msg, promise, false);
+        writeInEventLoop(ctx, msg, promise);
     }
 
-    private void writeInEventLoop(ChannelHandlerContext ctx, Object msg, ChannelPromise promise,
-                                  boolean startHold) throws Exception {
+    private void writeInEventLoop(ChannelHandlerContext ctx, Object msg, ChannelPromise promise)
+            throws Exception {
         if (settled) {
             // 已定案：不再参与协商，也不扣包（激活后的编码由 zstd_encoder 负责）
             super.write(ctx, msg, promise);
@@ -372,10 +367,12 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
         // ⚠️ 判定与扣包必须在同一把锁内完成，且要先置 holding 再写 SetCompression：
         // 否则并发的写线程可能在「SetCompression 已写出、holding 只对本题线程可见」的缝里
         // 把后续包按原版 zlib 发出去 —— 客户端此时已切 zstd，收到即解码失败断开。
+        boolean startHold = false;
         boolean held = false;
         synchronized (holdLock) {
-            if (startHold) {
-                // 窗口已由调用线程开启，此包本身就是 SetCompression：原样透传
+            if (!holding && isCompressionPacket(msg)) {
+                holding = true;
+                startHold = true;
             } else if (holding && isPacket(msg)) {
                 // ⚠️ 只扣 MC 包：管道里还会流经 netty 自身的控制消息（协议阶段切换用的 Runnable），
                 // 扣住它会阻塞 LOGIN→CONFIGURATION 切换且日志无异常。
