@@ -250,6 +250,16 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
      * 字典收益 0.0%），只保留批处理。返回 true 时本类不建解压上下文、不喂滚动历史、
      * 不校验 {@code dictGen}。</p>
      */
+    /**
+     * 存储批帧的帧头标记：{@code rawSize == 1}。
+     *
+     * <p>⚠️ 不能与"原版单包直存帧"共用 0：那样两种形态在字节层面不可区分，解析只能靠
+     * "当前是否还在握手窗口"来猜——窗口判定与真实到达顺序错开一帧就会把批帧当成单包下传
+     * （包数被当作包 id），表现为 {@code MinecraftDecoder} 抛 "A packet frame decoder failed"。
+     * 5.0.44 起改为自描述：0 = 原版单包，1 = 存储批。</p>
+     */
+    public static final int STORED_BATCH_MARKER = 1;
+
     protected boolean storedBatchFrames() {
         return false;
     }
@@ -365,6 +375,17 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
             return;
         }
 
+        // ── 自描述分派：rawSize == 1 是"存储批"（上行方向专用）──
+        // 放在所有"握手窗口 / 原版帧"判断之前：这条形态与窗口无关，永远按批解析。
+        // v9 曾把它和"原版单包 [0]"挤在同一个标记 0 上，只能靠窗口猜，错开一帧就把包数
+        // 当成包 id 下传 —— 服务端 MinecraftDecoder 抛 "A packet frame decoder failed"。
+        if (rawSize == STORED_BATCH_MARKER) {
+            sawZstdFrame = true;
+            onStoredFrame(remaining);
+            emitStoredBatch(ctx, in, remaining);
+            return;
+        }
+
         if (rawSize == 0) {
             // 未压缩帧：帧体<b>恰好是一个包</b>。这里之所以（也<b>必须</b>）完全不区分
             // "原版未压缩帧"与"zstd 直存帧"，是因为编码侧把直存帧做成了与原版帧逐字节同形
@@ -387,11 +408,6 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
 
             sawZstdFrame = true;
             onStoredFrame(remaining);
-            // 上行（客户端→服务端）的帧是"存储批"：[0][count][len][pkt]...，本方向不压缩
-            if (storedBatchFrames()) {
-                emitStoredBatch(ctx, in, remaining);
-                return;
-            }
             // 历史记账的形态是 {@code [varint pktLen][pkt]}，与编码器喂进去的完全一致；
             // 直存帧按定义一定不大，这一次拷贝可忽略（采样顺手复用同一个数组）。
             byte[] batch = singlePacketBatch(in, remaining);

@@ -1188,7 +1188,9 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
         if (withBodyLen) {
             ZstdVarInts.write(frame, bodyLen);
         }
-        ZstdVarInts.write(frame, 0);
+        // ⚠️ 标记用 1，不能复用 0：0 是"原版单包直存帧"，两者形状必须自描述，
+        // 否则解析要靠"当前是否还在握手窗口"来猜，窗口与真实到达顺序错开一帧就解错。
+        ZstdVarInts.write(frame, 1);
         ZstdVarInts.write(frame, count);
         frame.writeBytes(raw, base, rawTotal);
         onFrame(1 + rawTotal, frame.readableBytes(), false);
