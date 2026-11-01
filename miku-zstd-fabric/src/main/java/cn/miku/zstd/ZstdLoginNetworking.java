@@ -102,19 +102,18 @@ public final class ZstdLoginNetworking {
             mgr.setDirStatus(true, encoderStatus);
             mgr.setDirStatus(false, decoderStatus);
 
-            boolean refuse = encoderStatus == ZstdNegotiateStatus.VANILLA
-                    || decoderStatus == ZstdNegotiateStatus.VANILLA;
+            // resolve 只可能给出 READY 或 NEED_DICT，不需要再判 VANILLA
             boolean needDict = encoderStatus == ZstdNegotiateStatus.NEED_DICT
                     || decoderStatus == ZstdNegotiateStatus.NEED_DICT;
             // 需要字典时先保持 PLAIN：等 zstd:dict 到达并加载成功后才进入 NEGOTIATING。
             // 这样即便服务端最终没推字典，客户端也只是保持原版，不会形成单侧 zstd。
-            channel.attr(ZstdChannelManager.ZSTD_STATE).set(refuse || needDict
+            channel.attr(ZstdChannelManager.ZSTD_STATE).set(needDict
                     ? ZstdChannelManager.TransportState.PLAIN
                     : ZstdChannelManager.TransportState.NEGOTIATING);
 
             LOGGER.debug("[Zstd] LoginPlugin negotiated: encId={} encStatus={} decId={} decStatus={} -> {}",
                     encoderDictId, encoderStatus, decoderDictId, decoderStatus,
-                    refuse ? "staying vanilla" : (needDict ? "awaiting dict" : "will activate zstd"));
+                    needDict ? "awaiting dict" : "will activate zstd");
 
             return CompletableFuture.completedFuture(answer(encoderStatus, decoderStatus));
         } catch (Exception e) {
@@ -223,9 +222,8 @@ public final class ZstdLoginNetworking {
         if (dictId == ZstdDictId.NONE) {
             return ZstdNegotiateStatus.READY; // 服务端尚无字典：协议没问题，照常参与 zstd
         }
-        if (!DictCache.contains(dictId)) {
-            return ZstdNegotiateStatus.NEED_DICT; // 本地无缓存：请求服务端推送
-        }
+        // 一次 get 就够：contains + get 双查不会带来额外信息（put 只在这里发生，
+        // 中间没有并发淘汰路径），只是多一次加锁。
         return loadCached(mgr, dictId, isEncoder)
                 ? (byte) ZstdNegotiateStatus.READY
                 : (byte) ZstdNegotiateStatus.NEED_DICT;
@@ -235,9 +233,7 @@ public final class ZstdLoginNetworking {
         try {
             byte[] cached = DictCache.get(dictId);
             if (cached == null) {
-                // 缓存查到了 id 却取不到字节 = 状态不一致。绝不能"假装成功"。
-                LOGGER.warn("[Zstd] 缓存中取不到字典 id={} \u2014 改报需要服务端推送", dictId);
-                return false;
+                return false; // 本地没有：请求服务端推送
             }
             boolean ok = isEncoder
                     ? mgr.loadEncoderDict(cached, dictId)
