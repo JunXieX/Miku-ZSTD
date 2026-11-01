@@ -1047,6 +1047,12 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
 
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+        // ⚠️ 别的插件用"抛异常"取消某一条出站包（CraftEngine 的 CancelPacketException
+        // 就是这种用法：在 encoder 里 throw 以短路 pipeline）。这是控制流，不是连接错误。
+        if (isPacketCancellation(cause)) {
+            LOGGER.debug("[Zstd] packet cancelled by another plugin: {}", cause.toString());
+            return;
+        }
         // 通道已关闭时的异常一律是收尾噪音（本插件在断线时会失败化挂起的写 promise，
         // 那些 promise 的监听器会把异常广播回 pipeline），降为 debug，
         // 避免关服/退服时刷 ERROR + 堆栈。
@@ -1056,5 +1062,15 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
             LOGGER.error("[Zstd] encoder exception, closing channel", cause);
         }
         ctx.close();
+    }
+
+    /** 是否为"发包被其它插件取消"的控制流异常（不是连接错误）。 */
+    private static boolean isPacketCancellation(Throwable cause) {
+        for (Throwable t = cause; t != null; t = t.getCause()) {
+            if (t.getClass().getSimpleName().contains("CancelPacket")) {
+                return true;
+            }
+        }
+        return false;
     }
 }
