@@ -854,21 +854,6 @@ public class ZstdHijacker extends ChannelDuplexHandler {
         return -1;
     }
 
-    /** 读 SetCompressionPacket 的阈值（反射失败返回 "?"）。只用于日志，不影响主流程。 */
-    private static String readThreshold(Object packet) {
-        try {
-            for (java.lang.reflect.Method m : packet.getClass().getMethods()) {
-                if (m.getParameterCount() == 0
-                        && (m.getName().equals("getThreshold") || m.getName().equals("threshold"))) {
-                    return String.valueOf(m.invoke(packet));
-                }
-            }
-        } catch (Throwable ignored) {
-            // 反射不可用：日志降级为 ?
-        }
-        return "?";
-    }
-
     /** 线上字典帧：{@code [int crc32][int len][bytes]}；crc 必须与字典 id 同源。 */
     private static void writeDictBytes(ByteBuf buf, byte[] dict) {
         buf.writeInt(mikumc.zstd.protocol.ZstdDictId.wireChecksum(dict));
