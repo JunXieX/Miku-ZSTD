@@ -298,6 +298,23 @@ public class ZstdHijacker extends ChannelDuplexHandler {
             return;
         }
 
+        // ⚠️ 第二次及以后的 SetCompression 会被这里放过（pipelineActivated 已置位）。
+        // 它来自"同一条连接重新走登录"的场景：离线玩家经 limbo 登录服验证后转后端、
+        // 或代理重设压缩阈值。此刻客户端会重装原版编解码器，必须让日志能看出发生过这件事，
+        // 否则现场只有一句 lost connection，无从判断。
+        if (pipelineActivated && C_SET_COMPRESSION != null && C_SET_COMPRESSION.isInstance(msg)) {
+            int threshold = readThresholdValue(msg);
+            LOGGER.info("[Zstd] 同一条连接收到第二次 SetCompression（threshold={}）；pipeline={}",
+                    threshold, ctx.channel().pipeline().names());
+            if (threshold < 0) {
+                // 对端要"关掉压缩"（limbo 登录服就是这样把连接降回明文的）。
+                // 本端若继续用 zstd 发帧，对端会按明文读 —— 第一帧就错乱。
+                LOGGER.info("[Zstd] 压缩被禁用（threshold<0）——本端退回明文");
+                giveUp(ctx);
+                return;
+            }
+        }
+
         if (!pipelineActivated && C_SET_COMPRESSION != null && C_SET_COMPRESSION.isInstance(msg)) {
             pipelineActivated = true;
             LOGGER.debug("[Zstd] SetCompression detected — deferring zstd activation until negotiate response; pipeline={}",
@@ -805,6 +822,36 @@ public class ZstdHijacker extends ChannelDuplexHandler {
             LOGGER.error("[Zstd] Failed to send dict query", e);
             return false;
         }
+    }
+
+    /** 读 SetCompressionPacket 的阈值（反射失败返回 -1，即按"禁用"处理）。 */
+    private static int readThresholdValue(Object packet) {
+        try {
+            for (java.lang.reflect.Method m : packet.getClass().getMethods()) {
+                if (m.getParameterCount() == 0
+                        && (m.getName().equals("getThreshold") || m.getName().equals("threshold"))) {
+                    return ((Number) m.invoke(packet)).intValue();
+                }
+            }
+        } catch (Throwable ignored) {
+            // 反射不可用：按禁用处理（退回明文最安全）
+        }
+        return -1;
+    }
+
+    /** 读 SetCompressionPacket 的阈值（反射失败返回 "?"）。只用于日志，不影响主流程。 */
+    private static String readThreshold(Object packet) {
+        try {
+            for (java.lang.reflect.Method m : packet.getClass().getMethods()) {
+                if (m.getParameterCount() == 0
+                        && (m.getName().equals("getThreshold") || m.getName().equals("threshold"))) {
+                    return String.valueOf(m.invoke(packet));
+                }
+            }
+        } catch (Throwable ignored) {
+            // 反射不可用：日志降级为 ?
+        }
+        return "?";
     }
 
     /** 线上字典帧：{@code [int crc32][int len][bytes]}；crc 必须与字典 id 同源。 */
