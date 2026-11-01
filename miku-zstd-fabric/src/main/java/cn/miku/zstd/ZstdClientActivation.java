@@ -298,7 +298,14 @@ public final class ZstdClientActivation {
         }
 
         ZstdChannelManager.TransportState state = channel.attr(ZstdChannelManager.ZSTD_STATE).get();
-        if (state != ZstdChannelManager.TransportState.NEGOTIATING) {
+        // ⚠️ ZSTD_ACTIVE 也必须放行：走到这里说明上一段的"处理器在位"检查没通过，
+        // 也就是 zstd 编解码器已被原版重新装回。真实触发场景是<b>同一条连接的第二次
+        // SetCompression</b>——离线玩家经 limbo 登录服验证后转后端、或代理重发压缩阈值时，
+        // 客户端会再次跑 setupCompression 并把 compress/decompress 装回去。
+        // 旧实现只认 NEGOTIATING，于是这次重装被 (state != NEGOTIATING) 挡掉，
+        // 客户端停在原版 zlib 而服务端仍是 zstd —— 单侧 zstd，玩家被踢。
+        if (state != ZstdChannelManager.TransportState.NEGOTIATING
+                && state != ZstdChannelManager.TransportState.ZSTD_ACTIVE) {
             // 注意：此处不置 ACTIVATED —— 另一条触发路径（handleCompression TAIL）
             // 仍可能在 negotiate 到达后完成激活。
             LOGGER.debug("[Zstd] client activation deferred: state={} (negotiate not received yet)",
