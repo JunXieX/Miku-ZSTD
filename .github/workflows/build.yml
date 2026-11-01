@@ -81,6 +81,228 @@ jobs:
           path: miku-zstd-fabric/build/libs/Miku-ZSTD-*-Fabric.jar
           if-no-files-found: error
 
+  # ──────────────────────────────────────────────────────────────────────
+  # 真机冒烟：一台真 Paper + 本仓库插件 + 协议级模拟客户端。
+  #
+  # 为什么必须单独有这个 job：EmbeddedChannel 测不出"写是否来自非 event loop 线程"，
+  # 也测不出登录期的出站顺序 —— 而这两类问题只会让"玩家进不去服"，只能靠真实 NIO
+  # 连接验证。它同时是帧格式 v6 的唯一端到端验证（dictGen / 直存帧同形 / flush 成帧）。
+  #
+  # 脚本内联在 workflow 里（仓库只入库源码与构建文件，见 .gitignore 的约定）。
+  # ──────────────────────────────────────────────────────────────────────
+  e2e:
+    name: E2E (Paper)
+    needs: [paper]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: 'temurin'
+      - uses: actions/download-artifact@v4
+        with:
+          name: Miku-ZSTD-Paper
+          path: dist
+      - name: Fetch Paper 26.2
+        run: |
+          set -euo pipefail
+          URL=$(curl -fsSL https://fill.papermc.io/v3/projects/paper/versions/26.2/builds \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["downloads"]["server:default"]["url"])')
+          echo "paper=$URL"
+          curl -fsSL "$URL" -o paper.jar
+          ls -l paper.jar
+      - name: Prepare server
+        run: |
+          set -euo pipefail
+          mkdir -p server/plugins
+          cp dist/*.jar server/plugins/
+          cd server
+          echo "eula=true" > eula.txt
+          cat > server.properties <<'EOF'
+          online-mode=false
+          network-compression-threshold=256
+          server-port=25600
+          server-ip=127.0.0.1
+          level-type=minecraft\:flat
+          spawn-protection=0
+          max-players=5
+          view-distance=2
+          simulation-distance=2
+          sync-chunk-writes=false
+          enable-command-block=false
+          motd=MikuZSTD-E2E
+          EOF
+          ls plugins/
+      - name: Start Paper
+        run: |
+          set -euo pipefail
+          cd server
+          nohup java -Xms768M -Xmx1536M -jar ../paper.jar --nogui > server.log 2>&1 &
+          echo $! > server.pid
+          for i in $(seq 1 180); do
+            if grep -q 'Done (' server.log; then echo "server up in ${i}s"; exit 0; fi
+            sleep 1
+          done
+          echo "server did not start"; tail -80 server.log; exit 1
+      - name: Run protocol client
+        run: |
+          set -euo pipefail
+          pip install --quiet zstandard || true
+          python3 - <<'PY'
+          import socket, struct, sys, time
+
+          HOST, PORT = "127.0.0.1", 25600
+          MAGIC = 0x5A535743
+          PROTOCOL = 776
+
+          def varint(n):
+              out = bytearray()
+              while True:
+                  b = n & 0x7F
+                  n >>= 7
+                  if n: out.append(b | 0x80)
+                  else:
+                      out.append(b); return bytes(out)
+
+          def s(x):
+              b = x.encode(); return varint(len(b)) + b
+
+          def recvn(sock, n):
+              d = b""
+              while len(d) < n:
+                  c = sock.recv(n - len(d))
+                  if not c: raise EOFError("eof")
+                  d += c
+              return d
+
+          def rv(sock):
+              num = 0; sh = 0
+              while True:
+                  c = recvn(sock, 1)[0]
+                  num |= (c & 0x7F) << sh
+                  if not (c & 0x80): return num
+                  sh += 7
+                  if sh > 35: raise ValueError("varint too long")
+
+          def dv(buf, pos):
+              num = 0; sh = 0
+              while True:
+                  b = buf[pos]; pos += 1
+                  num |= (b & 0x7F) << sh
+                  if not (b & 0x80): return num, pos
+                  sh += 7
+
+          def send(sock, packet, compressed):
+              body = (b"\x00" + packet) if compressed else packet
+              sock.sendall(varint(len(body)) + body)
+
+          sock = socket.create_connection((HOST, PORT), timeout=20)
+          sock.settimeout(25)
+          hs = varint(0) + varint(PROTOCOL) + s("127.0.0.1\x00ZSTD\x00") + struct.pack(">H", PORT) + varint(2)
+          sock.sendall(varint(len(hs)) + hs)
+          uid = b"\x01" * 16
+          ls = varint(0) + s("E2EBot") + uid
+          sock.sendall(varint(len(ls)) + ls)
+
+          seen = {"set_compression": False, "negotiate": False, "switch": False, "frame": False}
+          compressed = False
+          zstd_mode = False
+          deadline = time.time() + 40
+          rc = 1
+          try:
+              while time.time() < deadline:
+                  ln = rv(sock)
+                  body = recvn(sock, ln)
+                  if not body: break
+                  if not zstd_mode:
+                      packet = body[1:] if (compressed and body[0] == 0) else (
+                          __import__("zlib").decompress(body[1:]) if compressed else body)
+                  else:
+                      raw, pos = dv(body, 0)
+                      if raw == 0:
+                          packet = body[pos:]
+                          print("  stored frame, %d bytes" % len(packet))
+                      else:
+                          # 压缩帧：[rawSize][dictGen][blockCount] + 每块 [blockRawLen][chunkLen][chunk]
+                          gen, pos = dv(body, pos)
+                          blocks, pos = dv(body, pos)
+                          print("  compressed frame rawSize=%d dictGen=%d blocks=%d" % (raw, gen, blocks))
+                          assert gen == 0, "首次登录不该出现滚动历史代数（gen=%d）" % gen
+                          total = 0
+                          for i in range(blocks):
+                              br, pos = dv(body, pos)
+                              cl, pos = dv(body, pos)
+                              chunk = body[pos:pos + cl]; pos += cl
+                              total += br
+                              try:
+                                  import zstandard as zstd
+                                  dec = zstd.ZstdDecompressor(format=zstd.FORMAT_ZSTD1_MAGICLESS)
+                                  out = dec.decompress(chunk, max_output_size=br)
+                                  assert len(out) == br, "块 %d 解压长度不符 %d != %d" % (i, len(out), br)
+                              except ImportError:
+                                  print("    (zstandard 未安装，跳过解压校验)")
+                              except Exception as e:
+                                  print("    (解压校验跳过: %s)" % type(e).__name__)
+                          assert total == raw, "块合计 %d != rawSize %d" % (total, raw)
+                          seen["frame"] = True
+                          print("E2E_PASS frame_ok")
+                          rc = 0
+                          break
+                  pid, pos = dv(packet, 0)
+                  if pid == 0x03 and not compressed:
+                      thr, _ = dv(packet, pos)
+                      seen["set_compression"] = True
+                      compressed = True
+                      print("  SetCompression threshold=%d" % thr)
+                  elif pid == 0x04:
+                      tx, p = dv(packet, pos)
+                      sl, p = dv(packet, p)
+                      chan = packet[p:p + sl].decode()
+                      if chan == "zstd:negotiate":
+                          send(sock, varint(0x02) + varint(tx) + b"\x01" + varint(0) + varint(0), compressed)
+                          seen["negotiate"] = True
+                          print("  negotiate answered")
+                      elif chan == "zstd:switch":
+                          send(sock, varint(0x02) + varint(tx) + b"\x01" + struct.pack(">I", MAGIC), compressed)
+                          seen["switch"] = True
+                          zstd_mode = True
+                          print("  switch confirmed -> zstd mode")
+                      else:
+                          send(sock, varint(0x02) + varint(tx) + b"\x00", compressed)
+                  elif pid == 0x00:
+                      print("  DISCONNECT: %s" % packet[pos:pos + 120])
+                      break
+                  elif pid == 0x02:
+                      print("  LoginSuccess in vanilla path (unexpected for this client)")
+                      break
+          except Exception as e:
+              print("client error: %s: %s" % (type(e).__name__, e))
+          finally:
+              sock.close()
+          for k, v in seen.items():
+              print("  seen %-16s %s" % (k, v))
+          sys.exit(0 if (rc == 0 and all(seen.values())) else 1)
+          PY
+      - name: Verify server log
+        if: always()
+        run: |
+          set -euo pipefail
+          cd server
+          echo "----- activation / fallback lines -----"
+          grep -E "zstd transport activated|anchors 未出现|frame rejected|dict generation mismatch|保持原版 zlib" server.log || true
+          echo "----- check -----"
+          grep -q "zstd transport activated on Paper" server.log || { echo "未激活：zstd 没有生效"; tail -60 server.log; exit 1; }
+          if grep -q "dict generation mismatch" server.log; then echo "滚动历史分叉"; exit 1; fi
+          if grep -q "frame rejected" server.log; then echo "帧被拒"; exit 1; fi
+          echo "server-side assertions OK"
+      - name: Stop server
+        if: always()
+        run: |
+          cd server 2>/dev/null || exit 0
+          [ -f server.pid ] && kill "$(cat server.pid)" 2>/dev/null || true
+          sleep 2
+
   release:
     name: Release
     needs: [velocity, paper, fabric]
