@@ -117,7 +117,8 @@ public class ZstdVelocityConfig {
         this.trainerPruneMinPayload = clamp(getInt(t, "prune_min_payload", 16), 0, 4096);
 
         Map<String, Object> l = getMap(map, "logging");
-        this.debug = getBool(l, "debug");
+        // ⚠️ 5.0.36 起默认开启（与 Paper 端一致）：登录期问题只有 debug 日志能定位。
+        this.debug = getBool(l, "debug", true);
 
         Map<String, Object> bb = getMap(map, "bossbar");
         this.bossbarFormat = getString(bb, "format", mikumc.zstd.protocol.ZstdBossBarFormat.DEFAULT_FORMAT);
@@ -188,8 +189,13 @@ public class ZstdVelocityConfig {
     }
 
     private static boolean getBool(Map<String, Object> map, String key) {
+        return getBool(map, key, false);
+    }
+
+    /** 带默认值的布尔读取（缺失键时用它，而不是硬编码 false）。 */
+    private static boolean getBool(Map<String, Object> map, String key, boolean def) {
         Object o = map.get(key);
-        return o instanceof Boolean ? (Boolean) o : false;
+        return o instanceof Boolean ? (Boolean) o : def;
     }
 
     // ------------------------------------------------------------------
@@ -324,8 +330,9 @@ public class ZstdVelocityConfig {
                       format: "&a%players% &7人在用 &8| &f%raw% &7\u2192 &a%wire% &8| 压缩率 &e%ratio%"
 
                     logging:
-                      # 调试日志开关：输出逐包诊断信息（仅在排查问题时开启）
-                      debug: false
+                      # 调试日志开关：输出逐包诊断信息（协商、切换确认、扣包/放行、安装锚点）
+                      # 5.0.36 起默认 true —— 登录期的问题只有这些日志能定位；排查完可以改回 false。
+                      debug: true
                     """;
             Files.writeString(configPath, yaml, StandardCharsets.UTF_8);
         } catch (IOException e) {

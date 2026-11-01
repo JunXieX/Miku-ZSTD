@@ -61,7 +61,15 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
      * 模组客户端那边已经切到 zstd —— 它会解不开我们按原版压缩补发的包，直接掉线。
      * 预算放大到 5s 把这个窗口压低一个数量级。</p>
      */
-    private static final int MAX_RETRIES = 50;
+    /**
+     * 安装阶段的单次重试间隔与总预算（{@code 100ms × 15 = 1.5s}）。
+     *
+     * <p>⚠️ 以前是 50 次（5 秒）。这 5 秒里如果 {@code SetCompression} 已经写出，本处理器正
+     * <b>扣着后续所有出站包</b>（holding），玩家看到的就是"卡在连接中"，最后还可能被直接断开。
+     * 锚点（原版 compress/decompress）是 {@code setupCompression} 在同一次调用里紧跟着装上的，
+     * 正常情况下几微秒就位；等不到就是"这条连接压根没有压缩层"，多等 3.5 秒只会让玩家多卡 3.5 秒。</p>
+     */
+    private static final int MAX_RETRIES = 15;
 
     /**
      * 「已推送 {@code zstd:dict}、正在等其应答」阶段的重试次数（合计约 10s）。
@@ -503,8 +511,12 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
             // 拉长，setupCompression 还没跑到），本端回落原版、玩家照常进服，只是拿不到 zstd。
             // 带 remote 是为了能把这条记录和具体玩家对上（同一个服里 6 次激活 / 11 次回落时，
             // 没有地址就分不清是哪条连接）。
-            LOGGER.info("[Zstd] anchors 未出现（compress/decompress 缺失）— 该连接回落原版; "
-                            + "remote={}, setCompressionSeen={}, pipeline={}",
+            // ⚠️ 字段名必须如实：这里打印的是 holding（"扣包窗口是否开启"），不是"是否见过
+            // SetCompression"。旧标签写成 setCompressionSeen，运维会据此误判成"服务器没发压缩包"。
+            // 级别也必须是 debug：24 人在线的服上，每次回落都打一整行 pipeline 会淹没真问题；
+            // 需要它的时候把 logging.debug 打开即可（5.0.36 起默认就是开的）。
+            LOGGER.debug("[Zstd] anchors 未出现（compress/decompress 缺失）— 该连接回落原版; "
+                            + "remote={}, holding={}, pipeline={}",
                     channel.remoteAddress(), holding, channel.pipeline().names());
             finishVanilla(ctx);
             return;
