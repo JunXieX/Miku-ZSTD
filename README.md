@@ -128,9 +128,9 @@ MikuMC 服务器与作者 JunXieX 享有项目著作权。
 | `compression.level` | 3 | zstd 压缩等级 1-22。3 已经够用：小包上更高等级反而更差（同一个 64B 包，L3 压到 45.3%，L9 只有 57.8%），而 L9 的 CPU 开销是 8 到 12 倍。只有大包占绝对多数且 CPU 富余时才考虑调到 6 |
 | `compression.window_log` | 20 | zstd 窗口大小（2 的幂）。调大能提升大帧压缩率，但每连接内存占用同步上升 |
 | `compression.threads` | 0 | 压缩线程数，0 表示自动（核心数减保留值）。混合架构下取「核数减 1」通常最稳 |
-| `batch_window_ms` | 50 | **兜底窗口**：正常流量下用不到（攒批边界就是服务端自己的 flush，不额外等），只有"只写不发"的第三方调用方才会触发。调大不会提升压缩率，只是让这类数据等更久 |
-| `batch_max_packets` | 64 | 单帧最多合几个包。过大时单帧压缩耗时会变长 |
-| `logging.bandwidth_profile` | true | 每 60 秒输出一次带宽剖析，便于判断优化空间在哪 |
+| `compression.batch_window_ms` | 50 | **兜底窗口**：正常流量下用不到（攒批边界就是服务端自己的 flush，不额外等），只有"只写不发"的第三方调用方才会触发。调大不会提升压缩率，只是让这类数据等更久 |
+| `compression.batch_max_packets` | 64 | 单帧最多合几个包。过大时单帧压缩耗时会变长 |
+| `logging.debug` | true | 调试日志开关；Velocity 同时据此启停每 60 秒一次的带宽剖析 |
 
 > 改动 `level`、`window_log`、`batch_window_ms`、`batch_max_packets` 后需要新连接才生效（已有连接沿用建立时的参数）。
 
