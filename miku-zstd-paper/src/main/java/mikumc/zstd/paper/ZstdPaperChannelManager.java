@@ -1,7 +1,6 @@
 package mikumc.zstd.paper;
 
 import com.github.luben.zstd.ZstdCompressCtx;
-import com.github.luben.zstd.ZstdDecompressCtx;
 import mikumc.zstd.protocol.ZstdCtxPool;
 import io.netty.channel.Channel;
 import io.netty.util.AttributeKey;
@@ -39,16 +38,6 @@ public class ZstdPaperChannelManager {
 
     private final ZstdCompressCtx compressCtx;
 
-    /**
-     * 解压上下文。
-     *
-     * <p>⚠️ 5.0.43 起上行（客户端 → 服务端）不再压缩，这个 ctx 已经<b>没有实际用途</b>
-     * ——入站只剩"握手窗口里的原版压缩帧"，那条路径用的是 JDK 的 {@code Inflater}。
-     * 暂时保留：基类仍会向解码器索要它，租借/归还也挂在同一条生命周期上。
-     * 等这版跑稳再单独清理（连带 {@link ZstdCtxPool#borrowDecompress()} 那一档）。</p>
-     */
-    private final ZstdDecompressCtx decompressCtx;
-
     private volatile int negotiateTxId = -1;
     private volatile boolean responseReceived;
     private volatile boolean refused;
@@ -62,13 +51,10 @@ public class ZstdPaperChannelManager {
         this.compressCtx = ZstdCtxPool.borrowCompress(cfg.level);
         this.compressCtx.setWindowLog(cfg.windowLog);
         this.compressCtx.setLong(1); // LDM：提升区块级长距离重复的压缩率
-        // 上行已不压缩，这份 ctx 仅剩占位（见字段注释）；归还路径与压缩 ctx 共用同一把锁
-        this.decompressCtx = ZstdCtxPool.borrowDecompress();
         // 帧头精简必须与客户端一致（magicless / 无 contentSize / 无 dictID）
         this.compressCtx.setMagicless(true);
         this.compressCtx.setContentSize(false);
         this.compressCtx.setDictID(false);
-        this.decompressCtx.setMagicless(true);
     }
 
     /**
@@ -90,10 +76,6 @@ public class ZstdPaperChannelManager {
 
     public ZstdCompressCtx getCompressCtx() {
         return compressCtx;
-    }
-
-    public ZstdDecompressCtx getDecompressCtx() {
-        return decompressCtx;
     }
 
     public int getNegotiateTxId() {
@@ -210,12 +192,7 @@ public class ZstdPaperChannelManager {
         return false;
     }
 
-    /**
-     * 出站方向是否已有可插入的锚点（原版 {@code compress} 或其别名）。
-     *
-     * <p>用途：激活前先确认<b>两个方向都插得进去</b>再动手。只装上一侧会构成单侧 zstd，
-     * 而单侧 zstd 必定断连（见 {@code ZstdPaperNegotiator.tryActivate0}）。</p>
-     */
+    /** 下行编码器是否已有可插入的原版压缩锚点。 */
     public boolean hasEncoderAnchor(Channel channel) {
         var p = channel.pipeline();
         return p.get("zstd_encoder") != null
@@ -223,43 +200,15 @@ public class ZstdPaperChannelManager {
                 || p.get("compression-encoder") != null;
     }
 
-    /**
-     * 入站方向是否已有可插入的锚点（原版 {@code decompress} 或其别名）。
-     *
-     * <p>同上：必须在任何插入动作之前与出站方向一起校验。</p>
-     */
-    public boolean hasDecoderAnchor(Channel channel) {
+    /** 确认嗅探器需要的原版解压锚点；正常上行始终交给它解压。 */
+    public boolean hasConfirmAnchor(Channel channel) {
         var p = channel.pipeline();
-        return p.get("zstd_decoder") != null
-                || p.get("decompress") != null
+        return p.get("decompress") != null
                 || p.get("compression-decoder") != null;
     }
 
     /**
-     * 安装入站解码器：插在原版 {@code decompress} 的<b>上游</b>。
-     *
-     * <p>入站是从 head 往 tail 走的，{@code addBefore} 让我们的解码器先拿到帧；解出来的
-     * 每个包都包成原版未压缩帧 {@code [0][packet]} 交给紧跟其后的原版 {@code decompress}
-     * ——它对 {@code dataLength == 0} 是<b>原样透传</b>，等于借它把包送到包解码器，
-     * 而它自己什么都不做。原版处理器因此可以一直留在管线里。</p>
-     *
-     * <p>⚠️ 位置一旦换到它下游就会乱码：原版 {@code decompress} 会把我们的输出当成
-     * {@code [dataLength][deflate]} 再解一次，帧头里的 {@code rawSize} 被当成长度读。</p>
-     */
-    public boolean installDecoder(Channel channel) {
-        var p = channel.pipeline();
-        if (p.get("zstd_decoder") != null) return true;
-        for (String anchor : new String[]{"decompress", "compression-decoder"}) {
-            if (p.get(anchor) != null) {
-                p.addBefore(anchor, "zstd_decoder", new ZstdPaperDecoder());
-                return true;
-            }
-        }
-        return false;
-    }
-
-    /**
-     * 摘掉本插件装在管线上的<b>全部</b>处理器（幂等）：编码器、解码器、确认嗅探器、切换闸门。
+     * 摘掉本插件装在管线上的<b>全部</b>处理器（幂等）：下行编码器、确认嗅探器、切换闸门。
      *
      * <p>⚠️ 只摘自己的名字，原版 {@code compress} / {@code decompress} / {@code prepender}
      * 一律不动。协议 v7 起我们本来就是"插进去"的，所以摘干净之后管线就是一条标准的原版
@@ -276,7 +225,6 @@ public class ZstdPaperChannelManager {
         if (channel == null) return false;
         var p = channel.pipeline();
         boolean changed = removeIfPresent(p, "zstd_encoder");
-        changed |= removeIfPresent(p, "zstd_decoder");
         changed |= removeIfPresent(p, ZstdPaperSwitchConfirmSniffer.NAME);
         changed |= removeIfPresent(p, "zstd_switch_gate");
         if (changed) {
@@ -320,6 +268,7 @@ public class ZstdPaperChannelManager {
             LOGGER.debug("[Zstd] 切换闸门无法安装（encoder 锚点缺失）; pipeline={}", p.names());
             return false;
         }
+        if (!hasConfirmAnchor(channel)) return false;
         switchGate = mikumc.zstd.protocol.ZstdSwitchGate.create();
         p.addAfter("encoder", "zstd_switch_gate", switchGate);
         installConfirmSniffer(p);
@@ -331,15 +280,12 @@ public class ZstdPaperChannelManager {
      *
      * <p>⚠️ 必须在帧层：包层看到它时已经被原版解码器按"未知包 id"处理掉了。</p>
      *
-     * <p>⚠️ 锚点顺序同样是协议要求：{@code zstd_decoder} 优先。嗅探器必须排在<b>我们的
-     * 解码器上游</b>，否则它看到的是我们解出来的 {@code [0][packet]}，而不是客户端真正
-     * 发出的那一帧——被原版压缩过的确认（阈值很小时会走压缩帧）就此认不出来，闸门只能
-     * 白等满超时才放行。平时它先装在 {@code decompress} 之前，之后解码器再插到
-     * {@code decompress} 前面，两条路径的最终顺序相同：嗅探器 → 我们的解码器 → 原版。</p>
+     * <p>嗅探器读取原版未压缩或 zlib 帧，只消费匹配的切换确认；其余帧原样交给
+     * 原版 {@code decompress}，正常上行不经过任何 zstd 解码器。</p>
      */
     private void installConfirmSniffer(io.netty.channel.ChannelPipeline p) {
         if (p.get(ZstdPaperSwitchConfirmSniffer.NAME) != null) return;
-        for (String anchor : new String[]{"zstd_decoder", "decompress", "compression-decoder"}) {
+        for (String anchor : new String[]{"decompress", "compression-decoder"}) {
             if (p.get(anchor) != null) {
                 p.addBefore(anchor, ZstdPaperSwitchConfirmSniffer.NAME,
                         new ZstdPaperSwitchConfirmSniffer());
@@ -347,12 +293,6 @@ public class ZstdPaperChannelManager {
             }
         }
         LOGGER.debug("[Zstd] 确认嗅探器未能安装（压缩解码器锚点缺失）; pipeline={}", p.names());
-    }
-
-    /** 本连接是否已由客户端确认切换（供解码器决定是否启用握手窗口模式）。 */
-    public boolean isSwitchConfirmed() {
-        var gate = switchGate;
-        return gate != null && gate.isConfirmed();
     }
 
     /**
@@ -404,7 +344,6 @@ public class ZstdPaperChannelManager {
             compressLock.markClosed();
             // 归还而非关闭：池内部会 reset（清字典与参数），池满或已停用时才真正 close
             ZstdCtxPool.returnCompress(compressCtx);
-            ZstdCtxPool.returnDecompress(decompressCtx);
         }
     }
 }

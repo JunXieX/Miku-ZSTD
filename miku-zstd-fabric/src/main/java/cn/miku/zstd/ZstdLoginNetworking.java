@@ -17,22 +17,13 @@ import java.util.function.Consumer;
 import mikumc.zstd.protocol.ZstdNegotiateStatus;
 
 /**
- * 登录协商：{@code zstd:negotiate} 的<b>单次</b>往返。
- *
- * <h2>载荷（协议 v8）</h2>
+ * 登录协商：zstd:negotiate 往返保留下行能力确认，上行始终沿用原版。
  * <pre>
- *   服务端 → 客户端： [int 版本]（4 字节大端）
- *   客户端 → 服务端： [varint 状态]（0 = 会启用 zstd，2 = 保持原版）
+ *   服务端 → 客户端：[int 协商版本]（4 字节大端）
+ *   客户端 → 服务端：[varint 状态]（READY = 准备启用下行，VANILLA = 保持原版）
  * </pre>
- *
- * <p>5.0.42 起训练字典整套删除，只剩滚动历史：字典由两端各自从这条连接的原始字节流现算
- * （每帧向前引用最近 64KB），<b>不经过网络</b>。因此协商里不再有 dictId / flags / 推送请求，
- * 也就不需要第二次往返——用不到字典之后，"协商通过"就等于"能压"。</p>
- *
- * <h2>状态语义（双端必须完全一致）</h2>
- * <p>{@code 0 = 客户端会启用 zstd}、{@code 2 = 客户端保持原版}。服务端严格按 2 回落原版 zlib，
- * 因此客户端任何返回 2 的分支都必须同时放弃激活，否则会出现"服务端 zlib / 客户端 zstd"的
- * 必断连组合。</p>
+ * <p>READY 应答不代替安装屏障：客户端仍须安装下行解码器，并在 zstd:switch 到达后回发
+ * confirm，服务端才放行扣住的下行登录包。版本或载荷异常时，VANILLA 应答与本地回落同步执行。</p>
  */
 public final class ZstdLoginNetworking {
     private static final Logger LOGGER = LoggerFactory.getLogger(MikuZstd.LOGGER_NAME);
@@ -50,6 +41,13 @@ public final class ZstdLoginNetworking {
         try {
             Connection connection = ((ClientHandshakePacketListenerAccessor) handler).getConnection();
             Channel channel = ((ConnectionAccessor) connection).getChannel();
+
+            // Fabric LoginQueryRequestHandler.receive 的线程契约是 Netty event loop。
+            // 新 negotiate 先同步摘除旧下行 handler、清 ACTIVATED，再更换 native 上下文；
+            // 旧 decoder 的 handlerRemoved0 负责释放滚动历史与字典引用。
+            // 仅此入口清理，重复 SetCompression 仍保留当前 decoder 和历史。
+            channel.attr(ZstdChannelManager.ZSTD_STATE).set(ZstdChannelManager.TransportState.PLAIN);
+            ZstdClientActivation.onRoundDeclined(channel);
 
             // ⚠️ 本轮判定之前就要把上一轮的上下文换掉：这条连接可能被重放登录流程
             //（ViaFabricPlus 协议切换 / 重连到另一台服务器）。滚动历史算出的字典是
@@ -86,7 +84,7 @@ public final class ZstdLoginNetworking {
 
             // 应答写出之后再补一次激活尝试（quiet 版）：正常情况下 SetCompression 还没到、
             // 锚点不存在，这里只会记 debug；但代理或其它模组把登录顺序调换时，它是唯一
-            // 能补上的时机。提前（应答写出前）切换不安全，理由见该方法的注释。
+            // 能补上的时机。这里只准备下行；switch/confirm 仍承担安装就绪屏障。
             listenerConsumer.accept(operation ->
                     ZstdClientActivation.activateAfterQueryResponseSent(channel));
 
@@ -103,8 +101,8 @@ public final class ZstdLoginNetworking {
      * {@link ZstdChannelManager.TransportState#PLAIN}，并请激活层拆掉可能残留的 zstd 处理器。
      *
      * <p>⚠️ <b>为什么必须显式做这件事</b>：同一个 {@code Channel} 可能被<b>重放登录</b>
-     * （ViaFabricPlus 协议切换、或同一条连接重新协商）。上一轮若已激活 zstd，本端就会一直
-     * 以 zstd 发帧、并按 zstd 解帧；而这一轮的对端是原版（或旧版插件）——形成"单侧 zstd"，
+     * （ViaFabricPlus 协议切换、或同一条连接重新协商）。上一轮若已激活下行 zstd，本端就会
+     * 继续按 zstd 解帧；而这一轮的对端是原版（或旧版插件）——形成"单侧 zstd"，
      * 对端发来的原版压缩帧会被本端 zstd 解码器拒绝，玩家<b>进不去服务器</b>。
      * 只有状态被置为 PLAIN，激活层才知道该把上一轮的 zstd 处理器拆掉（见
      * {@code ZstdClientActivation#onRoundDeclined}）。</p>
@@ -122,7 +120,7 @@ public final class ZstdLoginNetworking {
         }
     }
 
-    /** 应答载荷：只有一个 varint 状态（协议 v8 起不再有两个方向的状态字节）。 */
+    /** 应答载荷只有一个 varint 下行能力状态；上行没有 zstd 协商状态。 */
     private static FriendlyByteBuf answer(int status) {
         FriendlyByteBuf buf = new FriendlyByteBuf(Unpooled.buffer());
         buf.writeVarInt(status);

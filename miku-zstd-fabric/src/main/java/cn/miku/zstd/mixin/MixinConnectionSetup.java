@@ -9,10 +9,8 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
- * 服务端下发 Set Compression（客户端 setupCompression 被调用）后，
- * 把 zstd 编解码器插到原版 zlib 的 compress/decompress 两侧（不替换它们）。
- *
- * <p>TAIL 是必要的：锚点要等本方法内部把原版处理器装好才存在。</p>
+ * 原版 setupCompression 的 TAIL：压缩处理器安装后，准备下行 zstd 解码器与 switch 嗅探器。
+ * 上行的 compress、prepender 与加密处理全部沿用原版。
  */
 @Mixin(Connection.class)
 public class MixinConnectionSetup {

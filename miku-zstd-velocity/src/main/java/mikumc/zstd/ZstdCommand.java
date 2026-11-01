@@ -100,9 +100,8 @@ public final class ZstdCommand {
         source.sendMessage(Component.text("── 压缩线程池 ──", NamedTextColor.YELLOW));
         source.sendMessage(Component.text("  " + ZstdCompressPool.summary(), NamedTextColor.GRAY));
 
-        source.sendMessage(Component.text("── 解压缓冲 ──", NamedTextColor.YELLOW));
         source.sendMessage(Component.text(
-                "  " + mikumc.zstd.protocol.ZstdBatchDecoderBase.scratchStats(), NamedTextColor.GRAY));
+                "  上行保持原版压缩/解压；带宽与压缩统计仅覆盖下行", NamedTextColor.GRAY));
         if (ZstdCompressPool.backlogged()) {
             source.sendMessage(Component.text(
                     "  队列积压：压缩跟不上流量 → 优先降低 level，其次调大 threads",
@@ -115,7 +114,7 @@ public final class ZstdCommand {
 
     /** 各连接的压缩统计排行 —— 定位"是谁在拖后腿"。 */
     private void showTop(CommandSource source) {
-        source.sendMessage(Component.text("═══ 各连接压缩统计 ═══", NamedTextColor.GOLD));
+        source.sendMessage(Component.text("═══ 各连接下行压缩统计 ═══", NamedTextColor.GOLD));
         source.sendMessage(Component.text("  " + mikumc.zstd.protocol.ZstdConnStats.totalSummary(),
                 NamedTextColor.GRAY));
         java.util.List<String> rows = mikumc.zstd.protocol.ZstdConnStats.top(10);

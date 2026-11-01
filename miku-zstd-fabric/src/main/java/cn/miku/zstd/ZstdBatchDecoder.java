@@ -5,34 +5,15 @@ import io.netty.channel.ChannelHandlerContext;
 import mikumc.zstd.protocol.ZstdBatchDecoderBase;
 
 /**
- * Miku-ZSTD 解码器（服务端 → 客户端）帧格式 <b>v7</b>（协商版本 v9）。
+ * 服务端 → 客户端的 zstd 下行解码器，帧格式保持 v7，协商版本取共享常量。
  *
- * <p>帧解析、内层切包、两道防护（压缩比上限 / scratch 上限）、fail-fast 协议
- * 全部在共享基类 {@link ZstdBatchDecoderBase} 中（三端同一份源码）；
- * 本类只声明解压上下文来源与 HUD 统计口径。</p>
- *
- * <h2>安装位置与顺序前提</h2>
- * <p>本类挂在原版 {@code decompress} 的<b>上游</b>（{@code addBefore}），不替换它：解出的每个包
- * 都以原版未压缩帧 {@code [0][packet]} 交出，由原版 {@code decompress} 原样透传下去。完整的
- * 入站顺序是：</p>
+ * <p>共享基类负责帧解析、分块解压、内层切包与边界检查。本类只提供下行上下文、
+ * 已解包的转发位置与 HUD 下行统计，不实现任何上行或原版压缩帧兼容分支。</p>
  * <pre>
- *   socket → decrypt → splitter → zstd_switch_sniffer → zstd_decoder（本类）→ decompress → decoder
+ *   socket → decrypt → splitter → zstd_switch_sniffer → zstd_decoder → decompress → decoder
  * </pre>
- * <p>⚠️ 这个顺序是本类的<b>隐含前提</b>：<b>正版加密</b>时 {@code decrypt} 插在 {@code splitter}
- * 之前，所以本类拿到的必然是"已解密、且外层长度已被 {@code splitter} 剥掉"的完整帧——它才能
- * 把首字节当 {@code rawSize} 读。若别的模组把解密挪到 {@code splitter} 之后（或干脆挪到本类
- * 下游），进到这里的会是密文，帧头必然是非法 varint，表现为"一连服务器就断"。</p>
- *
- * <h2>⚠️ 不要覆写 {@code storedBatchFrames()}</h2>
- * <p>那个钩子属于<b>上行</b>解的那一侧（Paper / Velocity 解客户端发来的存储批帧）。本类解的是
- * 服务端 → 客户端，这个方向仍然压缩，而服务端的小包直存帧是 {@code [0][packet]}——{@code [0]}
- * 后面直接是包 id。一旦把本类也标成"存储批"，这些帧会被当成 {@code [0][count][len][pkt]...}：
- * 包 id 被读成 count，随后必然长度不自洽，按协议错误关连接，表现就是"一连服务器就断"。
- * 所以这里保持基类默认的 {@code false}，什么也不用写。</p>
- *
- * <h2>统计口径</h2>
- * <p>两个方向都按"帧体线下字节"与"解压后字节"记账，且<b>两侧都计入 rawSize 标记</b>
- * ——这样小包直存时压缩率恰好显示 100%，不会把协议自身的帧头算成"膨胀"。</p>
+ * <p>收到的是已解密且剥掉外层长度的帧体；解出的普通包从 decompress 的 context 向后交付，
+ * 跳过原版/Krypton 重复解压。直存帧仍为 {@code [0][packet]}，压缩帧格式保持不变。</p>
  */
 public class ZstdBatchDecoder extends ZstdBatchDecoderBase {
 
@@ -51,7 +32,7 @@ public class ZstdBatchDecoder extends ZstdBatchDecoderBase {
     /**
      * 每帧重新取解压上下文。
      *
-     * <p>⚠️ 与编码器同理：重放登录（重新协商）时 {@code ZstdChannelManager#resetContexts()}
+     * <p>重放登录（重新协商）时 {@code ZstdChannelManager#resetContexts()}
      * 会把旧上下文归还池、换一个新的。旧实例里绑着上一轮滚动历史算出的字典，继续用就会按
      * 错代的字典解压 —— 帧头 {@code dictGen} 对不上，或者更糟：解出一堆看着像包的东西。
      * 读取发生在 decode（event loop）上，替换也只在 event loop 上发生（协商回调），

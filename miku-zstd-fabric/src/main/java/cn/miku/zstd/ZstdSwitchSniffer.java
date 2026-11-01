@@ -28,7 +28,7 @@ import java.util.List;
  * 所以锚点顺序是 {@code zstd_decoder} → {@code decompress} → {@code compression-decoder}：
  * 必须排在<b>我们的解码器上游</b>。若被插到我们下游，这条询问会被我们的解码器当"直存帧"
  * 处理——既喂进了滚动历史（服务端那条询问绕过编码器写、没有喂，两端历史当场分叉），
- * 又会被原版 {@code decompress} 透传到包解码器，客户端按未注册通道回一条 {@code success=false}。
+ * 又会被交到包解码器，客户端按未注册通道回一条 {@code success=false}。
  * 锚点都不在时安装方只记 debug 等下一次触发，不做兜底位置。</p>
  *
  * <h2>为什么继承 {@code MessageToMessageDecoder}</h2>
@@ -44,8 +44,8 @@ public final class ZstdSwitchSniffer extends MessageToMessageDecoder<ByteBuf> {
      * 单帧上限：询问包是 {@code [0][0x04][varint txId][len]["zstd:switch"][magic]} ≈ 23B，
      * 超过这个尺寸的帧一律不可能是它。
      *
-     * <p>⚠️ 本嗅探器是<b>常驻</b>的（服务端的询问只发一次，但确认之前它必须一直在位），
-     * 所以这个上限同时是热路径开关：调大意味着更多入站帧要走
+     * <p>嗅探器在询问到达前保持在位，识别到 switch 后自行移除，
+     * 因此这个上限限制切换前要走询问识别的入站帧数量：调大意味着更多帧要走
      * {@link ZstdStepFrames#asBarePacket} 的解析（其中"被压缩过的帧"还要尝试一次 zlib 解压）。</p>
      */
     private static final int MAX_FRAME_BYTES = 64;

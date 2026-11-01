@@ -1,7 +1,6 @@
 package mikumc.zstd;
 
 import com.github.luben.zstd.ZstdCompressCtx;
-import com.github.luben.zstd.ZstdDecompressCtx;
 import mikumc.zstd.protocol.ZstdCtxPool;
 import io.netty.channel.Channel;
 import io.netty.util.AttributeKey;
@@ -14,7 +13,7 @@ import org.slf4j.LoggerFactory;
 /**
  * Miku-ZSTD 每连接上下文（Velocity 端）。
  *
- * <p>持有 zstd 压缩/解压上下文与协商状态机。生命周期：嗅探器检测到
+ * <p>持有下行 zstd 压缩上下文与协商状态机。生命周期：嗅探器检测到
  * {@code \0ZSTD\0} 握手标记时创建，连接关闭时释放本地资源。</p>
  *
  * <h2>帧格式（v7；协商版本见 {@link #PROTOCOL_VERSION}）</h2>
@@ -23,13 +22,11 @@ import org.slf4j.LoggerFactory;
  *       或直存 {@code [varint bodyLen][0][packet]} —— Velocity 把「写外层长度」与「压缩」
  *       放在<b>同一个</b>处理器里，我们的帧要从它之后写出（才能跳过它），于是 bodyLen 由
  *       编码器<b>自带</b>（见 {@code ZstdBatchEncoder#writeBodyLen}）。</li>
- *   <li>客户端 → 服务端帧（<b>不压缩</b>，5.0.43 起）：存储批
- *       {@code [0][varint count] + count × [varint pktLen][packet]} —— 外层长度由客户端
- *       管线的 prepender 负责，服务端 frame-decoder 剥离后本解码器收到的即完整帧负载；
- *       基类按 {@code count} 逐包拆开下传（见 {@code ZstdBatchDecoder#storedBatchFrames}）。</li>
+ *   <li>客户端 → 服务端始终使用原版压缩协议：原版压缩解码器处理
+ *       {@code [0][packet]} 或 {@code [dataLength][zlib(packet)]}，再交给包解码器。</li>
  *   <li>下行 {@code rawSize == 0} 表示未压缩直存：帧体<b>恰好是一个包</b>（{@code [0][packet]}），
  *       与原版未压缩帧逐字节同形；{@code rawSize > 0} 才是压缩帧，其
- *       {@code payload = [varint pktLen][pkt]...} 可含多个包。上行不压缩，只有上面那种存储批帧。</li>
+ *       {@code payload = [varint pktLen][pkt]...} 可含多个包。</li>
  *   <li>「v几」有三种含义（协商版本 / 帧格式 / 历史版本），见
  *       {@link ZstdVarInts} 类注释里的术语表——不要混用。</li>
  * </ul>
@@ -41,7 +38,7 @@ import org.slf4j.LoggerFactory;
  * 激活前必须看到"已应答且状态为就绪"，否则一律回落原版。</p>
  *
  * <p>⚠️ 5.0.42 起没有"字典协商"这一段了：训练字典整套删除，跨帧重复交给
- * {@link mikumc.zstd.protocol.ZstdRollingDict}（协议内每方向自动维护 64KB 滑窗）。
+ * {@link mikumc.zstd.protocol.ZstdRollingDict}（下行两端自动维护 64KB 滑窗）。
  * 因此本类不再持有任何字典对象，也不再需要引用计数/归还。</p>
  *
  * <h2>3.1.0 变更</h2>
@@ -64,7 +61,6 @@ public class ZstdChannelManager {
     public final mikumc.zstd.protocol.ZstdConnStats stats = new mikumc.zstd.protocol.ZstdConnStats();
 
     private final ZstdCompressCtx compressCtx;
-    private final ZstdDecompressCtx decompressCtx;
 
     // ── 协商状态 ──
     /**
@@ -99,7 +95,6 @@ public class ZstdChannelManager {
         this.compressCtx = ZstdCtxPool.borrowCompress(cfg.level);
         this.compressCtx.setWindowLog(cfg.windowLog);
         this.compressCtx.setLong(1); // LDM：提升区块级长距离重复的压缩率
-        this.decompressCtx = ZstdCtxPool.borrowDecompress();
         applySlimFrameFormat();
         // 注意：这里不装载任何字典。跨帧重复由协议基类的滚动历史（ZstdRollingDict）
         // 在帧边界自行维护，本类不参与，也不需要在激活路径上做任何字典准备。
@@ -125,7 +120,6 @@ public class ZstdChannelManager {
         compressCtx.setMagicless(true);
         compressCtx.setContentSize(false);
         compressCtx.setDictID(false);
-        decompressCtx.setMagicless(true);
     }
 
     /**
@@ -147,10 +141,6 @@ public class ZstdChannelManager {
 
     public ZstdCompressCtx getCompressCtx() {
         return compressCtx;
-    }
-
-    public ZstdDecompressCtx getDecompressCtx() {
-        return decompressCtx;
     }
 
     // ── 协商门控 ──
@@ -343,16 +333,10 @@ public class ZstdChannelManager {
         switchGate = mikumc.zstd.protocol.ZstdSwitchGate.create();
         p.addAfter("minecraft-encoder", "zstd_switch_gate", switchGate);
 
-        // 确认嗅探器挂在<b>我们解码器的上游</b>（帧层）：确认包可能被原版压缩或直存
+        // 确认嗅探器只读取原版未压缩或 zlib 帧；正常入站继续走原版解压与包解码。
         if (p.get("zstd_switch_confirm") == null) {
-            // ⚠️ 锚点顺序 = 我们上游优先。嗅探器按"对端发来的原始帧形态"识别确认包
-            //（{@code [0][packet]} 或 {@code [dataLength][packet]}），所以它必须排在
-            // {@code zstd_decoder} <b>之前</b>：一旦落到我们解码器下游，它看到的已经是
-            // 重新封装过的输出，一个字节都对不上，闸门只能干等满 5 秒超时。
-            // 首次激活时解码器还没装，就先挂到原版压缩解码器之前——随后 installDecoder 的
-            // addBefore 会把 zstd_decoder 插进两者之间，相对位置仍然在上游。
             boolean installed = false;
-            for (String anchor : new String[]{"zstd_decoder", "compression-decoder", "decompress"}) {
+            for (String anchor : new String[]{"compression-decoder", "decompress"}) {
                 if (p.get(anchor) != null) {
                     p.addBefore(anchor, "zstd_switch_confirm", new ZstdSwitchConfirmSniffer());
                     installed = true;
@@ -415,37 +399,11 @@ public class ZstdChannelManager {
     }
 
     /**
-     * 本连接是否已由客户端确认切换（供解码器决定是否启用握手窗口模式）。
+     * 安装下行切换处理器：先安装扣包闸门和原版帧确认嗅探器，再安装下行编码器。
+     * 任一步失败都整体回滚；正常上行一直走原版解压器与包解码器。
      *
-     * <p>闸门尚未安装（zstd 还未激活）时按"未确认"返回：此时解码器本身也不在管线里，
-     * 语义上就是"切换尚未发生"。</p>
-     */
-    public boolean isSwitchConfirmed() {
-        var gate = switchGate;
-        return gate != null && gate.isConfirmed();
-    }
-
-    /**
-     * 安装编解码器（先装闸门，再装编码器，最后装解码器）。任一步失败都<b>整体回滚</b>。
-     *
-     * <p>⚠️ 顺序不可调换：</p>
-     * <ol>
-     *   <li>闸门必须先于 {@code zstd_encoder} 就位——否则激活之后到确认之前，
-     *       出站帧会以 zstd 形态直接发给还没切换的客户端；而它同时必须先于
-     *       {@code zstd_decoder} 就位：解码器在确认之前只按原版规则解释；</li>
-     *   <li>{@code zstd_encoder} 的 {@code handlerAdded} 会立即解析压缩上下文，
-     *       因此必须在字典装载之后插入。</li>
-     * </ol>
-     *
-     * <p>⚠️ <b>闸门装不上就必须整体放弃激活</b>：没有闸门就没有"确认"这个信号，
-     * {@code isSwitchConfirmed()} 恒为 false，解码器会<b>永久停在"原版兼容窗口"</b>：
-     * 客户端切换后发来的 zstd 压缩帧会被当作原版 deflate 帧解压 → 失败 → 断连。
-     * 宁可回落原版。</p>
-     *
-     * <p>失败路径一律 {@link #uninstallZstd} 收场而不是关连接：原版处理器从来没被摘掉
-     *（v7 起只插入不替换），摘干净我们自己的四个 handler 之后管线就是完整原版形态，
-     * 调用方可以按原版压缩补发扣住的登录包；而且此刻客户端还没收到 {@code zstd:switch}，
-     * 两边对"用哪种压缩"的理解必然一致。</p>
+     * <p>闸门必须先于下行编码器就位，确保客户端确认下行解码就绪之前，
+     * 登录期数据仍被扣住。此时尚未发送 {@code zstd:switch}，安装失败可摘掉自身处理器回落原版。</p>
      *
      * @return 是否确实安装成功
      */
@@ -456,10 +414,6 @@ public class ZstdChannelManager {
             return false;
         }
         if (!installEncoder(channel)) {
-            uninstallZstd(channel);
-            return false;
-        }
-        if (!installDecoder(channel)) {
             uninstallZstd(channel);
             return false;
         }
@@ -487,54 +441,17 @@ public class ZstdChannelManager {
     public void uninstallZstd(Channel channel) {
         if (channel == null) return;
         var p = channel.pipeline();
-        for (String name : new String[]{"zstd_encoder", "zstd_decoder",
+        for (String name : new String[]{"zstd_encoder",
                 "zstd_switch_gate", "zstd_switch_confirm"}) {
             // remove 对不存在的名字会抛 NoSuchElementException，先判存在
             if (p.get(name) != null) {
                 p.remove(name);
             }
         }
-        // 闸门实例已经离开管线：字段必须一起清空，否则 isSwitchConfirmed() 仍在读一个
-        // 已脱离管线的实例（它的内部状态停在"已确认"，与被摘除的事实相反）。
+        // 闸门实例已离开管线，清空引用供后续安装重新创建。
         switchGate = null;
         // 本连接不再走 zstd：计数与状态一起回退（setReplaced 幂等，未激活时是空操作）
         setReplaced(false);
-    }
-
-    /**
-     * 把 zstd 解码器插到原版压缩解码器的 <b>上游</b>（入站先经过我们）。
-     *
-     * <p>入站事件从 head 走向 tail，{@code addBefore} 让本处理器排在原版解压处理器
-     * <b>前面</b>：帧由我们拆、包由我们解，然后每个包以<b>原版未压缩帧</b>
-     * {@code [0][packet]} 交给原版 {@code decompress}——它对 {@code dataLength == 0}
-     * 是原样透传，于是它仍然在管线里"干活"，只是什么都不改
-     *（见 {@code ZstdBatchDecoderBase} 的 {@code vanillaFrame}）。</p>
-     *
-     * <p>⚠️ 必须是"插在它上游"，既不能替换也不能插在它下游：替换会回到"摘掉装不回"的
-     * 死局；而插到下游则完全无效——原版会先把我们的 zstd 帧当成原版压缩帧去解，
-     * 一帧都过不去。</p>
-     *
-     * <p>⚠️ 绝不能 {@code addBefore("minecraft-decoder")}：那是在<b>保留</b> MC 帧解码器的
-     * 前提下再加一层，本解码器输出的包会被它当成外层帧<b>再解析一次</b>，必然失败 ——
-     * 症状是 Velocity 打出 "A packet frame decoder failed"（QuietRuntimeException）并断连，
-     * 而我们自己的解码器不会报任何 "frame rejected"，极难归因。</p>
-     *
-     * <p>⚠️ 调用前 {@link #installSwitchGate} 必须已执行（见 {@link #installHandlers}）。</p>
-     *
-     * @return 是否确实安装成功
-     */
-    private boolean installDecoder(Channel channel) {
-        if (channel == null) return false;
-        var p = channel.pipeline();
-        if (p.get("zstd_decoder") != null) return true;
-        for (String anchor : new String[]{"compression-decoder", "decompress"}) {
-            if (p.get(anchor) != null) {
-                p.addBefore(anchor, "zstd_decoder", new ZstdBatchDecoder());
-                return true;
-            }
-        }
-        LOGGER.warn("[Zstd] decoder not installed — compression anchor missing in pipeline {}", p.names());
-        return false;
     }
 
     /** 释放 zstd 上下文（归还租借池）。 */
@@ -550,7 +467,6 @@ public class ZstdChannelManager {
             compressLock.markClosed();
             // 归还池（内部 reset）；池满/已停用时才真正 close
             ZstdCtxPool.returnCompress(compressCtx);
-            ZstdCtxPool.returnDecompress(decompressCtx);
         }
     }
 }

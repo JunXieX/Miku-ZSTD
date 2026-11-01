@@ -30,7 +30,7 @@ public final class ZstdPaperCommand implements BasicCommand {
         CommandSender sender = source.getSender();
 
         if (args.length > 0 && "top".equalsIgnoreCase(args[0])) {
-            sender.sendMessage("§6═══ 各连接压缩统计 ═══");
+            sender.sendMessage("§6═══ 各连接下行压缩统计 ═══");
             sender.sendMessage("§7  " + mikumc.zstd.protocol.ZstdConnStats.totalSummary());
             java.util.List<String> rows = mikumc.zstd.protocol.ZstdConnStats.top(10);
             if (rows.isEmpty()) {
@@ -70,7 +70,7 @@ public final class ZstdPaperCommand implements BasicCommand {
                 ? "§c  原版压缩阈值 = " + threshold + "（已关闭）→ 本插件会自动停用"
                 : "§a  原版压缩阈值 = " + threshold + " → zstd 可接管");
         sender.sendMessage("§7  压缩等级=" + cfg.level + " 窗口=" + cfg.windowLog
-                + " 批处理=" + cfg.batchWindowMs + "ms/" + cfg.batchMaxPackets + "包"
+                + " 下行批处理=" + cfg.batchWindowMs + "ms/" + cfg.batchMaxPackets + "包"
                 + " 直存阈值=" + cfg.skipCompressBelowBytes + "B");
 
         sender.sendMessage("§e── 压缩线程池 ──");
@@ -79,8 +79,7 @@ public final class ZstdPaperCommand implements BasicCommand {
             sender.sendMessage("§c  队列积压：压缩跟不上流量 → 优先降低 level，其次调大 threads");
         }
 
-        sender.sendMessage("§e── 解压缓冲 ──");
-        sender.sendMessage("§7  " + mikumc.zstd.protocol.ZstdBatchDecoderBase.scratchStats());
+        sender.sendMessage("§7  上行保持原版压缩/解压；带宽与压缩统计仅覆盖下行");
 
         sender.sendMessage("§e── 跨帧历史 ──");
         sender.sendMessage("§7  滚动历史：§a自动§7（每帧把最近 64KB 原始字节当字典，每 256KB 轮换一次）"

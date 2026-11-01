@@ -16,9 +16,9 @@ import java.util.concurrent.TimeUnit;
 import java.nio.channels.ClosedChannelException;
 
 /**
- * Miku-ZSTD 出站编码器基类（帧格式 <b>v6</b>，协商版本 v7）——三端共享实现。
+ * Miku-ZSTD 下行编码器基类（帧格式 <b>v7</b>，协商版本 v11）——服务端共享实现。
  *
- * <h2>帧格式（v6）</h2>
+ * <h2>下行帧格式（v7）</h2>
  * <pre>
  *   [varint bodyLen?][varint rawSize][varint dictGen][varint blockCount] + block...
  *   block = [varint blockRawLen][varint chunkLen][chunk]
@@ -41,8 +41,8 @@ import java.nio.channels.ClosedChannelException;
  * 包解码器 / Velocity 的校验器）都能正确解释，<b>不存在任何字节级启发式</b>。</p>
  *
  * <p>{@code bodyLen} <b>只由 Velocity 写</b>：它 4.x 的压缩编码器把"外层长度 + 压缩"合在同一个
- * 处理器里，跳过它就必须自带长度。Paper / Fabric 的 {@code prepender} 仍在写帧路径下游，由它负责；客户端侧由
- * prepender 负责外层长度，子类通过 {@link #writeBodyLen()} 声明。</p>
+ * 处理器里，跳过它就必须自带长度。Paper 的 {@code prepender} 仍在写帧路径下游，
+ * 由它负责外层长度，子类通过 {@link #writeBodyLen()} 声明。</p>
  *
  * <h2>批处理：以 flush 为界</h2>
  * <p><b>一个 flush 成出一帧</b>：{@code flush()} 到达时把攒下的包合成一帧、写出并 flush。
@@ -262,22 +262,6 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
     private byte[] appliedRollingDict;
 
     /**
-     * 本方向是否已"武装"（= 允许真正产出 zstd 帧并记账）。
-     *
-     * <p>⚠️ 这是滚动历史正确性的前提，不是性能开关。两端必须对<b>同一批帧</b>记账，
-     * 而"哪些帧是 zstd 帧"这件事，在<b>直存帧</b>上从字节层面根本看不出来（它故意与原版
-     * 未压缩帧同形）。所以只能约定：<b>未武装期间一律透传、不产帧、不记账</b>。</p>
-     *
-     * <p>谁需要关掉它：<b>客户端</b>。它在 SetCompression 时就把编码器挂进了管线，
-     * 但要到回出切换确认那一刻才真正该开始产 zstd 帧；在这之前对端还处在"按原版解释"的
-     * 窗口里（它只会放行、不记账）。若这段时间本端产了帧，就会出现"一端记了、一端没记"，
-     * 之后 {@code dictGen} 必然分叉。</p>
-     *
-     * <p>服务端两侧默认 {@code true}：它们只在自己已经激活之后才可能产帧，天然对齐。</p>
-     */
-    private volatile boolean armed = true;
-
-    /**
      * 在途批次使用的字典代数，{@code buildCompressedFrame} 写进帧头。
      *
      * <p>用字段而不是参数传递：同一时刻只允许一个在途批次（{@code compressing} 门），
@@ -297,19 +281,6 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
     protected abstract ZstdCompressCtx resolveCompressContext(ChannelHandlerContext ctx);
 
     /**
-     * 本方向的帧是否走 zstd 压缩。默认 true；<b>上行（客户端→服务端）返回 false</b>。
-     *
-     * <p>实测（2026-11-01，跑图/飞行/PVP 模拟）：上行单包均值 28.8B，压缩后<b>反而膨胀 13%</b>，
-     * 字典对上行收益 0.0%；也就是说压缩这一步一个字节都没省，全靠直存兜底。
-     * 上行真正有效的优化只有<b>批处理</b>——把窗口内的多个包合成一帧，省掉每包 1 字节的
-     * {@code [0]} 前缀与逐包的外层长度。所以上行保留批处理、彻底去掉 zstd。</p>
-     *
-     * <p>返回 false 时本类<b>完全不碰</b> zstd 上下文与滚动历史：不建 ctx、不喂历史、
-     * 不写 {@code dictGen}，帧形态固定为 {@code [0][count][len][pkt]...}（见 {@link #writeStoredBatch}）。</p>
-     */
-    protected abstract boolean compressUpstream();
-
-    /**
      * 小包跳过压缩的阈值：低于该值直接直存，不调用 zstd。
      *
      * <p>5.0.42 起不再区分"有没有静态字典"：训练字典整套已删除，滚动历史不提供熵表，
@@ -323,7 +294,7 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
     /** 窗口日志（0 = 交给 zstd 按等级自动选）。 */
     protected abstract int configWindowLog();
 
-    /** 帧头是否写外层 {@code bodyLen}（只有 Velocity true；Paper / Fabric 由 prepender 负责） */
+    /** 帧头是否写外层 {@code bodyLen}（Velocity true；Paper 由 prepender 负责） */
     protected abstract boolean writeBodyLen();
 
     /**
@@ -345,29 +316,6 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
     /** 本方向的滚动历史（只读用途：子类可在诊断命令里读代数/命中情况）。 */
     protected final ZstdRollingDict rollingDict() {
         return rolling;
-    }
-
-    /** 是否已武装（允许产 zstd 帧并记账）。 */
-    protected final boolean isArmed() {
-        return armed;
-    }
-
-    /**
-     * 武装本方向：此后产出的帧才算 zstd 帧、才进滚动历史。
-     *
-     * <p>⚠️ 调用点必须与对端"离开兼容窗口"的时刻对齐（客户端 = 切换确认写出成功之后）。</p>
-     */
-    public final void arm() {
-        armed = true;
-    }
-
-    /**
-     * 解除武装：装作一台"不参与 zstd"的编码器——全部原样透传、不记账。
-     *
-     * <p>用于客户端在 SetCompression 时就装上编码器、但还不该产帧的那段时间。</p>
-     */
-    public final void disarm() {
-        armed = false;
     }
 
     /**
@@ -428,10 +376,8 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
     /**
      * 本批实际要使用的压缩上下文（在池线程、已持有 {@link #compressLock()} 时调用）。
      *
-     * <p>默认返回 {@code handlerAdded} 时解析出的实例——对上下文生命周期与连接一致的一端
-     * （服务端两端）这就够了。<b>客户端必须覆写</b>：它在重新协商到"无字典"的服务器时
-     * 需要换一个新的上下文来清空旧字典（zstd 没有卸载接口），届时旧实例会被 close。
-     * 若仍用缓存实例，压缩就会写已释放的原生内存 → SIGSEGV。</p>
+     * <p>默认返回 {@code handlerAdded} 时解析出的下行上下文；生命周期由服务端
+     * ChannelManager 与连接共同管理，释放时必须持有同一把压缩锁。</p>
      *
      * @return 压缩上下文；{@code null} 表示当前不可用（本批按失败处理）
      */
@@ -472,9 +418,8 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
             emitBatch(ctx);
             return;
         }
-        if (compressCtx == null || !armed) {
-            // 透传：不缓冲、不产帧、不记账。下游的原版压缩处理器仍在管线里，
-            // 因此这一帧会按原版规则（zlib 或直存）发出去——正是对端兼容窗口需要的形态。
+        if (compressCtx == null) {
+            // 没有下行压缩上下文时交回原版处理器，不缓冲、不产帧、不记账。
             ctx.write(packet, promise);
             return;
         }
@@ -653,22 +598,6 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
         //（16B 仍膨胀到 103.5%，靠字典预置的 Huffman/FSE 表）；滚动历史是 raw content，
         // 只有内容匹配、没有熵表，24~47B 的包压出来照样膨胀 —— 把它算作"有字典"等于每帧
         // 白跑一次 zstd（字节不会变差，压不动会退回直存，但 CPU 是白花的）。
-        // ── 上行：只批处理，不压缩 ──
-        // 一个字节都不压（实测压了反而膨胀 13%），所以这里直接写"存储批帧"，绕开整条
-        // zstd 路径：不建 ctx、不喂历史、不写 dictGen。收益来自批处理省掉的每包前缀。
-        if (!compressUpstream()) {
-            try {
-                writeStoredBatch(ctx, raw, rawTotal, withBodyLen, promises);
-            } catch (Throwable t) {
-                failAll(promises, t);
-                LOGGER.error("[Zstd] encoder stored-batch build failed", t);
-            }
-            if (!pending.isEmpty()) {
-                schedulePendingBatch(ctx);
-            }
-            return;
-        }
-
         if (rawTotal < Math.max(MIN_STORED_THRESHOLD, skipCompressThreshold())) {
             try {
                 writeStoredFrames(ctx, raw, rawTotal, withBodyLen, promises);
@@ -1005,14 +934,8 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
      * <p>⚠️ <b>必须在帧边界、以与对端完全相同的粒度调用</b>：对端解码器在同一帧处理完后
      * 喂同样的字节。粒度一旦不同（例如这里按整批喂、对端按包喂），两端的历史与代数就会分叉，
      * 后果是解压出垃圾而不是压缩率下降。详见 {@link ZstdRollingDict} 的类注释。</p>
-     *
-     * <p>未武装时不记账（见 {@link #armed}）：那种帧不是 zstd 帧，对端在兼容窗口里也是
-     * 只放行不记账。这一支理论上走不到（{@code write()} 已提前透传），留作第二道保险。</p>
      */
     private void feedHistory(ByteBuf raw, int index, int len) {
-        if (!armed) {
-            return;
-        }
         rolling.feed(raw, index, len);
         applyRollingDict();
     }
@@ -1145,58 +1068,6 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
      * <p>⚠️ 先把整批校验完再动手写：写了一半才失败，会让"已经写出去的帧"与"被失败化的
      * promise"对不上——上游以为没发出去，其实数据已经在路上。</p>
      */
-    /**
-     * 上行专用：把整批包写成 <b>一个</b>"存储批帧"，不做任何压缩。
-     *
-     * <p>帧形态：{@code [0][varint count] + count × [varint pktLen][packet]}。</p>
-     *
-     * <p>与 {@link #writeStoredFrames}（下行回落路径）的唯一区别是<b>多包一帧</b>：
-     * 原版对每个小包各发一帧 {@code [0][packet]}（每包 1 字节前缀 + 逐包外层长度），
-     * 批处理把这些开销摊到一次。上行包均值 28.8B，这一点摊薄就是<b>全部</b>收益。</p>
-     *
-     * <p>{@code raw} 里已经是 {@code [len][bytes]} 拼接好的负载，所以帧体就是
-     * {@code [0][count]} 直接接上这段字节，不需要逐包重写。</p>
-     */
-    private void writeStoredBatch(ChannelHandlerContext ctx, ByteBuf raw, int rawTotal,
-                                  boolean withBodyLen, List<ChannelPromise> promises) {
-        final int base = raw.readerIndex();
-        final int end = base + rawTotal;
-        int count = 0;
-        int[] cursor = {base};
-        while (cursor[0] < end) {
-            int pktLen = ZstdVarInts.readOr(raw, cursor, ZstdVarInts.INVALID, end);
-            if (pktLen <= 0 || cursor[0] + (long) pktLen > end) {
-                throw new IllegalStateException("corrupt batch layout at offset " + cursor[0]
-                        + " (pktLen=" + pktLen + ", total=" + rawTotal + ")");
-            }
-            cursor[0] += pktLen;
-            count++;
-        }
-        if (count == 0) {
-            failAll(promises, new IllegalStateException("empty stored batch"));
-            return;
-        }
-
-        int bodyLen = 1 + ZstdVarInts.length(count) + rawTotal;
-        if (bodyLen > ZstdVarInts.MC_MAX_FRAME_BYTES) {
-            // 批太大（上行包极小，理论上不会发生）：退回"一帧一包"，绝不切断帧
-            writeStoredFrames(ctx, raw, rawTotal, withBodyLen, promises);
-            return;
-        }
-
-        ByteBuf frame = ctx.alloc().directBuffer((withBodyLen ? ZstdVarInts.length(bodyLen) : 0) + bodyLen);
-        if (withBodyLen) {
-            ZstdVarInts.write(frame, bodyLen);
-        }
-        // ⚠️ 标记用 1，不能复用 0：0 是"原版单包直存帧"，两者形状必须自描述，
-        // 否则解析要靠"当前是否还在握手窗口"来猜，窗口与真实到达顺序错开一帧就解错。
-        ZstdVarInts.write(frame, 1);
-        ZstdVarInts.write(frame, count);
-        frame.writeBytes(raw, base, rawTotal);
-        onFrame(1 + rawTotal, frame.readableBytes(), false);
-        writeFrame(ctx, frame, promises);
-    }
-
     private void writeStoredFrames(ChannelHandlerContext ctx, ByteBuf raw, int rawTotal,
                                    boolean withBodyLen, List<ChannelPromise> promises) {
         final int bodyLimit = ZstdVarInts.MC_MAX_FRAME_BYTES - (withBodyLen ? 5 : 0);

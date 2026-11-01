@@ -365,7 +365,7 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
 
         // 走到这里说明应答是 0（就绪）：isRefused 那条分支已经处理了 2（保持原版）。
         // 5.0.42 起不再有"缺字典待补偿"的中间态——滚动历史不下发，客户端也不会停在等字典上。
-        LOGGER.debug("[Zstd] 正在安装 zstd 编解码器 (pipeline={})", channel.pipeline().names());
+        LOGGER.debug("[Zstd] 正在安装下行 zstd 编码器 (pipeline={})", channel.pipeline().names());
         // 安装阶段仍然走自己的重试循环（计数从 0 起）：它等的是原版 handler 出现，
         // 与"等协商应答"是两条独立的时序，共用一个 attempt 会让晚进入安装阶段的一方
         // 一上来就被判预算耗尽。
@@ -373,12 +373,10 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
     }
 
     /**
-     * 安装 zstd 编解码器（独立重试循环，预算 {@link #MAX_RETRIES}）。
+     * 安装下行 zstd 编码器（独立重试循环，预算 {@link #MAX_RETRIES}）。
      *
-     * <p>先确认<b>两端都有可插入的锚点</b>再动手：虽然协议 v7 起随时可以用
-     * {@link ZstdPaperChannelManager#uninstallZstd(io.netty.channel.Channel)} 回滚，
-     * 但"只装上一侧"的中间态本来就是单侧 zstd（客户端按 zstd 发、我们按原版解），
-     * 没必要先制造出来再修——两侧日志都会显示"激活过"，事后极难归因。</p>
+     * <p>先确认下行压缩锚点与确认嗅探器所需的原版解压锚点，再安装闸门与下行编码器。
+     * 正常上行始终经过原版 decompress 与包解码器，确认只同步客户端下行解码就绪。</p>
      *
      * <p>原版 compress/decompress 是在 SetCompression 写出<b>之后</b>才安装的，
      * 所以首轮必然找不到锚点——必须重试，但重试期间要保持 holding，
@@ -396,7 +394,7 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
         // 不同 txId 的切换请求，第二次确认无人认领。实测（模拟客户端）可稳定复现。
         if (mgr.isReplaced()) return;
 
-        if (!mgr.hasEncoderAnchor(channel) || !mgr.hasDecoderAnchor(channel)) {
+        if (!mgr.hasEncoderAnchor(channel) || !mgr.hasConfirmAnchor(channel)) {
             // 原版 compress/decompress 是在 SetCompression 写出之后才装的，首轮必然缺失。
             if (installAttempt < MAX_RETRIES) {
                 channel.eventLoop().schedule(() -> installHandlers(ctx, mgr, installAttempt + 1),
@@ -418,17 +416,14 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
             return;
         }
 
-        // ⚠️ 闸门必须先于编码器就位（包层），且必须先于解码器——解码器靠它的状态判断
-        // "当前入站是否还可能是原版帧"。
-        // ⚠️ 装不上就不能继续激活：没有闸门就没有"确认"这个信号，解码器会永久停在原版
-        // 兼容窗口（客户端切换后的 zstd 压缩帧会被当作原版 deflate 帧解压失败 → 断连）。
+        // 闸门及原版确认帧嗅探器先就位，确认客户端下行解码就绪后再放行扣包。
         if (!mgr.installSwitchGate(channel)) {
             if (installAttempt < MAX_RETRIES) {
                 channel.eventLoop().schedule(() -> installHandlers(ctx, mgr, installAttempt + 1),
                         RETRY_MS, TimeUnit.MILLISECONDS);
                 return;
             }
-            LOGGER.warn("[Zstd] 切换闸门安装失败（encoder 锚点缺失）— 回落原版; pipeline={}",
+            LOGGER.warn("[Zstd] 切换闸门安装失败（encoder 或原版 decompress 锚点缺失）— 回落原版; pipeline={}",
                     channel.pipeline().names());
             finishVanilla(ctx);
             return;
@@ -442,26 +437,6 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
             }
             LOGGER.warn("[Zstd] zstd 编码器安装失败（锚点在位却插入失败）— 回落原版; pipeline={}",
                     channel.pipeline().names());
-            finishVanilla(ctx);
-            return;
-        }
-        if (!mgr.installDecoder(channel)) {
-            // 解码器安装失败（锚点刚校验过却仍失败，多为竞态）：先按 100ms 重试。
-            if (installAttempt < MAX_RETRIES) {
-                channel.eventLoop().schedule(() -> installHandlers(ctx, mgr, installAttempt + 1),
-                        RETRY_MS, TimeUnit.MILLISECONDS);
-                return;
-            }
-            // ⚠️ 重试耗尽：摘掉已装上的编码器再收尾。协议 v7 起原版 compress/decompress
-            // 从来没被拆过，"回滚"就是把自己那几个处理器摘干净（uninstallZstd），管线随即
-            // 回到标准原版形态，不会再停在"出站 zstd / 入站原版"的必断连中间态。
-            // 旧实现做不到这一步：它用 pipeline.replace 把原版实例拿走过，而非 @Sharable
-            // 的 handler 一旦移除就再也放不回去，所以当时这里只能关连接。
-            // 注意 finishVanilla 在扣包窗口内仍会关连接（客户端在 SetCompression 时就已经
-            // 切过 zstd，两侧只能同时放弃），但此时管线是原版形态，收尾不会写出半截 zstd 帧。
-            LOGGER.error("[Zstd] zstd 解码器安装失败（锚点在位却插入失败）— 摘除自身并回落原版; pipeline={}",
-                    channel.pipeline().names());
-            mgr.uninstallZstd(channel);
             finishVanilla(ctx);
             return;
         }
@@ -490,10 +465,14 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
      * 版本不匹配的客户端都会命中），属"每条非 zstd 连接都白付一份永久税"。</p>
      */
     private void finishVanilla(ChannelHandlerContext ctx) {
-        // ⚠️ 已经扣过包 = SetCompression 已写出、客户端此刻已把入站解码器换成 zstd。
-        // 这时把扣包按原版 zlib 补发，等于喂它解不开的帧，只能直接关连接让它重连
-        //（与下面解码器安装失败分支的处理一致）。
-        if (holding) {
+        ZstdPaperChannelManager mgr = ctx.channel().attr(ZstdPaperChannelManager.KEY).get();
+        boolean vanillaConfirmed = mgr != null && mgr.isResponseReceived() && mgr.isRefused();
+        if (vanillaConfirmed) {
+            // 原版答复可能晚于 SetCompression：先摘除自身下行处理器，再按原版路径补发扣包。
+            mgr.uninstallZstd(ctx.channel());
+        }
+        // 尚未明确收到原版答复时，客户端可能已经切换下行 zstd；保留既有 fail-fast 收尾。
+        if (holding && !vanillaConfirmed) {
             releaseHeld(ctx);
             ctx.channel().close();
             retire(ctx);

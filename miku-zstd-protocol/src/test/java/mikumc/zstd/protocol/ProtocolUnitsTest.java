@@ -126,7 +126,14 @@ class ProtocolUnitsTest {
     // ────────────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("状态码：0/1/2 原样保留，其它一律归一为 2（保持原版）")
+    @DisplayName("协议版本：上行回归原版使用 negotiate=11，下行仍为 frame=7")
+    void vanillaUpstreamKeepsDownstreamFrameVersion() {
+        assertEquals(11, ZstdProtocolVersion.NEGOTIATE);
+        assertEquals(7, ZstdProtocolVersion.FRAME);
+    }
+
+    @Test
+    @DisplayName("状态码：只保留 0/2，其它一律归一为 2（保持原版）")
     void negotiateStatusWhitelist() {
         assertEquals(0, ZstdNegotiateStatus.sanitize(0));
         // ⚠️ 5.0.42 起 1（旧的"需要字典"）已取消，按 VANILLA 处理

@@ -59,7 +59,7 @@ public final class ZstdStepFrames {
     /**
      * 写客户端确认包（含包 id）：{@code [0x02][txId][success][payload]}。
      *
-     * @param accepted true = 已切换到 zstd；false = 客户端无法切换，请服务端保持原版
+     * @param accepted true = 下行解码器已就绪；false = 下行安装未就绪，不确认放行
      */
     public static ByteBuf writeConfirm(ByteBuf buf, int txId, boolean accepted) {
         ZstdVarInts.write(buf, PACKET_ID_QUERY_ANSWER);
@@ -102,28 +102,33 @@ public final class ZstdStepFrames {
             return out;
         }
 
-        // ② 裸帧：帧层已剥掉外层长度，首字节是包 id
+        // ② 优先识别有效的原版 zlib 帧。dataLength 可能恰好等于包 id 2/4，
+        // 例如阈值 0 下 txId=128 的空应答长度为 4；先当裸帧会把长度当包 id。
+        try {
+            int declared = readVarInt(in, start);
+            if (declared > 0 && declared <= MAX_BARE_BYTES) {
+                int idx = start + varIntLen(in, start);
+                if (idx < end) {
+                    byte[] data = inflate(in, idx, end, declared);
+                    if (data != null && (data[0] == PACKET_ID_LOGIN_PLUGIN
+                            || data[0] == PACKET_ID_QUERY_ANSWER)) {
+                        byte[] out = new byte[data.length - 1];
+                        System.arraycopy(data, 1, out, 0, out.length);
+                        return out;
+                    }
+                }
+            }
+        } catch (RuntimeException ignored) {
+            // 不是完整的原版 zlib 帧，继续尝试协议允许的裸包形态。
+        }
+
+        // ③ 裸帧：帧层已剥掉外层长度，首字节是包 id。
         if (first == PACKET_ID_LOGIN_PLUGIN || first == PACKET_ID_QUERY_ANSWER) {
             byte[] out = new byte[len - 1];
             in.getBytes(start + 1, out, 0, out.length);
             return out;
         }
-
-        // ③ 压缩帧：[varint dataLength][deflate(packet)]
-        try {
-            int idx = start;
-            int declared = readVarInt(in, idx);
-            if (declared <= 0 || declared > MAX_BARE_BYTES) return null;
-            idx += varIntLen(in, idx);
-            if (idx >= end) return null;
-            byte[] data = inflate(in, idx, end, declared);
-            if (data == null) return null;
-            byte[] out = new byte[Math.max(0, data.length - 1)];
-            System.arraycopy(data, 1, out, 0, out.length);
-            return out;
-        } catch (Throwable t) {
-            return null;
-        }
+        return null;
     }
 
     /**
@@ -138,15 +143,18 @@ public final class ZstdStepFrames {
         java.util.zip.Inflater inflater = new java.util.zip.Inflater();
         try {
             inflater.setInput(src);
-            byte[] out = new byte[declared];
+            // 多留 1 字节探测膨胀，确保不是只解出声明长度就提前接受未结束的流。
+            byte[] out = new byte[declared + 1];
             int total = 0;
-            while (total < declared && !inflater.finished()) {
-                int n = inflater.inflate(out, total, declared - total);
-                if (n == 0 && (inflater.needsInput() || inflater.needsDictionary())) break;
+            while (total < out.length && !inflater.finished()) {
+                int n = inflater.inflate(out, total, out.length - total);
+                if (n == 0) break;
                 total += n;
             }
-            // 必须完整解满：半截数据不能拿去匹配魔数
-            return total == declared ? out : null;
+            if (total != declared || !inflater.finished() || inflater.getRemaining() != 0) {
+                return null;
+            }
+            return java.util.Arrays.copyOf(out, declared);
         } catch (Throwable t) {
             return null;
         } finally {

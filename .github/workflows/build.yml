@@ -94,7 +94,11 @@ jobs:
   # 脚本内联在 workflow 里（仓库只入库源码与构建文件，见 .gitignore 的约定）。
   # ──────────────────────────────────────────────────────────────────────
   e2e:
-    name: E2E (Paper)
+    name: E2E (Paper, threshold=${{ matrix.threshold }}, client=${{ matrix.negotiate }})
+    strategy:
+      matrix:
+        threshold: [0, 256]
+        negotiate: [11, 10]
     needs: [paper]
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -124,7 +128,7 @@ jobs:
           echo "eula=true" > eula.txt
           cat > server.properties <<'EOF'
           online-mode=false
-          network-compression-threshold=256
+          network-compression-threshold=${{ matrix.threshold }}
           server-port=25600
           server-ip=127.0.0.1
           level-type=minecraft\:flat
@@ -153,11 +157,15 @@ jobs:
           set -euo pipefail
           pip install --quiet zstandard || true
           python3 - <<'PY'
-          import socket, struct, sys, time
+          import socket, struct, sys, time, zlib
 
           HOST, PORT = "127.0.0.1", 25600
           MAGIC = 0x5A535743
           PROTOCOL = 776
+          NEGOTIATE = 11
+          CLIENT_NEGOTIATE = int("${{ matrix.negotiate }}")
+          expected_zstd = CLIENT_NEGOTIATE == NEGOTIATE
+          required = ["set_compression", "negotiate"] + (["switch", "frame"] if expected_zstd else ["vanilla_login"])
 
           def varint(n):
               out = bytearray()
@@ -196,9 +204,26 @@ jobs:
                   if not (b & 0x80): return num, pos
                   sh += 7
 
-          def send(sock, packet, compressed):
-              body = (b"\x00" + packet) if compressed else packet
+          def send(sock, packet, threshold):
+              use_zlib = threshold is not None and len(packet) >= threshold
+              if threshold is None:
+                  body = packet
+              elif use_zlib:
+                  body = varint(len(packet)) + zlib.compress(packet)
+              else:
+                  body = b"\x00" + packet
               sock.sendall(varint(len(body)) + body)
+              return use_zlib
+
+          def vanilla_packet(body, threshold):
+              if threshold is None:
+                  return body
+              raw, pos = dv(body, 0)
+              if raw == 0:
+                  return body[pos:]
+              packet = zlib.decompress(body[pos:])
+              assert len(packet) == raw, "原版压缩帧解压长度不符"
+              return packet
 
           sock = socket.create_connection((HOST, PORT), timeout=20)
           sock.settimeout(25)
@@ -208,10 +233,12 @@ jobs:
           ls = varint(0) + s("E2EBot") + uid
           sock.sendall(varint(len(ls)) + ls)
 
-          seen = {"set_compression": False, "negotiate": False, "switch": False, "frame": False}
+          seen = {"set_compression": False, "negotiate": False, "switch": False, "frame": False, "vanilla_login": False}
           frames = 0
           compressed = False
+          compression_threshold = None
           zstd_mode = False
+          pending_negotiate = None
           deadline = time.time() + 40
           rc = 1
           try:
@@ -220,8 +247,7 @@ jobs:
                   body = recvn(sock, ln)
                   if not body: break
                   if not zstd_mode:
-                      packet = body[1:] if (compressed and body[0] == 0) else (
-                          __import__("zlib").decompress(body[1:]) if compressed else body)
+                      packet = vanilla_packet(body, compression_threshold)
                   else:
                       raw, pos = dv(body, 0)
                       if raw == 0:
@@ -272,27 +298,53 @@ jobs:
                       thr, _ = dv(packet, pos)
                       seen["set_compression"] = True
                       compressed = True
+                      compression_threshold = thr
+                      assert thr == int("${{ matrix.threshold }}"), "SetCompression 阈值与矩阵不符"
                       print("  SetCompression threshold=%d" % thr)
+                      if pending_negotiate is not None:
+                          pending_tx, pending_status = pending_negotiate
+                          assert pending_status == 2 and not expected_zstd
+                          send(sock, varint(0x02) + varint(pending_tx) + b"\x01" + varint(pending_status), compression_threshold)
+                          pending_negotiate = None
+                          seen["negotiate"] = True
+                          print("  deferred fallback answered after SetCompression")
                   elif pid == 0x04:
                       tx, p = dv(packet, pos)
                       sl, p = dv(packet, p)
                       chan = packet[p:p + sl].decode()
+                      payload = packet[p + sl:]
                       if chan == "zstd:negotiate":
-                          send(sock, varint(0x02) + varint(tx) + b"\x01" + varint(0) + varint(0), compressed)
+                          server_version = struct.unpack(">i", payload)[0]
+                          assert server_version == NEGOTIATE, "服务端协商版本应为 11"
+                          status = 0 if server_version == CLIENT_NEGOTIATE else 2
+                          if status == 2 and compression_threshold is None:
+                              pending_negotiate = (tx, status)
+                              print("  fallback answer deferred until SetCompression")
+                              continue
+                          assert status != 2 or seen["set_compression"], "旧版回落应答必须晚于 SetCompression"
+                          send(sock, varint(0x02) + varint(tx) + b"\x01" + varint(status), compression_threshold)
                           seen["negotiate"] = True
                           print("  negotiate answered")
                       elif chan == "zstd:switch":
-                          send(sock, varint(0x02) + varint(tx) + b"\x01" + struct.pack(">I", MAGIC), compressed)
+                          assert expected_zstd, "版本 10 客户端保持原版时不应收到切换询问"
+                          confirm = varint(0x02) + varint(tx) + b"\x01" + struct.pack(">I", MAGIC)
+                          zlib_confirm = send(sock, confirm, compression_threshold)
+                          assert zlib_confirm == (compression_threshold == 0), "确认帧应遵守原版压缩阈值"
+                          print("  vanilla switch confirm: %s" % ("zlib" if zlib_confirm else "stored"))
                           seen["switch"] = True
                           zstd_mode = True
                           print("  switch confirmed -> zstd mode")
                       else:
-                          send(sock, varint(0x02) + varint(tx) + b"\x00", compressed)
+                          send(sock, varint(0x02) + varint(tx) + b"\x00", compression_threshold)
                   elif pid == 0x00:
                       print("  DISCONNECT: %s" % packet[pos:pos + 120])
                       break
                   elif pid == 0x02:
-                      print("  LoginSuccess in vanilla path (unexpected for this client)")
+                      assert not expected_zstd, "版本 11 客户端应启用下行 zstd"
+                      assert pending_negotiate is None and seen["negotiate"], "原版登录前必须已发送回落应答"
+                      seen["vanilla_login"] = True
+                      print("E2E_PASS version_mismatch_stays_vanilla")
+                      rc = 0
                       break
           except Exception as e:
               print("client error: %s: %s" % (type(e).__name__, e))
@@ -300,7 +352,7 @@ jobs:
               sock.close()
           for k, v in seen.items():
               print("  seen %-16s %s" % (k, v))
-          sys.exit(0 if (rc == 0 and all(seen.values())) else 1)
+          sys.exit(0 if (rc == 0 and all(seen[key] for key in required)) else 1)
           PY
       - name: Verify server log
         if: always()
@@ -310,7 +362,12 @@ jobs:
           echo "----- activation / fallback lines -----"
           grep -E "zstd transport activated|anchors 未出现|frame rejected|dict generation mismatch|保持原版 zlib" server.log || true
           echo "----- check -----"
-          grep -q "zstd transport activated on Paper" server.log || { echo "未激活：zstd 没有生效"; tail -60 server.log; exit 1; }
+          if [ "${{ matrix.negotiate }}" = "11" ]; then
+            grep -q "zstd transport activated on Paper" server.log || { echo "未激活：zstd 没有生效"; tail -60 server.log; exit 1; }
+          else
+            if grep -q "zstd transport activated on Paper" server.log; then echo "旧版客户端误激活"; exit 1; fi
+            grep -q "保持原版 zlib" server.log || { echo "旧版客户端未回落原版"; exit 1; }
+          fi
           if grep -q "dict generation mismatch" server.log; then echo "滚动历史分叉"; exit 1; fi
           if grep -q "frame rejected" server.log; then echo "帧被拒"; exit 1; fi
           echo "server-side assertions OK"
@@ -332,7 +389,11 @@ jobs:
   # 第一个 zstd 帧），LoginSuccess 在选服之前就发出了。
   # ──────────────────────────────────────────────────────────────────────
   e2e-velocity:
-    name: E2E (Velocity)
+    name: E2E (Velocity, threshold=${{ matrix.threshold }}, client=${{ matrix.negotiate }})
+    strategy:
+      matrix:
+        threshold: [0, 256]
+        negotiate: [11, 10]
     needs: [velocity]
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -377,7 +438,7 @@ jobs:
           [forced-hosts]
 
           [advanced]
-          compression-threshold = 256
+          compression-threshold = ${{ matrix.threshold }}
           compression-level = -1
           login-ratelimit = 0
           EOF
@@ -401,6 +462,10 @@ jobs:
           HOST, PORT = "127.0.0.1", 25565
           MAGIC = 0x5A535743
           PROTOCOL = 776
+          NEGOTIATE = 11
+          CLIENT_NEGOTIATE = int("${{ matrix.negotiate }}")
+          expected_zstd = CLIENT_NEGOTIATE == NEGOTIATE
+          required = ["set_compression", "negotiate"] + (["switch", "frame"] if expected_zstd else ["vanilla_login"])
 
           def varint(n):
               out = bytearray()
@@ -436,9 +501,26 @@ jobs:
                   if not (b & 0x80): return num, pos
                   sh += 7
 
-          def send(sock, packet, compressed):
-              body = (b"\x00" + packet) if compressed else packet
+          def send(sock, packet, threshold):
+              use_zlib = threshold is not None and len(packet) >= threshold
+              if threshold is None:
+                  body = packet
+              elif use_zlib:
+                  body = varint(len(packet)) + zlib.compress(packet)
+              else:
+                  body = b"\x00" + packet
               sock.sendall(varint(len(body)) + body)
+              return use_zlib
+
+          def vanilla_packet(body, threshold):
+              if threshold is None:
+                  return body
+              raw, pos = dv(body, 0)
+              if raw == 0:
+                  return body[pos:]
+              packet = zlib.decompress(body[pos:])
+              assert len(packet) == raw, "原版压缩帧解压长度不符"
+              return packet
 
           sock = socket.create_connection((HOST, PORT), timeout=20)
           sock.settimeout(25)
@@ -447,15 +529,16 @@ jobs:
           ls = varint(0) + s("E2EVelocity") + b"\x02" * 16
           sock.sendall(varint(len(ls)) + ls)
 
-          seen = {"set_compression": False, "negotiate": False, "switch": False, "frame": False}
-          compressed = False; zstd_mode = False; rc = 1
+          seen = {"set_compression": False, "negotiate": False, "switch": False, "frame": False, "vanilla_login": False}
+          compressed = False; compression_threshold = None; zstd_mode = False; rc = 1
+          pending_negotiate = None
           deadline = time.time() + 40
           try:
               while time.time() < deadline:
                   ln = rv(sock); body = recvn(sock, ln)
                   if not body: break
                   if not zstd_mode:
-                      packet = body[1:] if (compressed and body[0] == 0) else (zlib.decompress(body[1:]) if compressed else body)
+                      packet = vanilla_packet(body, compression_threshold)
                   else:
                       raw, pos = dv(body, 0)
                       if raw == 0:
@@ -477,31 +560,55 @@ jobs:
                       print("E2E_PASS compressed_frame_ok"); rc = 0; break
                   pid, pos = dv(packet, 0)
                   if pid == 0x03 and not compressed:
-                      thr, _ = dv(packet, pos); compressed = True
+                      thr, _ = dv(packet, pos); compressed = True; compression_threshold = thr
+                      assert thr == int("${{ matrix.threshold }}"), "SetCompression 阈值与矩阵不符"
                       seen["set_compression"] = True
                       print("  SetCompression threshold=%d" % thr)
+                      if pending_negotiate is not None:
+                          pending_tx, pending_status = pending_negotiate
+                          assert pending_status == 2 and not expected_zstd
+                          send(sock, varint(0x02) + varint(pending_tx) + b"\x01" + varint(pending_status), compression_threshold)
+                          pending_negotiate = None
+                          seen["negotiate"] = True
+                          print("  deferred fallback answered after SetCompression")
                   elif pid == 0x04:
                       tx, pp = dv(packet, pos); sl, pp = dv(packet, pp)
                       chan = packet[pp:pp + sl].decode()
+                      payload = packet[pp + sl:]
                       if chan == "zstd:negotiate":
-                          send(sock, varint(0x02) + varint(tx) + b"\x01" + varint(0) + varint(0), compressed)
+                          server_version = struct.unpack(">i", payload)[0]
+                          assert server_version == NEGOTIATE, "服务端协商版本应为 11"
+                          status = 0 if server_version == CLIENT_NEGOTIATE else 2
+                          if status == 2 and compression_threshold is None:
+                              pending_negotiate = (tx, status)
+                              print("  fallback answer deferred until SetCompression")
+                              continue
+                          assert status != 2 or seen["set_compression"], "旧版回落应答必须晚于 SetCompression"
+                          send(sock, varint(0x02) + varint(tx) + b"\x01" + varint(status), compression_threshold)
                           seen["negotiate"] = True; print("  negotiate answered")
                       elif chan == "zstd:switch":
-                          send(sock, varint(0x02) + varint(tx) + b"\x01" + struct.pack(">I", MAGIC), compressed)
+                          assert expected_zstd, "版本 10 客户端保持原版时不应收到切换询问"
+                          confirm = varint(0x02) + varint(tx) + b"\x01" + struct.pack(">I", MAGIC)
+                          zlib_confirm = send(sock, confirm, compression_threshold)
+                          assert zlib_confirm == (compression_threshold == 0), "确认帧应遵守原版压缩阈值"
+                          print("  vanilla switch confirm: %s" % ("zlib" if zlib_confirm else "stored"))
                           seen["switch"] = True; zstd_mode = True; print("  switch confirmed -> zstd mode")
                       else:
-                          send(sock, varint(0x02) + varint(tx) + b"\x00", compressed)
+                          send(sock, varint(0x02) + varint(tx) + b"\x00", compression_threshold)
                   elif pid == 0x00:
                       print("  DISCONNECT: %s" % packet[pos:pos + 160]); break
                   elif pid == 0x02:
-                      print("  LoginSuccess in vanilla path (unexpected)"); break
+                      assert not expected_zstd, "版本 11 客户端应启用下行 zstd"
+                      assert pending_negotiate is None and seen["negotiate"], "原版登录前必须已发送回落应答"
+                      seen["vanilla_login"] = True
+                      print("E2E_PASS version_mismatch_stays_vanilla"); rc = 0; break
           except Exception as e:
               print("client error: %s: %s" % (type(e).__name__, e))
           finally:
               sock.close()
           for k, v in seen.items():
               print("  seen %-16s %s" % (k, v))
-          sys.exit(0 if (rc == 0 and all(seen.values())) else 1)
+          sys.exit(0 if (rc == 0 and all(seen[key] for key in required)) else 1)
           PY
       - name: Verify velocity log
         if: always()
@@ -511,7 +618,12 @@ jobs:
           echo "----- zstd lines -----"
           grep -E "zstd|Zstd" velocity.log | tail -30 || true
           echo "----- check -----"
-          grep -q "Zstd transport activated" velocity.log || { echo "未激活"; tail -60 velocity.log; exit 1; }
+          if [ "${{ matrix.negotiate }}" = "11" ]; then
+            grep -q "Zstd transport activated" velocity.log || { echo "未激活"; tail -60 velocity.log; exit 1; }
+          else
+            if grep -q "Zstd transport activated" velocity.log; then echo "旧版客户端误激活"; exit 1; fi
+            grep -q "保持原版 zlib" velocity.log || { echo "旧版客户端未回落原版"; exit 1; }
+          fi
           if grep -q "dict generation mismatch" velocity.log; then echo "滚动历史分叉"; exit 1; fi
           if grep -q "frame rejected" velocity.log; then echo "帧被拒"; exit 1; fi
           echo "velocity-side assertions OK"
@@ -524,7 +636,7 @@ jobs:
 
   release:
     name: Release
-    needs: [velocity, paper, fabric]
+    needs: [velocity, paper, fabric, e2e, e2e-velocity]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
@@ -543,7 +655,7 @@ jobs:
         run: ls -R dist
       # ── 结构化更新日志 ────────────────────────────────────────────────────
       # 正文来源：**发版提交的完整提交信息**（发版时把更新日志写进提交正文）。
-      # 取不到再兜底一行。
+      # 正文为空或 tag 与任一端版本不一致时中止，避免发布缺少说明或版本错位的产物。
       # ⚠️ 为什么不用 generate_release_notes：它只会生成
       # "**Full Changelog**: compare/... 链接"，正文里没有任何"改了什么"——
       # 4.10.0 就是这样发的（Release 与 Modrinth 都只有那条链接，等于没说明）。
@@ -554,9 +666,18 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
-          git log -1 --format='%B' "$TAG" > /tmp/body.md
-          if ! grep -q '[^[:space:]]' /tmp/body.md; then
-            echo "Miku-ZSTD ${TAG#v}" > /tmp/body.md
+          VERSION="${TAG#v}"
+          PAPER_VERSION=$(sed -n "s/^version = '\([^']*\)'.*/\1/p" miku-zstd-paper/build.gradle)
+          VELOCITY_VERSION=$(sed -n "s/^version = '\([^']*\)'.*/\1/p" miku-zstd-velocity/build.gradle)
+          FABRIC_VERSION=$(sed -n 's/^mod_version=//p' miku-zstd-fabric/gradle.properties | tr -d '\r')
+          if [ "$VERSION" != "$PAPER_VERSION" ] || [ "$VERSION" != "$VELOCITY_VERSION" ] || [ "$VERSION" != "$FABRIC_VERSION" ]; then
+            echo "版本标签与三端构建版本不一致" >&2
+            exit 1
+          fi
+          git log -1 --format='%b' "$TAG" > /tmp/body.md
+          if ! grep -q '[^[:space:]]' /tmp/body.md || ! grep -Eq '^## (新增|修复|说明)' /tmp/body.md; then
+            echo "发版提交缺少结构化更新日志正文" >&2
+            exit 1
           fi
           echo "----- release body -----"
           cat /tmp/body.md

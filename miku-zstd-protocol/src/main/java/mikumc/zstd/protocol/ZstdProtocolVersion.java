@@ -12,6 +12,10 @@ public final class ZstdProtocolVersion {
     /**
      * 协商协议版本（登录期在 negotiate 载荷里交换，三端必须一致）。
      *
+     * <p>11：上行完全交还原版压缩管线，不再安装批处理编码器或服务端 zstd 解码器。
+     * 下行帧格式保持 v7；协商应答与切换确认仅用于确保下行解码器就绪。
+     * 旧客户端通过版本校验保持原版，避免向原版解压器发送旧存储批帧。</p>
+     *
      * <p>10：存储批帧改用<b>自描述</b>标记 {@code rawSize == 1}（0 仍是原版单包直存帧）。
      * 9 里两者共用 0，解析只能靠"是否还在握手窗口"猜 —— 窗口与到达顺序错开一帧就会把批帧
      * 当单包下传，实测表现为服务端 {@code MinecraftDecoder} 抛 "A packet frame decoder failed" 并断连。</p>
@@ -32,7 +36,7 @@ public final class ZstdProtocolVersion {
      *
      * <p>6：帧内改成 [rawSize][blockCount] + 每块 [blockRawLen][chunkLen][chunk]（大帧分块并行）。</p>
      */
-    public static final int NEGOTIATE = 10;
+    public static final int NEGOTIATE = 11;
 
     /** 帧格式版本（写进文档；线格式变更时与 {@link #NEGOTIATE} 一起升）。 */
     public static final int FRAME = 7;

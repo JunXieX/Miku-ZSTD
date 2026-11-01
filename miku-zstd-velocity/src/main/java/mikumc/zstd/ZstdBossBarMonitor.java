@@ -14,7 +14,7 @@ import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
 import java.time.Duration;
 
 /**
- * 代理端运行时监控：zstd 通道玩家数 + 带宽与压缩率统计（BossBar 实时显示）。
+ * 代理端运行时监控：zstd 通道玩家数 + 下行带宽与压缩率统计（BossBar 实时显示）。
  *
  * <p><b>为什么统计放在 Velocity 端</b>：在"代理 + 后端子服"的架构里，zstd 是在
  * <b>代理 ↔ 客户端</b>这一段生效的，所以只有代理端看到的字节数才等于玩家真实带宽。

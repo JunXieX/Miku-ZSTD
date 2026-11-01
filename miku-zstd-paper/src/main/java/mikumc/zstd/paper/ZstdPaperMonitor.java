@@ -13,7 +13,7 @@ import mikumc.zstd.protocol.ZstdBossBarFormat;
 import mikumc.zstd.protocol.ZstdTrafficCounter;
 
 /**
- * 运行时监控（Paper / Folia 端）：ZSTD 通道玩家数 + 带宽与压缩率统计（BossBar 实时显示）。
+ * 运行时监控（Paper / Folia 端）：ZSTD 通道玩家数 + 下行带宽与压缩率统计（BossBar 实时显示）。
  *
  * <h2>数据来源</h2>
  * <ul>
@@ -22,7 +22,7 @@ import mikumc.zstd.protocol.ZstdTrafficCounter;
  *       —— {@code raw} 是未经压缩的原始字节（"不压缩时本要发送的量"），
  *       {@code wire} 是 zstd 压缩后实际写出的字节。</li>
  * </ul>
- * <p>注意：统计口径只覆盖<b>走 zstd 的连接</b>。未装模组的玩家走原版 zlib，不在本统计内。</p>
+ * <p>注意：统计口径只覆盖<b>走 zstd 的连接的下行</b>，不统计原版上行。未装模组的玩家走原版 zlib，不在本统计内。</p>
  *
  * <h2>为什么计数与采样不在本类里</h2>
  * <p>那部分逻辑与 Velocity 端逐行相同（活跃连接数、累计字节、速率采样、采集开关），

@@ -11,9 +11,9 @@ import org.slf4j.LoggerFactory;
 import java.util.List;
 
 /**
- * Miku-ZSTD 入站解码器基类（帧格式 <b>v6</b>，协商版本 v7）——三端共享实现。
+ * Miku-ZSTD 下行解码器基类（帧格式 <b>v7</b>，协商版本 v11）——客户端使用。
  *
- * <h2>帧格式（v6）</h2>
+ * <h2>下行帧格式（v7）</h2>
  * <pre>
  *   [varint rawSize][varint dictGen][varint blockCount] + block...     // rawSize > 0（压缩帧）
  *   [0][packet]                                                        // rawSize == 0（直存帧）
@@ -45,8 +45,7 @@ import java.util.List;
  * 所以现在改为<b>跳过</b>原版解压器，既满足"不拆原版处理器"的初衷，也不再依赖任何
  * "透传"约定。</p>
  * <p>{@code rawSize == 0} 表示未压缩直存：帧体<b>恰好是一个包</b>（{@code [0][packet]}），
- * 与原版未压缩帧<b>逐字节同形</b>。因此"按原版解释"与"按 zstd 解释"对这段字节得到的结果
- * <b>完全相同</b>——切换窗口内外的处理不需要任何形状判断（见 {@link #acceptsLegacyFrames()}）。</p>
+ * 与原版未压缩帧<b>逐字节同形</b>。本类只接收已协商的下行帧，不解析上行或猜测原版压缩帧。</p>
  * <p>压缩帧（{@code rawSize > 0}）可含<b>多个</b>包，按内层 {@code [varint pktLen]} 逐个切出
  * 并下传。（v2 是一帧一包、内层没有长度前缀；v4 起直存帧同样是一帧一包——原因见
  * {@code ZstdBatchEncoderBase} 的"帧格式"一节。）</p>
@@ -104,13 +103,6 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
     private static final int SCRATCH_KEEP_LIMIT = 512 * 1024;
 
     /**
-     * 原版压缩帧解压后的硬上限（8MB，与 Minecraft 自身的解码器一致）。
-     *
-     * <p>{@code dataLength} 由对端声明，不封顶就是"1 字节输入换 32MB 分配"。</p>
-     */
-    private static final int VANILLA_MAX_RAW = 8 * 1024 * 1024;
-
-    /**
      * 大帧（超过 {@link #SCRATCH_KEEP_LIMIT}）的临时分配统计。
      *
      * <p>刻意<b>不做池化</b>：这类帧只在进服阶段出现（Registry 等一次性大数据），
@@ -150,14 +142,6 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
 
     /** 压缩输入 scratch（方法内即用即弃，可安全复用） */
     private byte[] scratch = new byte[0];
-    /**
-     * 是否已经成功解析过至少一个真正的 zstd 帧。
-     *
-     * <p>用于界定「协议切换窗口」：窗口内对端可能仍在发送原版帧（见
-     * {@link #acceptsLegacyFrames()}）。一旦见过合法 zstd 帧，就再也不做兼容解释，
-     * 保持对畸形输入的严格拒绝。</p>
-     */
-    private boolean sawZstdFrame;
     /** {@link #readVarIntAt} 的结束位置出参（避免热路径上每包一次 int[] 分配） */
     private int varintEnd;
     /** 传给 {@link ZstdVarInts#readAt} 的出参容器（复用，零分配） */
@@ -243,56 +227,6 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
      * @param inBytes  收到的压缩字节数
      * @param outBytes 解压后的字节数
      */
-    /**
-     * 入站帧是否是"存储批帧"（{@code [0][count][pktLen][pkt]...}）。默认 false。
-     *
-     * <p><b>上行（客户端→服务端）返回 true</b>：那个方向不压缩（实测压了反而膨胀 13%，
-     * 字典收益 0.0%），只保留批处理。返回 true 时本类不建解压上下文、不喂滚动历史、
-     * 不校验 {@code dictGen}。</p>
-     */
-    /**
-     * 存储批帧的帧头标记：{@code rawSize == 1}。
-     *
-     * <p>⚠️ 不能与"原版单包直存帧"共用 0：那样两种形态在字节层面不可区分，解析只能靠
-     * "当前是否还在握手窗口"来猜——窗口判定与真实到达顺序错开一帧就会把批帧当成单包下传
-     * （包数被当作包 id），表现为 {@code MinecraftDecoder} 抛 "A packet frame decoder failed"。
-     * 5.0.44 起改为自描述：0 = 原版单包，1 = 存储批。</p>
-     */
-    public static final int STORED_BATCH_MARKER = 1;
-
-    protected boolean storedBatchFrames() {
-        return false;
-    }
-
-    /**
-     * 解析存储批帧并逐包下传。
-     *
-     * <p>布局：{@code [0][varint count] + count × [varint pktLen][packet]}。任何长度不自洽
-     * 都按协议错误关连接（fail-fast），绝不"尽力而为"地猜包边界。</p>
-     */
-    private void emitStoredBatch(ChannelHandlerContext ctx, ByteBuf in, int remaining) {
-        final int end = in.readerIndex() + remaining;
-        int[] cursor = {in.readerIndex()};
-        int count = ZstdVarInts.readOr(in, cursor, ZstdVarInts.INVALID, end);
-        if (count == ZstdVarInts.INVALID || count <= 0) {
-            protocolError(ctx, "illegal stored-batch count (remaining=" + remaining + ")");
-            return;
-        }
-        for (int i = 0; i < count; i++) {
-            int pktLen = ZstdVarInts.readOr(in, cursor, ZstdVarInts.INVALID, end);
-            if (pktLen <= 0 || cursor[0] + (long) pktLen > end) {
-                protocolError(ctx, "corrupt stored-batch layout (packet " + i + "/" + count
-                        + ", pktLen=" + pktLen + ", left=" + (end - cursor[0]) + ")");
-                return;
-            }
-            emit(ctx, in.readRetainedSlice(pktLen));
-            cursor[0] += pktLen;
-        }
-        if (cursor[0] != end) {
-            protocolError(ctx, "stored-batch trailing bytes: " + (end - cursor[0]));
-        }
-    }
-
     protected abstract void onCompressedFrame(int inBytes, int outBytes);
 
     // ────────────────────────────────────────────────────────────────
@@ -305,41 +239,6 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
         if (decompressCtx == null) {
             LOGGER.warn("[Zstd] decoder installed without a decompress context on this channel");
         }
-    }
-
-    /**
-     * 是否允许"客户端确认切换之前，按原版规则解释入站帧"。
-     *
-     * <p>默认 {@code false}：帧格式自协商成功起就是 zstd。</p>
-     *
-     * <p>服务端两端覆写为 {@code true}，但<b>只有在切换未得到客户端确认时才生效</b>。
-     * 这是<b>协议保证</b>而不是猜测：服务端在激活 zstd 之前插入了 {@link ZstdSwitchGate}，
-     * 它扣住登录期的出站帧直到收到客户端的 {@code zstd:switch}；而客户端只有在把入站解码器
-     * 换成 zstd 之后才会发那个确认。因此"确认之前收到的必然是原版帧"——此窗口内
-     * 入站帧一律按原版规则解释（原始帧整包下传），不需要任何字节启发式。</p>
-     *
-     * <p>确认之后（或超时兜底之后）立即转为严格 zstd 模式；{@code sawZstdFrame}
-     * 仍作为第二道保险：一旦见过合法 zstd 帧，就再也不会退回原版解释。</p>
-     */
-    protected boolean acceptsLegacyFrames() {
-        return false;
-    }
-
-    /**
-     * 切换是否已被客户端确认（由子类按连接读取 {@link ZstdSwitchGate} 的状态）。
-     *
-     * <p>默认 {@code true}：客户端一侧不存在这个握手（它自己就是发起确认的一方）。</p>
-     */
-    protected boolean switchConfirmed() {
-        return true;
-    }
-
-    /** 切换未确认（正常握手窗口 / 超时兜底）：此期间入站只可能是原版帧。 */
-    private boolean legacyFallbackAllowed() {
-        // ⚠️ 不能用"见过几个原版帧"来决定退出：未确认期间对端<b>本来</b>就一直在发原版帧，
-        // 一旦第二个帧就切严格模式，那个原版压缩帧必然被当 zstd 解析 → 立刻断连。
-        // 唯一的退出条件是"确认到达"或"已经见过合法的 zstd 帧"。
-        return !sawZstdFrame && acceptsLegacyFrames() && !switchConfirmed();
     }
 
     @Override
@@ -375,38 +274,11 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
             return;
         }
 
-        // ── 自描述分派：rawSize == 1 是"存储批"（上行方向专用）──
-        // 放在所有"握手窗口 / 原版帧"判断之前：这条形态与窗口无关，永远按批解析。
-        // v9 曾把它和"原版单包 [0]"挤在同一个标记 0 上，只能靠窗口猜，错开一帧就把包数
-        // 当成包 id 下传 —— 服务端 MinecraftDecoder 抛 "A packet frame decoder failed"。
-        if (rawSize == STORED_BATCH_MARKER) {
-            sawZstdFrame = true;
-            onStoredFrame(remaining);
-            emitStoredBatch(ctx, in, remaining);
-            return;
-        }
-
         if (rawSize == 0) {
             // 未压缩帧：帧体<b>恰好是一个包</b>。这里之所以（也<b>必须</b>）完全不区分
             // "原版未压缩帧"与"zstd 直存帧"，是因为编码侧把直存帧做成了与原版帧逐字节同形
             //（{@code [0][packet]}，见 ZstdBatchEncoderBase 的帧格式一节）：两种解释结果相同，
             // 因此不存在任何"看起来像不像 zstd 帧"的启发式判断（那正是残留风险的来源）。
-            if (legacyFallbackAllowed()) {
-                // 窗口内收到的就是原版未压缩帧：必须<b>带着 [0] 前缀</b>交给下游的原版 decompress。
-                // ⚠️ 这里曾经直接 fire 掉帧体（前缀已被本类读走），下游 CompressionDecoder 会把
-                // 包首字节当成 dataLength 读 —— 只要那个字节不是 0，包就被截断/错解。
-                // 之所以一直没炸，是因为窗口内客户端几乎不发包（闸门扣着 LoginSuccess），属于
-                // "靠时序侥幸"。补回 1 字节前缀才是与原版逐字节同形，也才会被 Krypton 接受
-                // （它校验的是 actualUncompressedSize < threshold，而不是"不许有前缀"）。
-                ByteBuf restored = ctx.alloc().buffer(1 + remaining);
-                restored.writeByte(0);
-                restored.writeBytes(in, in.readerIndex(), remaining);
-                in.skipBytes(remaining);
-                ctx.fireChannelRead(restored);
-                return;
-            }
-
-            sawZstdFrame = true;
             onStoredFrame(remaining);
             // 历史记账的形态是 {@code [varint pktLen][pkt]}，与编码器喂进去的完全一致；
             // 直存帧按定义一定不大，这一次拷贝可忽略（采样顺手复用同一个数组）。
@@ -416,16 +288,6 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
             }
             feedHistory(batch);
             emit(ctx, in.readRetainedSlice(remaining));
-            return;
-        }
-
-        if (legacyFallbackAllowed()) {
-            // 原版压缩帧：[varint dataLength][raw deflate(packet)]
-            if (decompressVanillaFrame(ctx, in, rawSize, out)) {
-                return;
-            }
-            protocolError(ctx, "vanilla frame rejected (dataLength=" + rawSize
-                    + ", compressed=" + remaining + ")");
             return;
         }
 
@@ -515,7 +377,6 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
                 }
                 off += blockRaw;
             }
-            sawZstdFrame = true;
             onCompressedFrame(remaining, data.length);
             onDecodedPayload(data); // 采样（data 为本帧独占数组，可安全持有）
             // 历史记账：与编码器同一帧、同一份字节、同样一次喂入
@@ -524,52 +385,6 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
         } catch (Exception e) {
             protocolError(ctx, "decompress failed (rawSize=" + rawSize + ", compressed=" + remaining
                     + "): " + e);
-        }
-    }
-
-    /**
-     * 按原版规则解一个压缩帧：{@code [varint dataLength][deflate(packet)]}。
-     *
-     * <p>⚠️ 必须用 <b>zlib 包装</b>（{@code new Inflater()}）：Minecraft 的
-     * {@code CompressionDecoder} 用的是默认构造，线上带 zlib 头/尾。用 {@code Inflater(true)}
-     * （raw deflate）会直接 {@code incorrect header check} —— 表现为"原版帧解不开 → 断连"。</p>
-     *
-     * <p>⚠️ 尺寸必须封顶：{@code dataLength} 由对端声明，不设上限就是"1 字节换 32MB 分配"。
-     * 原版自身的硬上限是 8MB，这里与它对齐。</p>
-     *
-     * <p>只解<b>一个</b>包（原版一帧一包），解完把整个帧体消费掉。</p>
-     *
-     * @return 是否成功解出并写出；失败时<b>不</b>移动读指针
-     */
-    private boolean decompressVanillaFrame(ChannelHandlerContext ctx, ByteBuf in, int declared,
-                                           List<Object> out) {
-        if (declared <= 0 || declared > VANILLA_MAX_RAW) return false;
-        try {
-            int remaining = in.readableBytes();
-            byte[] src = new byte[remaining];
-            in.getBytes(in.readerIndex(), src, 0, remaining);
-            byte[] data = new byte[declared];
-            java.util.zip.Inflater inflater = new java.util.zip.Inflater();
-            int got;
-            try {
-                inflater.setInput(src);
-                got = 0;
-                while (got < declared && !inflater.finished()) {
-                    int n = inflater.inflate(data, got, declared - got);
-                    if (n == 0 && (inflater.needsInput() || inflater.needsDictionary())) break;
-                    got += n;
-                }
-            } finally {
-                inflater.end();
-            }
-            // 必须恰好解满：半截数据当完整包下传会让上层包解码器错位
-            if (got != declared) return false;
-            in.skipBytes(remaining);
-            emit(ctx, Unpooled.wrappedBuffer(data, 0, got));
-            return true;
-        } catch (Throwable t) {
-            LOGGER.debug("[Zstd] vanilla inflate failed: {}", t.toString());
-            return false;
         }
     }
 
@@ -592,7 +407,7 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
      *
      * <p>默认 {@code null} = 从本处理器自己的 ctx 往下（= 仍会经过下游的原版解压处理器）。</p>
      *
-     * <p>⚠️ <b>三端都必须覆写为"原版解压处理器"本身</b>（{@code decompress} /
+     * <p>⚠️ <b>客户端必须覆写为"原版解压处理器"本身</b>（{@code decompress} /
      * {@code compression-decoder}），理由见类注释的"为什么不能再套一层 [0]"。</p>
      */
     protected ChannelHandlerContext decodeForwardTarget(ChannelHandlerContext ctx) {
@@ -656,7 +471,7 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
                 return;
             }
             // data 是本帧独占的新数组，wrappedBuffer 共享它是安全的（零拷贝）；
-            // 外面再套一层"原版未压缩帧"[0] 前缀，交给下游的原版 decompress 透传。
+            // 从原版 decompress 的 context 直接下传，避免再次解压或校验直存阈值。
             emit(ctx, Unpooled.wrappedBuffer(data, off, pktLen));
             off += pktLen;
             packets++;

@@ -16,7 +16,7 @@ import java.util.List;
  * <ul>
  *   <li>包层在 {@code decompress} 之后，那时确认包已经被原版解码器按"未知包 id"
  *       处理掉（甚至直接断连）；</li>
- *   <li>确认包可能被原版压缩（阈值很小时）或直存，只有帧层能同时兼容三种外层形态。</li>
+ *   <li>确认包使用原版 zlib 压缩帧或 {@code [0][packet]} 直存帧，在帧层统一识别。</li>
  * </ul>
  * <p>因此在压缩解码器之前识别、消费并放行闸门。这与 Velocity 端是同一套语义，
  * 只是两端管线不同（Velocity 用 {@code ZstdSwitchConfirmSniffer}）。</p>

@@ -1,133 +1,48 @@
 # miku-zstd-protocol
 
-## 声明
+作者：JunXieX　|　MikuMC系列插件交流群：1105054380　|　非开源项目，请勿二次分发
 
-本项目为 MikuMC 服务器原创插件，公开给大众免费使用，MikuMC 服务器与作者 JunXieX 享有项目著作权，本项目非开源项目，请注意。
+三个部署模块共享的下行协议源码，不是独立 Gradle 工程。用户部署、配置与命令见根目录 README。
 
-MikuMC 系列插件交流群：1105054380
+## 当前协议
 
-三个模块**共享的协议层源码**（不是独立 Gradle 工程，见下）。
-
-## 为什么存在
-
-`miku-zstd-velocity/`、`miku-zstd-paper/` 与 `miku-zstd-fabric/` 是**三个独立 Gradle 工程**，
-历史上同一套协议逻辑各实现一份，约 600 行近乎重复：
-
-| 文件 | 服务端 | 客户端 | 差异 | 相似度 |
-|---|---|---|---|---|
-| `ZstdVarInts` | 115 | 108 | 17 | ~85% |
-| `ZstdBatchEncoder` | 265 | 250 | 46 | ~82% |
-| `ZstdBatchDecoder` | 252 | 234 | 40 | ~84% |
-
-其中帧格式代码要求三端**逐字节对称**，而"改一边忘另一边"的症状是
-**握手能成、之后静默错乱**（2.0.0 就因客户端多写一层长度前缀造成过断连回归），
-排查成本极高。共享单一实现后，这类漂移在结构上不再可能发生。
-
-## 术语：本项目的 "v几" 有三个含义
-
-同一份代码同时属于"协商版本 v5"与"帧格式 v4"，两者是不同维度的编号：
-
-- **协商版本**：`PROTOCOL_VERSION = 5`，登录期在 negotiate 载荷里交换，三端必须一致；
-  不一致即回落原版 zlib。v4 的改动是"字典改为按需推送"；v5 跟着帧格式 v4 一起前进
-  （帧格式一变，两端就必须同版本，否则会静默错乱）。
-- **帧格式 v4**：v3 做了帧头精简（magicless / 无 contentSize / 无 dictID）+ 一帧多包批处理；
-  **v4 把直存帧改成"一帧一包、不带内层长度前缀"**（`[0][packet]`），使其与原版未压缩帧
-  逐字节同形 —— 旧格式多写的那层 `[varint pktLen]` 会被对面包解码器当成包 id（`Unknown packet`）。
-  压缩帧仍合批，`payload = [varint pktLen][pkt]...` 不变。
-- **v1 / v2**：历史版本，只应出现在"我们为什么这么改"的说明里。
-
-完整说明见 `ZstdVarInts` 的类注释。
+- 协商版本：`ZstdProtocolVersion.NEGOTIATE = 11`。三端必须一致，版本不匹配时保持原版。
+- 下行帧格式：`ZstdProtocolVersion.FRAME = 7`。压缩帧带原始长度、滚动历史代数、分块数量及各块长度；直存帧为一包一帧 `[0][packet]`。
+- 上行从 5.0.45 起完全由原版压缩、分帧与解压处理。客户端不安装批处理编码器，服务端不安装 zstd 解码器，不存在上行存储批帧。
+- `negotiate` 应答用于能力校验，`switch` 确认与闸门用于确保客户端下行解码器就绪；确认包也遵循原版上行压缩规则。
 
 ## 共享边界
 
-共享（本目录）：
-
-| 文件 | 内容 |
+| 组件 | 职责 |
 |---|---|
-| `ZstdVarInts` | VarInt 编解码 + byte[]/ByteBuf 两种输入的读取入口 |
-| `ZstdBatchEncoderBase` | 批处理窗口、建帧、promise 编排、flush 吞并、生命周期清理 |
-| `ZstdBatchDecoderBase` | 帧解析、内层切包、压缩比上限、scratch 上限、fail-fast |
-| `ZstdNegotiateStatus` | 协商状态码白名单（越界一律归一为"保持原版"） |
-| `ZstdDictId` | 字典 id 的 CRC32 契约（服务端声明 / 客户端缓存键必须同源） |
-| `ZstdSampleFilter` / `ZstdDictAdoption` | 训练采样过滤与字典采纳判定 |
-| `ZstdTrafficCounter` / `ZstdBossBarFormat` | 流量计数与采样、BossBar 文本与字节单位 |
+| `ZstdProtocolVersion` | 协商与帧格式版本的唯一来源 |
+| `ZstdBatchEncoderBase` | 服务端下行攒批、压缩、直存、flush 边界、promise 与屏障保序 |
+| `ZstdBatchDecoderBase` | 客户端下行帧解析、历史代数校验、解压与内层切包 |
+| `ZstdRollingDict` | 确定性重建 64KB 滚动历史，不传输字典 |
+| `ZstdSwitchGate` / `ZstdStepFrames` | 下行就绪屏障、控制报文编码与原版帧识别 |
+| `ZstdCompressPool` / `ZstdCtxPool` / `ZstdCompressLock` | 下行压缩线程池、上下文池与 native 资源生命周期 |
+| `ZstdVarInts` | 有界 VarInt 编解码与帧长度限制 |
+| `ZstdConnStats` / `ZstdTrafficCounter` / `ZstdBossBarFormat` | 下行统计与展示口径 |
 
-**不共享**（各端职责差异大，强行合并会互相拖累）：
-
-| 类 | 原因 |
-|---|---|
-| `ZstdChannelManager` | 相似度仅 ~32%：服务端是"门控 + 字典装配"，客户端是"字典加载 + 状态" |
-| `ZstdDictRegistry` | 相似度仅 ~45%：服务端单代 + 换代延迟释放；客户端多代 LRU（可能连过多个服务器） |
-| `Zstd*Config` / `Trainer` / BossBar 展示层 | 纯单端职责（展示层分别是 Adventure 与 Bukkit） |
-
-跨端差异通过基类的抽象钩子收敛，各端只写 30~50 行：
-
-| 钩子 | Velocity | Paper | Fabric（客户端） |
-|---|---|---|---|
-| `writeBodyLen()` | `true`（无 frame-encoder，编码器自带外层长度） | `false`（prepender 负责） | `false`（prepender 负责） |
-| `onFrame(...)` | 带宽剖析 + 全局/连接统计 | 监控 + 连接统计 | HUD 统计 |
-| `skipCompressThreshold()` | `ZstdVelocityConfig` | `ZstdPaperConfig` | `ZstdConfig` |
-| `wantsStoredPayload()` | `false` | `false` | `false` |
-
-> 5.0.42 删除训练字典后，`hasCompressDict()` / `compressDict()` 两个抽象钩子已不存在，
-> 直存阈值只剩一档（`skip_compress_below_bytes`，默认 48）。滚动历史是唯一的字典来源。
+Velocity 与 Paper 持有下行压缩上下文；Fabric 持有下行解压上下文。各端只处理原版管线锚点、配置与展示差异。
 
 ## 接入方式
 
-三端 `build.gradle` 各有一处声明：
+三个模块的 `build.gradle` 通过 `sourceSets.main.java.srcDir` 引用本目录 `src/main/java`。共享源码编译进各自产物，不额外发布共享 jar。
 
-```groovy
-sourceSets {
-    main {
-        java {
-            srcDir(new File(rootDir.parentFile, 'miku-zstd-protocol/src/main/java'))
-        }
-    }
-}
-```
+- Velocity 负责下行外层长度，Paper 继续使用原版 prepender。
+- 服务端下行编码器从原版 compress 的 context 写帧，客户端下行解码器从原版 decompress 的 context 交付已解出的包。原版 handler 始终保留。
+- 压缩帧按整帧原始负载喂入历史；直存帧按 `[pktLen][packet]` 一帧一次喂入，两端必须完全对称。
 
-即**同一份源码被编译进各自的 jar**，无需 shadow / Loom `include` / 发布仓库。
+## 回归验证
 
-本目录的测试（`src/test/java`）**由 Velocity 模块的 test 源集负责执行**——
-三个模块里只有它是纯 `java` 插件（Paper 要 paper-api、Fabric 要 Loom），
-跑纯 JVM 测试的代价最小，而这些测试只依赖 netty + zstd，不需要任何 Minecraft 类。
-
-### 为什么不建成独立 Gradle 工程
-
-三个模块各自独立构建（各自的 wrapper、各自 `gradlew build`），跨工程共享 jar 需要
-composite build 或 `publishToMavenLocal`，并额外解决"classpath 依赖如何进入
-fabric 的 Loom 产物"（必须 `include` 成嵌套 jar）——引入三重构建风险，而收益
-（消除重复）与 `srcDir` 方案完全相同。因此当前取 `srcDir`：
-
-- ✅ 源码单份：改一处、三端同时生效（这是本次要解决的核心问题）
-- ✅ 零额外构建配置与打包风险
-- ⚠️ 共享代码在各端各编译一次（编译产物重复，源码不重复）
-
-### 升级为独立模块的路径（若将来需要）
-
-1. 给本目录加 `build.gradle`（`java-library`）+ `settings.gradle`，`group = 'mikumc.zstd'`；
-2. 三端 `settings.gradle` 加 `includeBuild('../miku-zstd-protocol')`；
-3. 三端依赖改 `implementation("mikumc.zstd:miku-zstd-protocol")`；
-4. Velocity 与 Paper 端 `shadowJar` 会自动打包；**Fabric 端需把该依赖加进 Loom 的 `include`**
-   （否则运行期 `NoClassDefFoundError`）——这一步是主要风险点。
-
-## 约束
-
-改动本目录后**必须**跑回归测试：
-
-```bash
-cd miku-zstd-velocity && ./gradlew test
-```
-
-（在 CI 上由 Velocity job 的 `test shadowJar` 执行；测试不过就不会产出产物。）
-
-测试位于本目录的 `src/test/java`：
+本地仅做静态审查，禁止执行任何 Gradle 任务。协议回归测试通过 GitHub Actions 的 Velocity job 执行，三端构建与 Paper / Velocity E2E 完成后仍需真实客户端验证。
 
 | 测试 | 覆盖 |
 |---|---|
-| `FrameLayoutTest` | 帧格式的逐字段布局（两种外层长度形态）、**直存帧一帧一包 / 不带内层长度前缀**、压缩帧合批、压缩无收益退回直存、往返还原；畸形输入与放大攻击**必须 fail-fast 关连接** |
-| `ProtocolUnitsTest` | VarInt 边界、字典 id 契约、协商状态码白名单、采样过滤、BossBar 模板与单位、流量统计、字典采纳判定 |
+| `FrameLayoutTest` | 下行直存/压缩/分块往返、历史代数、flush 边界、屏障保序、非法帧拒绝 |
+| `ProtocolUnitsTest` | VarInt、状态码、流量统计与文本格式 |
+| `ZstdSwitchGateTest` | 下行扣包、确认/超时、连接关闭与控制帧识别 |
+| `DictAblationTest` | 滚动历史对照实验，只出报告 |
 
-`FrameLayoutTest` 用两个只差 `writeBodyLen` 一个开关的测试专用编解码器，
-覆盖 Velocity 形态与 Paper/Fabric 形态——这是整套共享代码的黄金不变量：
-帧格式漂移不会编译失败，只会让两端静默错位，只有这类字节级断言能拦住它。
+真机验证至少包括新客户端、并发登录、旧版本回落与纯原版客户端；阈值 0 与 256 下的上行确认均须通过原版压缩层。

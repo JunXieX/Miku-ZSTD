@@ -9,7 +9,7 @@ import org.slf4j.LoggerFactory;
 import java.util.regex.Pattern;
 
 /**
- * 左上角统计 HUD：TX/RX 速率与压缩率。
+ * 左上角统计 HUD：TX 标记原版，RX 显示下行 zstd 速率与压缩率。
  * 由 MixinHud 在 {@code Hud.extractRenderState} 尾部调用。
  *
  * <h2>3.1.1 变更</h2>

@@ -42,8 +42,7 @@ import java.util.concurrent.TimeUnit;
  *       拿不到编译期常量，但二者同为 JVM 内建、开销同量级）
  *       ——该判断在激活前会对每个出站包执行，字符串比较（含 getSimpleName 的反射开销）
  *       是不必要的热路径成本；</li>
- *   <li>激活前<b>先校验两端锚点齐备</b>再动手安装，避免"只装上编码器"这类
- *       单侧 zstd 的必断连组合；</li>
+ *   <li>激活前先校验下行编码器与原版确认嗅探器的锚点，再安装下行切换处理器；</li>
  *   <li>VarInt 读取统一走 {@link ZstdVarInts}。</li>
  * </ul>
  */
@@ -118,7 +117,6 @@ public class ZstdHijacker extends ChannelDuplexHandler {
     private static final java.util.concurrent.atomic.AtomicBoolean ANCHOR_WARNED =
             new java.util.concurrent.atomic.AtomicBoolean();
 
-    private static final String MINECRAFT_DECODER = "minecraft-decoder";
     private static final String MINECRAFT_ENCODER = "minecraft-encoder";
     private static final String COMPRESSION_DECODER = "compression-decoder";
     private static final String COMPRESSION_ENCODER = "compression-encoder";
@@ -415,7 +413,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
     /**
      * 补发 hold 期间扣下的包。
      *
-     * <p>调用时机必须是"管道已定型"之后：激活成功时 zstd 编解码器已就位，
+     * <p>调用时机必须是"管道已定型"之后：激活成功时下行 zstd 编码器已就位，
      * 回落原版时原版压缩编码器仍在位——两种情形下都只需按原路径写出即可。</p>
      */
     /**
@@ -460,9 +458,9 @@ public class ZstdHijacker extends ChannelDuplexHandler {
         } catch (Throwable t) {
             LOGGER.error("[Zstd] activation flow failed (attempt={}) — releasing held packets, staying vanilla",
                     attempt, t);
-            // ⚠️ 安装只做到一半就抛异常时，管线里可能躺着 zstd_encoder/zstd_decoder：
-            // 它们会继续按 zstd 编解码，而客户端还没收到 zstd:switch，仍然按原版解释入站帧。
-            // 这里必须先把它们摘干净，再补发扣住的包（补发走的才是完整原版路径）。
+            // ⚠️ 安装只做到一半就抛异常时，管线里可能残留下行 zstd_encoder：
+            // 它会继续按 zstd 编码，而客户端还没收到 zstd:switch，仍然按原版解释入站帧。
+            // 这里必须先把自身处理器摘干净，再补发扣住的包（补发走的才是完整原版路径）。
             // ⚠️ 判据是 isReplaced()：一旦已激活成功（切换通知也已发出），对端就是 zstd 了，
             // 此时拆掉我们的处理器才是真正的单侧 zstd —— 那种情况只能保持现状。
             ZstdChannelManager m = ctx.channel().attr(ZstdChannelManager.KEY).get();
@@ -536,7 +534,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
     }
 
     /**
-     * 安装 zstd 编解码器并置位激活状态。
+     * 安装下行 zstd 编码器并置位激活状态。
      *
      * <p>⚠️ <b>返回值语义必须严格遵守</b>，它是"扣住的包该不该现在补发"的唯一判据：</p>
      * <ul>
@@ -568,15 +566,15 @@ public class ZstdHijacker extends ChannelDuplexHandler {
         Channel channel = ctx.channel();
         ChannelPipeline p = channel.pipeline();
 
-        if (p.get(MINECRAFT_DECODER) == null || p.get(MINECRAFT_ENCODER) == null) {
+        if (p.get(MINECRAFT_ENCODER) == null) {
             LOGGER.warn("[Zstd] Cannot activate zstd — not a frontend Minecraft channel");
             giveUp(ctx); // 不可激活：补发扣住的包 + 摘掉自身，否则连接卡死
             return false;
         }
-        // 先确认两端锚点都齐备，再动手——避免只装上一侧造成单侧 zstd 的必断连组合
-        if (!hasEncoderAnchor(p) || !hasDecoderAnchor(p)) {
-            LOGGER.error("[Zstd] Cannot activate zstd — pipeline anchors missing (encoder={}, decoder={}); "
-                    + "pipeline={}", hasEncoderAnchor(p), hasDecoderAnchor(p), p.names());
+        // 下行编码器与原版确认帧嗅探器的锚点均就绪后再安装；上行继续走原版解压。
+        if (!hasEncoderAnchor(p) || !hasConfirmAnchor(p)) {
+            LOGGER.error("[Zstd] Cannot activate zstd — pipeline anchors missing (downstream-encoder={}, confirm-decompress={}); "
+                    + "pipeline={}", hasEncoderAnchor(p), hasConfirmAnchor(p), p.names());
             giveUp(ctx); // 同上：不能把包一直扣着
             return false;
         }
@@ -584,7 +582,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
         // 这里原先要"按门控装载训练字典"，5.0.42 起训练字典整体删除：跨帧重复由协议基类的
         // 滚动历史（每方向 64KB 滑窗）在帧边界自动维护，本端不需要任何准备动作。
 
-        // ⚠️ 先在**代码路径上**把两个处理器都装上，成功了才置 replaced。
+        // ⚠️ 先在**代码路径上**把下行编码器、闸门和确认嗅探器都装上，成功了才置 replaced。
         //
         // 曾经这里先 setReplaced(true) 再安装：安装失败走重试时，{@code tryActivate0}
         // 开头的 {@code mgr.isReplaced()} 早退会把重试**整个吃掉**（replaced 已为 true
@@ -604,9 +602,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
             }
             LOGGER.error("[Zstd] zstd handler installation failed after {} attempts; pipeline={}",
                     installAttempt, p.names());
-            // ⚠️ 不再有"半装死局"：v7 起原版压缩处理器从来没被摘掉（只插入、不替换），
-            // 所以"只装上编码器、解码器没装上"这种中间态是可以撤销的 —— 把我们的四个
-            // handler 全摘掉，管线就回到完整原版形态。
+            // 原版压缩处理器始终在位，安装失败时摘除下行编码器、闸门和确认嗅探器即可回落。
             // 这一步必须做：残留的 zstd_encoder 会继续把出站包编成 zstd 帧，
             // 而客户端此刻还没收到 zstd:switch（那条通知在安装成功之后才发），
             // 它按原版解释入站帧 → 第一帧就错乱。
@@ -655,16 +651,9 @@ public class ZstdHijacker extends ChannelDuplexHandler {
                 || p.get("compress") != null;
     }
 
-    /**
-     * 入站方向是否有**可插入**的锚点。
-     *
-     * <p>⚠️ 同上：绝不能把 {@code minecraft-decoder} 算作锚点。在它之前插入一层会让
-     * 本解码器输出的包被它再当成外层帧解析一次，症状是 Velocity 打出
-     * "A packet frame decoder failed" 并断连。</p>
-     */
-    private static boolean hasDecoderAnchor(ChannelPipeline p) {
-        return p.get("zstd_decoder") != null || p.get(COMPRESSION_DECODER) != null
-                || p.get("decompress") != null;
+    /** 确认嗅探器需要原版解压锚点；正常上行在嗅探后仍由原版解压与包解码处理。 */
+    private static boolean hasConfirmAnchor(ChannelPipeline p) {
+        return p.get(COMPRESSION_DECODER) != null || p.get("decompress") != null;
     }
 
     /**

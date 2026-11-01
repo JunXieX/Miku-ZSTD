@@ -5,7 +5,6 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.file.Files;
-import mikumc.zstd.protocol.ZstdCompressPool;
 
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -40,27 +39,18 @@ public final class MikuZstd {
         Path configPath = Paths.get("Miku-ZSTD", "config.yml");
         migrateLegacyConfig(configPath);
         ZstdConfig.load(configPath);
-        ZstdCompressPool.init(ZstdConfig.INSTANCE.compressThreads, 5);
         detectKrypton();
     }
 
     /**
-     * 检测 Krypton 是否在场，并说明两者如何共存。
-     *
-     * <p>Krypton 在 {@code setupCompression} 的 HEAD 用<b>同名</b> handler
-     * （{@code compress}/{@code decompress}）装上 libdeflate 版压缩器；本模组在 TAIL 把
-     * zstd 编解码器插到这些名字<b>旁边</b>，出站跳过它、入站抢在它前面解。所以两者可以共存：
-     * zstd 负责压缩，Krypton 的加密、长度前缀与 flush 合并继续生效；本轮未协商成功时
-     * Krypton 继续用 libdeflate。</p>
-     *
-     * <p>只做一次性日志，不据此改变行为——真正的冲突由 {@code activateInEventLoop}
-     * 的"双侧校验"兜住（缺一侧就放弃激活）。</p>
+     * 一次性说明 Krypton 共存口径：上行继续使用其原版协议压缩、加密、长度前缀与 flush 优化；
+     * 已协商的 zstd 下行由本模组先解包，再从 decompress 的 context 向后交付。
      */
     private static void detectKrypton() {
         try {
             Class.forName("me.steinborn.krypton.mod.shared.network.compression.MinecraftCompressEncoder");
-            LOGGER.info("[Zstd] 检测到 Krypton：zstd 激活后将接管压缩管线，"
-                    + "Krypton 的其余优化（加密 / 长度前缀 / flush 合并）继续生效");
+            LOGGER.info("[Zstd] 检测到 Krypton：zstd 仅接管已协商的下行解压，"
+                    + "上行压缩、加密、长度前缀与 flush 合并继续由原版/Krypton 处理");
         } catch (ClassNotFoundException notInstalled) {
             // 未安装 Krypton：无需提示
         } catch (Throwable t) {
@@ -72,7 +62,7 @@ public final class MikuZstd {
      * 搬迁旧版本的配置文件。
      *
      * <p>4.1.6 之前配置放在 {@code config/miku_zstd.yml}。新位置还没有文件、而旧文件存在时，
-     * 直接<b>搬</b>过来——用户手改过的等级/阈值不该因为换了路径就丢掉，
+     * 直接<b>搬</b>过来——用户已有的显示设置与注释不该因为换了路径就丢掉，
      * 同时也不留旧文件，避免以后分不清哪个才是生效的。</p>
      */
     private static void migrateLegacyConfig(Path configPath) {
