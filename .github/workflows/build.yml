@@ -318,6 +318,202 @@ jobs:
           [ -f server.pid ] && kill "$(cat server.pid)" 2>/dev/null || true
           sleep 2
 
+  # ──────────────────────────────────────────────────────────────────────
+  # Velocity 端真机冒烟：真代理 + 协议级客户端，只跑到"登录完成"。
+  #
+  # 为什么要单独一个 job：v7 在 Velocity 上走的字节路径与 Paper 不同（外层 bodyLen 由
+  # 编码器自带、且没有 prepender）。2026-11-01 的 5.0.36 就只在代理端坏掉，而 Paper 的
+  # E2E 全绿 —— 这条路径当时没有任何门禁。
+  #
+  # 不需要后端服务器：本用例只验证登录阶段（SetCompression → negotiate → switch →
+  # 第一个 zstd 帧），LoginSuccess 在选服之前就发出了。
+  # ──────────────────────────────────────────────────────────────────────
+  e2e-velocity:
+    name: E2E (Velocity)
+    needs: [velocity]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: 'temurin'
+      - uses: actions/download-artifact@v4
+        with:
+          name: Miku-ZSTD-Velocity
+          path: dist
+      - name: Fetch Velocity 4.3.1
+        run: |
+          set -euo pipefail
+          URL=$(curl -fsSL https://fill.papermc.io/v3/projects/velocity/versions/4.3.1/builds \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["downloads"]["server:default"]["url"])')
+          echo "velocity=$URL"
+          curl -fsSL "$URL" -o velocity.jar
+          ls -l velocity.jar
+      - name: Prepare Velocity
+        run: |
+          set -euo pipefail
+          mkdir -p server/plugins
+          cp dist/*.jar server/plugins/
+          cd server
+          cat > velocity.toml <<'EOF'
+          bind = "0.0.0.0:25565"
+          motd = "MikuZSTD E2E"
+          online-mode = false
+          player-info-forwarding-mode = "none"
+          log-player-connections = true
+          log-command-executions = false
+
+          [servers]
+
+          [forced-hosts]
+
+          [advanced]
+          compression-threshold = 256
+          compression-level = -1
+          login-ratelimit = 0
+          EOF
+          ls plugins/
+      - name: Start Velocity
+        run: |
+          set -euo pipefail
+          cd server
+          nohup java -Xms256M -Xmx512M -jar ../velocity.jar > velocity.log 2>&1 &
+          echo $! > velocity.pid
+          for i in $(seq 1 120); do
+            if grep -qE 'Done \(|Listening on' velocity.log; then echo "velocity up in ${i}s"; exit 0; fi
+            sleep 1
+          done
+          echo "velocity did not start"; tail -80 velocity.log; exit 1
+      - name: Run protocol client
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import socket, struct, sys, time, zlib
+          HOST, PORT = "127.0.0.1", 25565
+          MAGIC = 0x5A535743
+          PROTOCOL = 776
+
+          def varint(n):
+              out = bytearray()
+              while True:
+                  b = n & 0x7F; n >>= 7
+                  if n: out.append(b | 0x80)
+                  else:
+                      out.append(b); return bytes(out)
+
+          def s(x):
+              b = x.encode(); return varint(len(b)) + b
+
+          def recvn(sock, n):
+              d = b""
+              while len(d) < n:
+                  c = sock.recv(n - len(d))
+                  if not c: raise EOFError("eof")
+                  d += c
+              return d
+
+          def rv(sock):
+              num = 0; sh = 0
+              while True:
+                  c = recvn(sock, 1)[0]; num |= (c & 0x7F) << sh
+                  if not (c & 0x80): return num
+                  sh += 7
+                  if sh > 35: raise ValueError("varint too long")
+
+          def dv(buf, pos):
+              num = 0; sh = 0
+              while True:
+                  b = buf[pos]; pos += 1; num |= (b & 0x7F) << sh
+                  if not (b & 0x80): return num, pos
+                  sh += 7
+
+          def send(sock, packet, compressed):
+              body = (b"\x00" + packet) if compressed else packet
+              sock.sendall(varint(len(body)) + body)
+
+          sock = socket.create_connection((HOST, PORT), timeout=20)
+          sock.settimeout(25)
+          hs = varint(0) + varint(PROTOCOL) + s("127.0.0.1\x00ZSTD\x00") + struct.pack(">H", PORT) + varint(2)
+          sock.sendall(varint(len(hs)) + hs)
+          ls = varint(0) + s("E2EVelocity") + b"\x02" * 16
+          sock.sendall(varint(len(ls)) + ls)
+
+          seen = {"set_compression": False, "negotiate": False, "switch": False, "frame": False}
+          compressed = False; zstd_mode = False; rc = 1
+          deadline = time.time() + 40
+          try:
+              while time.time() < deadline:
+                  ln = rv(sock); body = recvn(sock, ln)
+                  if not body: break
+                  if not zstd_mode:
+                      packet = body[1:] if (compressed and body[0] == 0) else (zlib.decompress(body[1:]) if compressed else body)
+                  else:
+                      raw, pos = dv(body, 0)
+                      if raw == 0:
+                          packet = body[pos:]
+                          pid2, _ = dv(packet, 0)
+                          print("  stored frame, %d bytes, packet id=%d" % (len(packet), pid2))
+                          seen["frame"] = True
+                          print("E2E_PASS frame_ok packet id=%d" % pid2); rc = 0; break
+                      gen, pos = dv(body, pos)
+                      blocks, pos = dv(body, pos)
+                      print("  compressed frame rawSize=%d dictGen=%d blocks=%d" % (raw, gen, blocks))
+                      assert gen == 0, "首次登录不该出现滚动历史代数（gen=%d）" % gen
+                      total = 0
+                      for i in range(blocks):
+                          br, pos = dv(body, pos); cl, pos = dv(body, pos)
+                          pos += cl; total += br
+                      assert total == raw, "块合计 %d != rawSize %d" % (total, raw)
+                      seen["frame"] = True
+                      print("E2E_PASS compressed_frame_ok"); rc = 0; break
+                  pid, pos = dv(packet, 0)
+                  if pid == 0x03 and not compressed:
+                      thr, _ = dv(packet, pos); compressed = True
+                      seen["set_compression"] = True
+                      print("  SetCompression threshold=%d" % thr)
+                  elif pid == 0x04:
+                      tx, pp = dv(packet, pos); sl, pp = dv(packet, pp)
+                      chan = packet[pp:pp + sl].decode()
+                      if chan == "zstd:negotiate":
+                          send(sock, varint(0x02) + varint(tx) + b"\x01" + varint(0) + varint(0), compressed)
+                          seen["negotiate"] = True; print("  negotiate answered")
+                      elif chan == "zstd:switch":
+                          send(sock, varint(0x02) + varint(tx) + b"\x01" + struct.pack(">I", MAGIC), compressed)
+                          seen["switch"] = True; zstd_mode = True; print("  switch confirmed -> zstd mode")
+                      else:
+                          send(sock, varint(0x02) + varint(tx) + b"\x00", compressed)
+                  elif pid == 0x00:
+                      print("  DISCONNECT: %s" % packet[pos:pos + 160]); break
+                  elif pid == 0x02:
+                      print("  LoginSuccess in vanilla path (unexpected)"); break
+          except Exception as e:
+              print("client error: %s: %s" % (type(e).__name__, e))
+          finally:
+              sock.close()
+          for k, v in seen.items():
+              print("  seen %-16s %s" % (k, v))
+          sys.exit(0 if (rc == 0 and all(seen.values())) else 1)
+          PY
+      - name: Verify velocity log
+        if: always()
+        run: |
+          set -euo pipefail
+          cd server
+          echo "----- zstd lines -----"
+          grep -E "zstd|Zstd" velocity.log | tail -30 || true
+          echo "----- check -----"
+          grep -q "Zstd transport activated" velocity.log || { echo "未激活"; tail -60 velocity.log; exit 1; }
+          if grep -q "dict generation mismatch" velocity.log; then echo "滚动历史分叉"; exit 1; fi
+          if grep -q "frame rejected" velocity.log; then echo "帧被拒"; exit 1; fi
+          echo "velocity-side assertions OK"
+      - name: Stop Velocity
+        if: always()
+        run: |
+          cd server 2>/dev/null || exit 0
+          [ -f velocity.pid ] && kill "$(cat velocity.pid)" 2>/dev/null || true
+          sleep 2
+
   release:
     name: Release
     needs: [velocity, paper, fabric]

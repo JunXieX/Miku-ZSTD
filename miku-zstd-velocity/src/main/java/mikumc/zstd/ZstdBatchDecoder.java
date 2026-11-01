@@ -34,6 +34,23 @@ public class ZstdBatchDecoder extends ZstdBatchDecoderBase {
         return mgr.getDecompressCtx();
     }
 
+    /**
+     * 解出的包要跳过原版压缩解码器（本类在它上游）。
+     *
+     * <p>⚠️ 必须是<b>原版解压处理器</b>本身：{@code fireChannelRead} 从它的 context 出发，
+     * 等于跳过它、直接进包解码器。v7 第一版是"补 {@code [0]} 前缀让原版透传"，在装了
+     * <b>Krypton</b> 的客户端上会触发它那条"未压缩帧必须短于阈值"的硬校验（实测直接断连）。
+     * 找不到（原版压缩未启用 / 已被第三方拆掉）就返回 {@code null}，基类退回自己的 ctx。</p>
+     */
+    @Override
+    protected ChannelHandlerContext decodeForwardTarget(ChannelHandlerContext ctx) {
+        io.netty.channel.ChannelHandlerContext c = ctx.pipeline().context("compression-decoder");
+        if (c != null) return c;
+        io.netty.channel.ChannelHandlerContext c = ctx.pipeline().context("decompress");
+        if (c != null) return c;
+        return null;
+    }
+
     @Override
     protected void onStoredFrame(int frameBodyBytes) {
         // 服务端无入站统计（有意）

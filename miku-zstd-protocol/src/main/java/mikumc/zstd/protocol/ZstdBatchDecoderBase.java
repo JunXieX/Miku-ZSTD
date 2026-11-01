@@ -23,15 +23,27 @@ import java.util.List;
  *
  * <h2>本类在管线里的位置（协议 v7 起）</h2>
  * <p>本处理器<b>不替换</b>原版 {@code decompress}，而是插在它<b>上游</b>（入站先经过本类），
- * 解出的每个包都以<b>原版未压缩帧</b>的形态 {@code [0][packet]} 交给下游——原版
- * {@code CompressionDecoder} 对 {@code dataLength == 0} 的分支是<b>原样透传</b>，于是
- * 它继续留在管线里却什么都不用做：</p>
+ * 解出的包<b>从原版解压处理器的 context 往下 fire</b>——即跳过它，直接进包解码器。
+ * 它继续留在管线里，只是不再参与这条连接的数据流：</p>
  * <ul>
  *   <li>ViaVersion / PacketEvents / Grim 这类<b>按名字查找</b> {@code decompress} 的插件照常工作；</li>
  *   <li>回落原版只需把自己摘掉，不存在"原版处理器已被移除、Netty 非 {@code @Sharable}
- *       实例无法重新插入"的死局（旧实现因此只能关连接）；</li>
- *   <li>代价是每包多 1 字节前缀与一次原版透传——入站是玩家操作流量，可忽略。</li>
+ *       实例无法重新插入"的死局（旧实现因此只能关连接）。</li>
  * </ul>
+ *
+ * <h2>为什么不能再套一层 {@code [0][packet]}</h2>
+ * <p>v7 的第一版实现是"把每个包补一个 {@code dataLength = 0} 前缀，交给原版解压器透传"，
+ * 看起来更省事（原版对 0 是原样放过）。它在 vanilla 上确实能跑，但<b>在装了 Krypton 的客户端上必炸</b>
+ * ——Krypton 的 {@code MinecraftCompressDecoder} 会把这条约定当作硬校验：</p>
+ * <pre>
+ * if (claimedUncompressedSize == 0) {
+ *     checkState(actualUncompressedSize &lt; threshold, "Actual uncompressed size %s is greater than threshold %s");
+ * }
+ * </pre>
+ * <p>也就是说"未压缩帧必须比阈值短"。我们解出来的包动辄上千字节，一帧就撞上
+ * {@code IllegalStateException} → 客户端直接断连（实测 2026-11-01，Krypton + 5.0.36）。
+ * 所以现在改为<b>跳过</b>原版解压器，既满足"不拆原版处理器"的初衷，也不再依赖任何
+ * "透传"约定。</p>
  * <p>{@code rawSize == 0} 表示未压缩直存：帧体<b>恰好是一个包</b>（{@code [0][packet]}），
  * 与原版未压缩帧<b>逐字节同形</b>。因此"按原版解释"与"按 zstd 解释"对这段字节得到的结果
  * <b>完全相同</b>——切换窗口内外的处理不需要任何形状判断（见 {@link #acceptsLegacyFrames()}）。</p>
@@ -118,9 +130,6 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
         return String.format("常驻上限 %dKB | 大帧临时分配 %,d 次 / 共 %.1fMB",
                 SCRATCH_KEEP_LIMIT / 1024, n, bytes / 1048576.0);
     }
-
-    /** 未压缩帧的 dataLength 前缀，复用一个常量数组（避免每包一次分配）。 */
-    private static final byte[] STORED_PREFIX = {0};
 
     /** 字典代数上限：仅用于 varint 越界判定（滑窗最多几秒轮换一次，远小于此）。 */
     private static final int MAX_DICT_GEN = 1 << 20;
@@ -322,8 +331,9 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
             //（{@code [0][packet]}，见 ZstdBatchEncoderBase 的帧格式一节）：两种解释结果相同，
             // 因此不存在任何"看起来像不像 zstd 帧"的启发式判断（那正是残留风险的来源）。
             if (legacyFallbackAllowed()) {
-                // 窗口内收到的就是原版帧：原样交给下游的原版 decompress（本处理器现在在它上游）
-                out.add(vanillaFrame(in.readRetainedSlice(remaining)));
+                // 窗口内收到的就是原版帧：<b>原样</b>交给下游的原版 decompress（本处理器在它上游）。
+                // 注意这里不能用 emit()：这条路径本该由原版解压器处理，跳过它反而是错的。
+                ctx.fireChannelRead(in.readRetainedSlice(remaining));
                 return;
             }
 
@@ -336,7 +346,7 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
                 onStoredPayload(batch);
             }
             feedHistory(batch);
-            out.add(vanillaFrame(in.readRetainedSlice(remaining)));
+            emit(ctx, in.readRetainedSlice(remaining));
             return;
         }
 
@@ -486,7 +496,7 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
             // 必须恰好解满：半截数据当完整包下传会让上层包解码器错位
             if (got != declared) return false;
             in.skipBytes(remaining);
-            out.add(vanillaFrame(Unpooled.wrappedBuffer(data, 0, got)));
+            emit(ctx, Unpooled.wrappedBuffer(data, 0, got));
             return true;
         } catch (Throwable t) {
             LOGGER.debug("[Zstd] vanilla inflate failed: {}", t.toString());
@@ -509,19 +519,24 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
     }
 
     /**
-     * 把一个包包成"原版未压缩帧"的<b>帧体</b>：{@code [varint dataLength = 0][packet]}。
+     * 解出来的包交给谁：从哪个 handler 的 context 往下 fire。
      *
-     * <p>为什么要这一步：本处理器现在挂在原版 {@code decompress} 的<b>上游</b>（协议 v7），
-     * 解出的包必须交给它继续往下走。而它对 {@code dataLength == 0} 的分支是<b>原样透传</b>——
-     * 于是我们只要补上这个 1 字节前缀，就既能借它把包送到包解码器，又让它"什么都不做"。
-     * 这比"从它的 context 直接 fireChannelRead 跳过它"更省事：不需要换掉
-     * {@code ByteToMessageDecoder} 的基类语义（后者自带累积、半帧、异常收敛一整套行为）。</p>
+     * <p>默认 {@code null} = 从本处理器自己的 ctx 往下（= 仍会经过下游的原版解压处理器）。</p>
+     *
+     * <p>⚠️ <b>三端都必须覆写为"原版解压处理器"本身</b>（{@code decompress} /
+     * {@code compression-decoder}），理由见类注释的"为什么不能再套一层 [0]"。</p>
      */
-    private static ByteBuf vanillaFrame(ByteBuf packet) {
-        // 用 CompositeByteBuf 而不是 wrappedBuffer(byte[], ByteBuf)：前者保证"包缓冲零拷贝"
-        // 且引用计数随复合缓冲一起释放。分配器取默认（不碰池化），因为它只是两个组件的壳。
-        return Unpooled.compositeBuffer(2)
-                .addComponents(true, Unpooled.wrappedBuffer(STORED_PREFIX), packet);
+    protected ChannelHandlerContext decodeForwardTarget(ChannelHandlerContext ctx) {
+        return null;
+    }
+
+    /** 交出一个<b>已解好</b>的包：跳过原版解压处理器，直接进包解码器。 */
+    private void emit(ChannelHandlerContext ctx, ByteBuf msg) {
+        ChannelHandlerContext target = decodeForwardTarget(ctx);
+        if (target == null) {
+            target = ctx;
+        }
+        target.fireChannelRead(msg);
     }
 
     /**
@@ -573,7 +588,7 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
             }
             // data 是本帧独占的新数组，wrappedBuffer 共享它是安全的（零拷贝）；
             // 外面再套一层"原版未压缩帧"[0] 前缀，交给下游的原版 decompress 透传。
-            out.add(vanillaFrame(Unpooled.wrappedBuffer(data, off, pktLen)));
+            emit(ctx, Unpooled.wrappedBuffer(data, off, pktLen));
             off += pktLen;
             packets++;
         }

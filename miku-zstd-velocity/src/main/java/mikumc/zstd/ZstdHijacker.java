@@ -681,7 +681,10 @@ public class ZstdHijacker extends ChannelDuplexHandler {
 
         mgr.setReplaced(true); // 计数已内聚在 setReplaced 内（幂等）
 
-        LOGGER.info("[Zstd] Zstd transport activated (dict={})", mgr.isDictConfirmed());
+        // ⚠️ 字段名必须如实：这里打印的是"客户端答了 READY"（isDictConfirmed），不是"装了字典"。
+        // 旧标签写 dict=，运维会以为服务端加载了训练字典；实际 negotiate 里 encId/decId 都为 0 时
+        // 两边都没字典，看到 dict=true 只会把排查方向带偏（2026-11-01 实机就差点被它误导）。
+        LOGGER.info("[Zstd] Zstd transport activated (client-ready={})", mgr.isDictConfirmed());
 
         // ⚠️ 切换闸门此刻正扣着登录期的大帧（例如 LoginSuccess 压缩帧），
         // 客户端在收到它之前不可能完成登录，也就没有任何东西会触发它的切换。

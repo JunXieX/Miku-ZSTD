@@ -56,6 +56,25 @@ public class ZstdBatchDecoder extends ZstdBatchDecoderBase {
         return m == null ? null : m.getDecompressCtx();
     }
 
+    /**
+     * 解出的包要跳过原版 {@code decompress}（本类在它上游）。
+     *
+     * <p>⚠️ 必须是原版解压处理器本身：{@code fireChannelRead} 从它的 context 出发 = 跳过它、
+     * 直接进包解码器。v7 第一版是"补 {@code [0]} 前缀让原版透传"，在装了 <b>Krypton</b> 的客户端上
+     * 必炸——Krypton 的 {@code MinecraftCompressDecoder} 会硬校验"未压缩帧必须短于阈值"
+     * （{@code checkState(actualUncompressedSize < threshold)}），而解出来的包动辄上千字节
+     * （实测 2026-11-01：1036 > 256 → IllegalStateException → 客户端直接断连）。</p>
+     *
+     * <p>Krypton 会替换同名 handler 的实现，但<b>名字仍是 {@code decompress}</b>（见其实测管线），
+     * 所以按名字取 context 对原版与 Krypton 都成立。</p>
+     */
+    @Override
+    protected ChannelHandlerContext decodeForwardTarget(ChannelHandlerContext ctx) {
+        io.netty.channel.ChannelHandlerContext c = ctx.pipeline().context("decompress");
+        if (c != null) return c;
+        return ctx.pipeline().context("compression-decoder");
+    }
+
     @Override
     protected void onStoredFrame(int frameBodyBytes) {
         // ⚠️ 两侧口径必须一致（都含 rawSize 标记），否则直存帧会显示成 99.9% 而不是 100%
