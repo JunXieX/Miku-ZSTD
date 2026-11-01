@@ -1,6 +1,6 @@
 # Miku-ZSTD — Paper 端（纯 Paper，无 Bukkit/Spigot 兼容层；同一份产物也跑 Folia）
 name: Miku-ZSTD
-version: 5.0.32
+version: 5.0.33
 main: mikumc.zstd.paper.MikuZstdPaper
 api-version: 1.26
 # Folia 只加载显式声明的插件。本插件的调度全部走区域调度器（GlobalRegionScheduler /

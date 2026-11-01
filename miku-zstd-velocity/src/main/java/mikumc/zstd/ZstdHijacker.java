@@ -294,7 +294,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
         // 阈值 < 0 表示它已禁用压缩，也就不需要 zstd。
         if (C_SET_COMPRESSION != null && C_SET_COMPRESSION.isInstance(msg)) {
             int threshold = readThresholdValue(msg);
-            if (threshold < 0) {
+            if (threshold != UNKNOWN_THRESHOLD && threshold < 0) {
                 LOGGER.debug("[Zstd] peer disabled compression (threshold<0) — not negotiating");
                 if (ctx.pipeline().get(ZstdHijacker.class) != null) {
                     ctx.pipeline().remove(this);
@@ -321,10 +321,11 @@ public class ZstdHijacker extends ChannelDuplexHandler {
             int threshold = readThresholdValue(msg);
             LOGGER.info("[Zstd] 同一条连接收到第二次 SetCompression（threshold={}）；pipeline={}",
                     threshold, ctx.channel().pipeline().names());
-            if (threshold < 0) {
+            if (threshold != UNKNOWN_THRESHOLD && threshold < 0) {
                 // 对端要"关掉压缩"（limbo 登录服就是这样把连接降回明文的）。
                 // 本端若继续用 zstd 发帧，对端会按明文读 —— 第一帧就错乱。
                 LOGGER.info("[Zstd] 压缩被禁用（threshold<0）——本端退回明文");
+                super.write(ctx, msg, promise); // 先把这条包原样送出，再让位
                 giveUp(ctx);
                 return;
             }
@@ -839,7 +840,16 @@ public class ZstdHijacker extends ChannelDuplexHandler {
         }
     }
 
-    /** 读 SetCompressionPacket 的阈值（反射失败返回 -1，即按"禁用"处理）。 */
+    /** 反射读不到阈值时的哨兵：与"对端真的传了 -1"区分开，后者才是禁用压缩。 */
+    private static final int UNKNOWN_THRESHOLD = Integer.MIN_VALUE;
+
+    /**
+     * 读 SetCompressionPacket 的阈值。
+     *
+     * <p>⚠️ 读不到时必须返回 {@link #UNKNOWN_THRESHOLD} 而不是负数：SetCompression 出现
+     * 本身就说明对端要开压缩，若把"反射失败"当成"阈值 -1（禁用）"，一次字段改名就会让
+     * 全体模组客户端的 zstd 静默失效，而日志里只有一行 debug。</p>
+     */
     private static int readThresholdValue(Object packet) {
         try {
             for (java.lang.reflect.Method m : packet.getClass().getMethods()) {
@@ -849,9 +859,9 @@ public class ZstdHijacker extends ChannelDuplexHandler {
                 }
             }
         } catch (Throwable ignored) {
-            // 反射不可用：按禁用处理（退回明文最安全）
+            // 反射不可用：按"未知"处理，继续协商
         }
-        return -1;
+        return UNKNOWN_THRESHOLD;
     }
 
     /** 线上字典帧：{@code [int crc32][int len][bytes]}；crc 必须与字典 id 同源。 */
