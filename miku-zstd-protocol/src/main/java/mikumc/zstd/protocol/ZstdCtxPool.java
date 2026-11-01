@@ -38,15 +38,22 @@ public final class ZstdCtxPool {
     private ZstdCtxPool() {
     }
 
-    /** 借一个压缩上下文（池空则新建并设定等级）。 */
+    /**
+     * 借一个压缩上下文。
+     *
+     * <p>⚠️ 等级必须<b>每次</b>设置：{@link #returnCompress} 里的 {@code reset()} 会把
+     * 参数一起清回默认值（见类注释），池命中时若不重设，配置里的 level 就只在"池恰好为空"
+     * 的头几条连接上生效——之后全部按 zstd 默认的 3 跑，改大改小都看不出来。</p>
+     */
     public static ZstdCompressCtx borrowCompress(int level) {
+        ZstdCompressCtx c;
         synchronized (COMPRESS) {
-            ZstdCompressCtx pooled = COMPRESS.pollFirst();
-            if (pooled != null) {
-                return pooled;
-            }
+            c = COMPRESS.pollFirst();
         }
-        return new ZstdCompressCtx().setLevel(level);
+        if (c == null) {
+            c = new ZstdCompressCtx();
+        }
+        return c.setLevel(level);
     }
 
     /** 归还压缩上下文：先 reset，再入池；池满或已停用则 close。 */

@@ -63,7 +63,7 @@ public final class ZstdClientActivation {
      */
     public static void activate(Channel channel) {
         if (channel == null) return;
-        channel.eventLoop().execute(() -> activateInEventLoop(channel, false, 0));
+        channel.eventLoop().execute(() -> activateInEventLoop(channel, false));
     }
 
     /**
@@ -101,15 +101,12 @@ public final class ZstdClientActivation {
     /** 摘掉 zstd 编解码器并回到 PLAIN（明文）。 */
     private static void deactivateQuietly(Channel channel) {
         if (!channel.isActive()) return;
-        ChannelPipeline p = channel.pipeline();
-        for (String name : new String[]{"zstd_encoder", "zstd_decoder", "zstd_switch_sniffer"}) {
-            if (p.get(name) != null) {
-                p.remove(name);
-            }
-        }
+        boolean changed = deactivateIfStale(channel);
         channel.attr(ACTIVATED).set(Boolean.FALSE);
-        channel.attr(ZstdChannelManager.ZSTD_STATE).set(ZstdChannelManager.TransportState.PLAIN);
-        LOGGER.info("[Zstd] 压缩被对端禁用（threshold<0）——客户端退回明文; pipeline={}", p.names());
+        if (changed) {
+            LOGGER.info("[Zstd] 压缩被对端禁用（threshold<0）——客户端退回明文; pipeline={}",
+                    channel.pipeline().names());
+        }
     }
 
     public static void prepareForSwitch(Channel channel) {
@@ -129,18 +126,18 @@ public final class ZstdClientActivation {
     }
 
     private static void prepareNow(Channel channel) {
+        if (!channel.isActive()) return;
         {
-            if (!channel.isActive()) return;
             // ⚠️ 必须<b>立即切换</b>，不能等服务端的 zstd:switch：
             // 服务端在收到协商应答后就激活并按 zstd 发帧；若本端等到 switch 才切，
             // 只要那条 switch 帧没被识别（嗅探器锚点缺失、第三方压缩层、旧版服务端
             // 不发 switch），本端就会回 success=false 并停在原版 ——
             // 服务端此时已提交到 zstd，只能"放行扣包"，两边帧格式对不上即断连。
             // 实测（Velocity + 5.0.6 客户端）就是这个路径。
-            if (deactivateIfStale(channel)) return;
+            // 陈旧处理（去激活、摘原版 handler）由 activateInEventLoop 自己完成，
+            // 这里重复一遍只会让两处逻辑必须永久手工对齐。
             ChannelPipeline p = channel.pipeline();
-            removeStaleVanillaHandlers(p);
-            activateInEventLoop(channel, false, 0);
+            activateInEventLoop(channel, false);
             // 切换嗅探器仍要装：它负责把"已切换"的确认（带魔数）回给服务端的闸门，
             // 让服务端立刻放行扣住的登录包，而不是干等 5 秒超时。
             installSwitchSniffer(p);
@@ -172,7 +169,7 @@ public final class ZstdClientActivation {
      */
     public static void activateAfterQueryResponseSent(Channel channel) {
         if (channel == null) return;
-        channel.eventLoop().execute(() -> activateInEventLoop(channel, true, 0));
+        channel.eventLoop().execute(() -> activateInEventLoop(channel, true));
     }
 
     /**
@@ -189,7 +186,7 @@ public final class ZstdClientActivation {
     public static void activateAndConfirm(Channel channel, int txId) {
         if (channel == null) return;
         channel.eventLoop().execute(() -> {
-            activateInEventLoop(channel, false, txId);
+            activateInEventLoop(channel, false);
             boolean onZstd = Boolean.TRUE.equals(channel.attr(ACTIVATED).get())
                     && channel.pipeline().get("zstd_decoder") != null;
             // ⚠️ 无论能否切换，都必须回一条应答：
@@ -297,7 +294,7 @@ public final class ZstdClientActivation {
         }
     }
 
-    private static void activateInEventLoop(Channel channel, boolean quiet, int confirmTxId) {
+    private static void activateInEventLoop(Channel channel, boolean quiet) {
         if (!channel.isActive()) return;
         ChannelPipeline p = channel.pipeline();
 

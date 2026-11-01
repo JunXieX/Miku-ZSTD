@@ -172,6 +172,12 @@ public final class ZstdPaperTrainer {
         if (t != null) t.addBatch(raw, length);
     }
 
+    /** 编码侧是否还需要样本（未启用 / 环已满 时为 false，调用方据此跳过整批拷贝）。 */
+    public static boolean wantsEncoderSample() {
+        ZstdPaperTrainer t = encoderInstance;
+        return t != null && !t.ringFull;
+    }
+
     /** 批量提交一帧（解码方向）。 */
     public static void submitDecoderBatch(byte[] raw, int length) {
         ZstdPaperTrainer t = decoderInstance;

@@ -131,9 +131,16 @@ public class ZstdChannelManager {
      * 压缩方向是否已装载字典。编码器据此选择"小包跳过压缩"的阈值：
      * 实测无字典时 48B 以下压缩反而膨胀，有字典时 24B 起才有收益（见 ZstdConfig）。
      */
-    /** 当前装载的压缩字典（分块并行给临时 ctx 用）；未装载返回 null。 */
+    /**
+     * 当前装载的压缩字典（分块并行的临时 ctx 用）；未装载返回 null。
+     *
+     * <p>⚠️ 客户端的方向字段名与服务端相反：{@code encoderDictEntry} 装的是对端的
+     * <b>解压</b>字典（客户端"编码"时要用它来压缩，但条目里只有解压对象），真正可用于
+     * 压缩的是 {@code decoderDictEntry}。照抄服务端实现会恒返回 null，
+     * 表现为 ≥512KB 的帧走分块时不绑字典、压缩率比同连接的小包还差。</p>
+     */
     public com.github.luben.zstd.ZstdDictCompress compressDict() {
-        ZstdDictRegistry.Entry e = encoderDictEntry;
+        ZstdDictRegistry.Entry e = decoderDictEntry;
         return e == null ? null : e.compressDict();
     }
 

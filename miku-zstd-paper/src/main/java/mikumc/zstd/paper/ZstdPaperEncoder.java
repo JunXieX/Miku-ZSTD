@@ -80,7 +80,11 @@ public class ZstdPaperEncoder extends ZstdBatchEncoderBase {
      */
     @Override
     protected void onRawBatch(io.netty.buffer.ByteBuf raw, int length) {
-        // 训练器按 byte[] 处理，这里复制一份：只有开启训练/采样时才走到本方法
+        // ⚠️ 先问训练器要不要，再决定拷不拷：这份拷贝跑在 event loop 上，
+        // 默认 2ms 一批、每条连接数百批/秒，环满之后全额白做。
+        if (!ZstdPaperTrainer.wantsEncoderSample()) {
+            return;
+        }
         byte[] copy = new byte[length];
         raw.getBytes(raw.readerIndex(), copy, 0, length);
         ZstdPaperTrainer.submitEncoderBatch(copy, length);
