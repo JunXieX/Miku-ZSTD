@@ -334,11 +334,18 @@ class ProtocolUnitsTest {
     // ────────────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("字典采纳：首部字典只要不劣化就采纳；替换字典才看阈值")
+    @DisplayName("字典采纳：首部字典给 -2% 容差；替换字典才看阈值")
     void dictAdoption() {
         // 首部字典：改进 0.1% 也应采纳（否则小包永远压不动，整条机制成死代码）
         assertTrue(ZstdDictAdoption.shouldAdoptDict(true, 0.001, 0.01));
-        assertFalse(ZstdDictAdoption.shouldAdoptDict(true, 0.0, 0.01), "不劣化=严格大于 0");
+        // ⚠️ 5.0.40 起改为容差判定：字典的净收益结构性地落在 ±2% 噪声带里
+        //（小包 +10%、中包 -1%，而小包只占总字节的百分之几），用 ">0" 当门槛会让
+        // 真实服务器上的字典<em>永远启用不了</em>——实测有服攒到 2000 样本 / 23.8MB 仍是 dictSize=0。
+        assertTrue(ZstdDictAdoption.shouldAdoptDict(true, 0.0, 0.01), "恰好 0 必须采纳");
+        assertTrue(ZstdDictAdoption.shouldAdoptDict(true, -0.01, 0.01), "-1% 仍在容差内");
+        assertTrue(ZstdDictAdoption.shouldAdoptDict(true, ZstdDictAdoption.FIRST_DICT_FLOOR, 0.01),
+                "容差边界必须采纳");
+        assertFalse(ZstdDictAdoption.shouldAdoptDict(true, -0.03, 0.01), "-3% 超出容差，拒绝");
         assertFalse(ZstdDictAdoption.shouldAdoptDict(true, -0.2, 0.01));
 
         // 替换字典：必须达到阈值
