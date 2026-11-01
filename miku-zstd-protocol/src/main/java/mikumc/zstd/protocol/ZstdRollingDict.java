@@ -61,11 +61,16 @@ public final class ZstdRollingDict {
     /**
      * 多少字节喂入后重建一次字典。
      *
-     * <p>取 256KB：滑窗被填满后，每 256KB 才换一次字典 —— 换得太勤，{@code loadDict} 与
-     * 字典生效初期的匹配率损失会吃掉收益；换得太懒，滑窗里早就全是"很久以前"的数据。
-     * 256KB ≈ 200~2000 帧，对每条连接都是秒级，足够跟上内容变化。</p>
+     * <p>⚠️ 从 256KB 提到 <b>1MB</b>（5.0.38 实测决定）：256KB 时进服首分钟出站 33.7MB →
+     * <b>每秒 2.5 次</b>重建，每次要分配 64KB 并 {@code loadDict}（zstd 内部再拷一份），
+     * 全部发生在 event loop 上；100 人规模约等于 32MB/s 的额外内存搬运 + 16MB/s 垃圾，
+     * 而压缩率只多拿一个百分点级别。1MB 把重建频率降到 1/4，历史最多"老"1MB
+     * （相对 64KB 的窗口仍然新鲜），代价可忽略。</p>
+     *
+     * <p>换得太勤，{@code loadDict} 与字典生效初期的匹配率损失会吃掉收益；换得太懒，
+     * 滑窗里就全是"很久以前"的数据。1MB ≈ 800~8000 帧，对每条连接仍是秒级。</p>
      */
-    public static final int ROTATE_AFTER_BYTES = 256 * 1024;
+    public static final int ROTATE_AFTER_BYTES = 1024 * 1024;
 
     /** 滑窗本体，按时间顺序排列（{@code [0, fill)} 有效，不回绕）。 */
     private final byte[] ring = new byte[DICT_BYTES];

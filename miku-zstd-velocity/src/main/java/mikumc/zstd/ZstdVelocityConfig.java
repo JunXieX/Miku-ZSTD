@@ -107,7 +107,10 @@ public class ZstdVelocityConfig {
         this.trainerMaxSamples = clamp(getInt(t, "max_samples", 10000), 16, 10_000_000);
         // min_samples 不能超过环容量，否则训练永远不会触发（环已满也到不了门槛）
         this.trainerMinSamples = clamp(getInt(t, "min_samples", 2000), 1, this.trainerMaxSamples);
-        this.trainerCooldownMs = Math.max(0L, getLong(t, "cooldown_ms", 300000));
+        // ⚠️ 5.0.38 起默认 <b>30 分钟</b>（原 5 分钟）：实机日志显示字典已收敛——连续几轮训出来的
+        // 候选都比现有字典差 1.3%（按字节加权），每 5 分钟拿 30MB 样本训一遍等于纯烧 CPU。
+        // 想彻底停掉就把这里设成 86400000（一天一次）；想立刻重训可以临时改小。
+        this.trainerCooldownMs = Math.max(0L, getLong(t, "cooldown_ms", 1_800_000));
         this.trainerFallbackTimeoutMs = Math.max(1000L, getLong(t, "fallback_timeout_ms", 600000));
         this.trainerDictMaxBytes = clamp(getInt(t, "dict_max_bytes", 131072), 1024,
                 mikumc.zstd.protocol.ZstdVarInts.MAX_DICT_BYTES_PER_DIRECTION);
@@ -293,7 +296,9 @@ public class ZstdVelocityConfig {
                       min_samples: 2000
 
                       # 两次训练之间的最小间隔（毫秒），默认 5 分钟
-                      cooldown_ms: 300000
+                      # 5.0.38 起默认 30 分钟（原 5 分钟）：实测字典已收敛，周期训练不再产出。
+                      # 彻底停用可设 86400000（一天一次）。
+                      cooldown_ms: 1800000
 
                       # 兜底超时（毫秒）：达到 min_samples 后等待这么久即强制训练
                       fallback_timeout_ms: 600000

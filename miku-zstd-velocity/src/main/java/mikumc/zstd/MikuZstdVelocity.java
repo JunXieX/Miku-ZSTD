@@ -169,8 +169,10 @@ public class MikuZstdVelocity {
             // ⚠️ 必须是 debug：这条路径是**每个 zstd 客户端每次进服都会命中**的正常流程，
             // 用 INFO 会让服务器日志被"每人一行"刷满（200 人在线就是 200 行噪音），
             // 而它本身不携带任何需要人工介入的信息 —— 真正值得 INFO 的是激活成功那一行。
-            logger.debug("[Zstd] Connection already negotiated by sniffer: {}",
-                    inbound.getRawVirtualHost().orElse(""));
+            // 主机名末尾是 {@code  ZSTD } 标记，直接打印会在日志里渲染成几个空格，
+            // 看起来像"配置里多了空格"。转义一下，观感才和真实字节一致。
+            logger.debug("[Zstd] Connection already negotiated by sniffer: host={}",
+                    inbound.getRawVirtualHost().orElse("").replace("\u0000", "\\0"));
             return;
         }
 

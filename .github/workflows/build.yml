@@ -28,6 +28,9 @@ jobs:
           # 本模块的 test 源集上，它保护的是跨端帧格式的字节对称性——
           # 那类错误不会编译失败，只会让两端静默错位。测试不过就不该产出产物。
           gradle test shadowJar --no-daemon
+      - name: Show dict ablation report
+        if: always()
+        run: cat miku-zstd-velocity/build/ablation-report.txt || echo "(no report)"
       - uses: actions/upload-artifact@v4
         with:
           name: Miku-ZSTD-Velocity

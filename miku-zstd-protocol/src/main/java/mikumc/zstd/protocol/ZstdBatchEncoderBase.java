@@ -641,8 +641,11 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
         // 此时 24B 起压缩确实有收益——按无字典的 48B 判会白丢这一段（见配置里的实测值）。
         // ⚠️ 直存帧一帧一包、不带内层长度前缀（见类注释的"帧格式"一节），所以这里
         // 不能把上面那份带长度前缀的拼接缓冲直接当一个帧发出去。
-        if (rawTotal < Math.max(MIN_STORED_THRESHOLD,
-                skipCompressThreshold(rolling.activeDict() != null || hasCompressDict()))) {
+        // ⚠️ 阈值只认【带熵表的静态字典】，滚动历史不算：那个 24B 是拿训练字典实测出来的
+        //（16B 仍膨胀到 103.5%，靠字典预置的 Huffman/FSE 表）；滚动历史是 raw content，
+        // 只有内容匹配、没有熵表，24~47B 的包压出来照样膨胀 —— 把它算作"有字典"等于每帧
+        // 白跑一次 zstd（字节不会变差，压不动会退回直存，但 CPU 是白花的）。
+        if (rawTotal < Math.max(MIN_STORED_THRESHOLD, skipCompressThreshold(hasCompressDict()))) {
             try {
                 writeStoredFrames(ctx, raw, rawTotal, withBodyLen, promises);
             } catch (Throwable t) {
@@ -1009,7 +1012,13 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
             c.setDictID(false);
         }
         appliedRollingDict = dict;
-        LOGGER.debug("[Zstd] 滚动历史字典已更新 gen={} ({}B)", rolling.generation(), dict.length);
+        // ⚠️ 必须抽样打印：满速连接每 MB 一次轮换、约 2~3 次/秒，逐次打会把 debug 日志刷满
+        //（实测 40 秒 99 行，别人什么都看不见）。首代必打（确认识别到滚动历史已生效），
+        // 之后每 64 代一行。
+        int gen = rolling.generation();
+        if (gen == 1 || gen % 64 == 0) {
+            LOGGER.debug("[Zstd] 滚动历史字典已更新 gen={} ({}B)", gen, dict.length);
+        }
     }
 
     /** 写出帧并完成这一批的 promise。 */

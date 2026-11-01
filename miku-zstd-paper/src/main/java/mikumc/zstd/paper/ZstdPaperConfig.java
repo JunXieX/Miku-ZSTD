@@ -69,7 +69,9 @@ public class ZstdPaperConfig {
         Map<String, Object> t = section(map, "trainer");
         this.trainerMaxSamples = clamp(getInt(t, "max_samples", 10000), 16, 10_000_000);
         this.trainerMinSamples = clamp(getInt(t, "min_samples", 2000), 1, this.trainerMaxSamples);
-        this.trainerCooldownMs = Math.max(0L, getLong(t, "cooldown_ms", 300000));
+        // ⚠️ 5.0.38 起默认 30 分钟（原 5 分钟）：实机日志显示字典已收敛，每 5 分钟拿 30MB 样本
+        // 训一遍是纯开销。彻底停用可设 86400000。
+        this.trainerCooldownMs = Math.max(0L, getLong(t, "cooldown_ms", 1_800_000));
         this.trainerFallbackTimeoutMs = Math.max(1000L, getLong(t, "fallback_timeout_ms", 600000));
         // 上限取 MAX_DICT_BYTES_PER_DIRECTION（约 1000KB），不是 1MB：
         //   · 客户端 loadOne 会拒绝超过 0x100000 的字典并回"不可用"；
@@ -243,7 +245,9 @@ public class ZstdPaperConfig {
                       min_samples: 2000
 
                       # 两次训练之间的最小间隔（毫秒），默认 5 分钟
-                      cooldown_ms: 300000
+                      # 5.0.38 起默认 30 分钟（原 5 分钟）：实测字典已收敛，周期训练不再产出。
+                      # 彻底停用可设 86400000（一天一次）。
+                      cooldown_ms: 1800000
 
                       # 兜底超时（毫秒）：达到 min_samples 后等待这么久即强制训练
                       fallback_timeout_ms: 600000
