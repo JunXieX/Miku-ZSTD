@@ -611,13 +611,17 @@ public class ZstdSampleTrainer {
     private EvalResult evaluate(List<byte[]> samples, byte[] newDict) {
         ZstdCompressCtx oldCtx = null;
         ZstdCompressCtx newCtx = null;
+        // 基线：完全不装字典。用来回答"现有字典到底还值多少"——这是 evaluate 唯一能给出的
+        // <b>绝对</b>口径（候选 vs 现有 只是相对值，会让人误以为"字典没用了"）。
+        ZstdCompressCtx baseCtx = null;
         ZstdDictCompress oldDictObj = null;
         ZstdDictCompress newDictObj = null;
         try {
             byte[] oldDict = currentDict;
             oldCtx = new ZstdCompressCtx();
             newCtx = new ZstdCompressCtx();
-            for (ZstdCompressCtx c : new ZstdCompressCtx[]{oldCtx, newCtx}) {
+            baseCtx = new ZstdCompressCtx();
+            for (ZstdCompressCtx c : new ZstdCompressCtx[]{oldCtx, newCtx, baseCtx}) {
                 c.setLevel(runtimeLevel);
                 c.setMagicless(true);
                 c.setContentSize(false);
@@ -634,6 +638,7 @@ public class ZstdSampleTrainer {
 
             long oldTotal = 0;
             long newTotal = 0;
+            long baseTotal = 0;
             long[] oldBand = new long[3];
             long[] newBand = new long[3];
             int testCount = Math.min(samples.size(), 500);
@@ -642,10 +647,19 @@ public class ZstdSampleTrainer {
                 int band = bandOf(s.length);
                 int o = oldCtx.compress(s).length;
                 int n = newCtx.compress(s).length;
+                int b = baseCtx.compress(s).length;
                 oldTotal += o;
                 newTotal += n;
+                baseTotal += b;
                 oldBand[band] += o;
                 newBand[band] += n;
+            }
+
+            // 「现有字典 vs 无字典」——线上排查"字典还有没有用"就看这一行。
+            if (baseTotal > 0) {
+                LOGGER.debug("[Zstd] {} dict-vs-no-dict: {} (现有 {}B / 无字典 {}B，样本 {} 个)",
+                        name, pct(1.0 - (double) oldTotal / baseTotal),
+                        oldTotal, baseTotal, testCount);
             }
 
             if (oldTotal == 0) return EvalResult.none();
@@ -660,6 +674,7 @@ public class ZstdSampleTrainer {
         } finally {
             if (oldCtx != null) oldCtx.close();
             if (newCtx != null) newCtx.close();
+            if (baseCtx != null) baseCtx.close();
             if (oldDictObj != null) oldDictObj.close();
             if (newDictObj != null) newDictObj.close();
         }
