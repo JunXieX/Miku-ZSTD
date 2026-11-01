@@ -530,7 +530,7 @@ class FrameLayoutTest {
         frame.writeBytes(packet);
         in.writeInbound(frame);
 
-        List<byte[]> got = drainInbound(in);
+        List<byte[]> got = drainInboundAfterDecompress(in);
         assertEquals(1, got.size(), "必须还原成 1 个包");
         assertArrayEquals(packet, got.get(0), "内容必须与原版包完全一致");
         assertTrue(in.isOpen(), "原版帧不得关闭连接");
@@ -570,7 +570,7 @@ class FrameLayoutTest {
         ZstdVarInts.write(vf, 0);
         vf.writeBytes(vanilla);
         in.writeInbound(vf);
-        assertArrayEquals(vanilla, drainInbound(in).get(0), "窗口内必须当作原版帧");
+        assertArrayEquals(vanilla, drainInboundAfterDecompress(in).get(0), "窗口内必须当作原版帧");
 
         // 客户端确认后：同样的字节必须被解释成同一个包（形状无歧义）
         decoder.confirm();
@@ -578,7 +578,7 @@ class FrameLayoutTest {
         ZstdVarInts.write(zf, 0);
         zf.writeBytes(vanilla);
         in.writeInbound(zf);
-        List<byte[]> got = drainInbound(in);
+        List<byte[]> got = drainInboundAfterDecompress(in);
         assertEquals(1, got.size(), "确认后必须同样解释成 1 个包");
         assertArrayEquals(vanilla, got.get(0), "两种解释必须逐字节一致");
         assertTrue(in.isOpen(), "合法帧不得关闭连接");
@@ -603,7 +603,7 @@ class FrameLayoutTest {
         ZstdVarInts.write(frame, 0);
         in.writeInbound(frame);
 
-        List<byte[]> got = drainInbound(in);
+        List<byte[]> got = drainInboundAfterDecompress(in);
         assertEquals(1, got.size(), "混批帧只能还原出压缩的那 1 个包");
         assertArrayEquals(packet, got.get(0), "压缩帧内容必须与原版包完全一致");
         assertTrue(in.isOpen(), "合法原版帧不得关闭连接");
@@ -627,7 +627,7 @@ class FrameLayoutTest {
         frame.writeBytes(packet);
         in.writeInbound(frame);
 
-        List<byte[]> got = drainInbound(in);
+        List<byte[]> got = drainInboundAfterDecompress(in);
         assertEquals(1, got.size(), "必须还原成 1 个包");
         assertArrayEquals(packet, got.get(0), "必须整包原样下传（含包 id）");
         assertTrue(in.isOpen(), "不得关闭连接");
@@ -691,7 +691,7 @@ class FrameLayoutTest {
         frame.writeBytes(deflated);
         in.writeInbound(frame);
 
-        List<byte[]> got = drainInbound(in);
+        List<byte[]> got = drainInboundAfterDecompress(in);
         assertEquals(1, got.size(), "必须还原成 1 个包（不得按 zstd 切包）");
         assertArrayEquals(packet, got.get(0), "内容必须与原版包完全一致");
         assertTrue(in.isOpen(), "合法原版帧不得关闭连接");
@@ -1142,19 +1142,45 @@ class FrameLayoutTest {
     /**
      * 取出解码器下传的包。
      *
-     * <p>⚠️ 协议 v7 起解码器<b>不再</b>替换原版 {@code decompress}，它发出的是"原版未压缩帧"
-     * {@code [varint dataLength = 0][packet]}（让下游原版解压器原样透传）。这里把那 1 字节
-     * 前缀剥掉，断言的就是"真实到达包解码器的包体"。</p>
+     * <p>v7 起解码器<b>跳过</b>原版 {@code decompress}（从它的 context 往下 fire），
+     * 所以这里收到的就是<b>裸包</b>（包 id + 包体），不带任何前缀。</p>
+     *
+     * <p>⚠️ 早先的实现会给每个包补 {@code [0]} 前缀让原版解压器透传；那条路在装了
+     * <b>Krypton</b> 的客户端上会触发它"未压缩帧必须短于阈值"的硬校验而断连
+     * （实测 2026-11-01），所以别再把它写回来。</p>
      */
+    /**
+     * 取出"<b>再经过原版 {@code decompress}</b> 之后"的包——只用于握手窗口内的用例。
+     *
+     * <p>窗口内解码器不参与帧解析：未压缩帧被原样下传（{@code [0][packet]}），
+     * 压缩帧由解码器解出来（裸包）。真实管线里这两种形态都会被原版解压器归一化成裸包，
+     * 所以这里补上那一步：首字节是 0 就跳过它。</p>
+     */
+    private static List<byte[]> drainInboundAfterDecompress(EmbeddedChannel in) {
+        List<byte[]> out = new ArrayList<>();
+        Object o;
+        while ((o = in.readInbound()) != null) {
+            ByteBuf b = (ByteBuf) o;
+            try {
+                if (b.isReadable() && b.getByte(b.readerIndex()) == 0) {
+                    b.skipBytes(1); // 原版未压缩帧的 dataLength = 0
+                }
+                byte[] data = new byte[b.readableBytes()];
+                b.getBytes(b.readerIndex(), data);
+                out.add(data);
+            } finally {
+                b.release();
+            }
+        }
+        return out;
+    }
+
     private static List<byte[]> drainInbound(EmbeddedChannel in) {
         List<byte[]> out = new ArrayList<>();
         Object o;
         while ((o = in.readInbound()) != null) {
             ByteBuf b = (ByteBuf) o;
             try {
-                int dataLength = ZstdVarInts.tryRead(b, ZstdVarInts.DEFAULT_MAX_VALUE);
-                assertEquals(0, dataLength,
-                        "解码器下传的必须是原版未压缩帧（dataLength=0），否则下游解压器会再解一次");
                 byte[] data = new byte[b.readableBytes()];
                 b.getBytes(b.readerIndex(), data);
                 out.add(data);
