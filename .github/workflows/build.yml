@@ -364,7 +364,12 @@ jobs:
           log-player-connections = true
           log-command-executions = false
 
+          # 必须注册一个服务器：Velocity 会因为"fallback 服务器未注册"直接拒绝启动。
+          # 本用例只跑到登录完成（LoginSuccess 在选服之前就发出），所以这里给一个必然连不上的
+          # 占位后端即可 —— 客户端在收到第一个 zstd 帧时就退出，不会走到选服。
           [servers]
+          lobby = "127.0.0.1:25601"
+          try = ["lobby"]
 
           [forced-hosts]
 
