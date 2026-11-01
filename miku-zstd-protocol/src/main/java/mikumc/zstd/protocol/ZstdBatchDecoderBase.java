@@ -377,7 +377,11 @@ public abstract class ZstdBatchDecoderBase extends ByteToMessageDecoder {
                 // 之所以一直没炸，是因为窗口内客户端几乎不发包（闸门扣着 LoginSuccess），属于
                 // "靠时序侥幸"。补回 1 字节前缀才是与原版逐字节同形，也才会被 Krypton 接受
                 // （它校验的是 actualUncompressedSize < threshold，而不是"不许有前缀"）。
-                ctx.fireChannelRead(Unpooled.wrappedBuffer(new byte[]{0}, in.readRetainedSlice(remaining)));
+                ByteBuf restored = ctx.alloc().buffer(1 + remaining);
+                restored.writeByte(0);
+                restored.writeBytes(in, in.readerIndex(), remaining);
+                in.skipBytes(remaining);
+                ctx.fireChannelRead(restored);
                 return;
             }
 
