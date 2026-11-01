@@ -932,9 +932,11 @@ class FrameLayoutTest {
         assertNotNull(frame, "压缩帧应能产出");
 
         ByteBuf probe = frame.duplicate();
+        int bodyLen = ZstdVarInts.tryRead(probe, ZstdVarInts.DEFAULT_MAX_VALUE);
+        assertEquals(probe.readableBytes(), bodyLen, "bodyLen 必须等于其后剩余字节数");
         int rawSize = ZstdVarInts.tryRead(probe, ZstdVarInts.DEFAULT_MAX_VALUE);
         assertTrue(rawSize > 0, "用例前提：产出的必须是压缩帧");
-        int genIndex = probe.readerIndex();
+        int genIndex = probe.readerIndex(); // dictGen 的绝对位置
         assertEquals(0, ZstdVarInts.tryRead(probe, 1 << 20), "编码器应写 dictGen=0");
 
         ByteBuf tampered = frame.retainedDuplicate();
@@ -992,6 +994,8 @@ class FrameLayoutTest {
         ByteBuf frame = readFrame(ch, 5000);
         assertNotNull(frame, "flush 必须成帧");
         ByteBuf probe = frame.duplicate();
+        int bodyLen = ZstdVarInts.tryRead(probe, ZstdVarInts.DEFAULT_MAX_VALUE);
+        assertEquals(probe.readableBytes(), bodyLen, "bodyLen 必须等于其后剩余字节数");
         int rawSize = ZstdVarInts.tryRead(probe, ZstdVarInts.DEFAULT_MAX_VALUE);
         assertTrue(rawSize > 0, "三包应合成一帧压缩");
         assertEquals(1, encoder.frames.size(), "一次 flush 只应产出一帧");
@@ -1071,6 +1075,9 @@ class FrameLayoutTest {
         ByteBuf frame = readFrame(ch);
         assertNotNull(frame, "应产出一帧");
         ByteBuf probe = frame.duplicate();
+        // Velocity 形态带外层 bodyLen，必须先剥掉它才能真正读到 rawSize
+        int bodyLen = ZstdVarInts.tryRead(probe, ZstdVarInts.DEFAULT_MAX_VALUE);
+        assertEquals(probe.readableBytes(), bodyLen, "bodyLen 必须等于其后剩余字节数");
         assertEquals(0, ZstdVarInts.tryRead(probe, ZstdVarInts.DEFAULT_MAX_VALUE),
                 "低于 16B 地板时必须直存（rawSize=0），不得被压成 zstd 帧");
         assertFalse(encoder.lastCompressed, "地板之下的批次不得走压缩");
