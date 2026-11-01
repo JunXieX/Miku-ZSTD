@@ -445,7 +445,8 @@ public final class ZstdPaperTrainer {
                     boolean accept = shouldAdoptDict(firstDict, ev.overall, adoptThreshold);
                     if (!accept) {
                         LOGGER.debug("[Zstd] {} 改进不足: {}（阈值 {}，分档：{}）", name, pct(ev.overall),
-                                firstDict ? "首部字典需>0" : pct(adoptThreshold), ev.bandSummary());
+                                firstDict ? "首部字典需>=" + pct(ZstdDictAdoption.FIRST_DICT_FLOOR)
+                                : pct(adoptThreshold), ev.bandSummary());
                     } else {
                         synchronized (this) {
                             currentDict = newDict;
@@ -456,7 +457,7 @@ public final class ZstdPaperTrainer {
                         // DEBUG：字典换代是正常运转，不进控制台（要看状态用 /mikuzstd status）
                         LOGGER.debug("[Zstd] {} 采纳新字典 id={} size={}B 改进={}{} 样本={}（{}B）分档：{}",
                                 name, dictId, newDict.length, pct(ev.overall),
-                                firstDict ? "（首部字典）" : "",
+                                firstDict ? "（首部字典，容差 -2% 内即采纳）" : "",
                                 snapshot.size(), totalBytes, ev.bandSummary());
                     }
                 }

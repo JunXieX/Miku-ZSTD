@@ -24,6 +24,14 @@ public final class ZstdDictAdoption {
     /** 分档数量：小 / 中 / 大 */
     public static final int BANDS = 3;
 
+    /**
+     * 首部字典允许的最大"劣化"（-2%）：低于它就认为候选有问题、拒绝启用。
+     *
+     * <p>见 {@link #shouldAdoptDict} 的说明——字典的净收益天然落在 ±2% 的噪声带里，
+     * 用 0 当门槛会让整条字典机制在真实流量上永远启动不了。</p>
+     */
+    public static final double FIRST_DICT_FLOOR = -0.02;
+
     private ZstdDictAdoption() {
     }
 
@@ -61,12 +69,25 @@ public final class ZstdDictAdoption {
      *
      * <p>替换字典仍按阈值把关：避免频繁换字典导致连接侧反复重建字典对象。</p>
      *
+     * <h2>为什么首部字典的门槛从 ">0" 改成 ">= -2%"（5.0.40）</h2>
+     * <p>">0" 在真实流量上会<b>死锁</b>：字典的收益结构是"小包大幅正、中包小幅负"，
+     * 而小包只占总字节的百分之几 —— 按总字节加权后 overall 经常落在 ±2% 的噪声带里，
+     * 一旦第一轮算出 ≤0 就被拒，{@code currentDict} 永远是 null，之后每轮仍按首部字典判，
+     * <b>字典永远启用不了</b>（实测：某服攒到 2000 样本 / 23.8MB，{@code dictSize} 仍为 0）。</p>
+     *
+     * <p>而首部字典的价值本来就不该用总字节衡量：它让小包从"压缩后膨胀、只能直存"
+     * 变成"可压缩"，这是<b>结构性</b>的。所以改成"只要不是明显更差就采纳"，
+     * 让字典有机会上线；真正的把关交给后续的替换阈值（避免频繁换代导致连接侧重建）。</p>
+     *
+     * <p>容差取 −2%：正常结构下 overall 就在 ±2% 以内；更差说明候选有问题
+     * （样本不足 / 训练异常），那时拒绝并留日志才是对的。</p>
+     *
      * @param firstDict   当前还没有字典
      * @param improvement 整体改进率（首部字典时即"相对无字典"）
      * @param threshold   替换字典所需的改进率（配置项）
      */
     public static boolean shouldAdoptDict(boolean firstDict, double improvement, double threshold) {
-        return firstDict ? improvement > 0 : improvement >= threshold;
+        return firstDict ? improvement >= FIRST_DICT_FLOOR : improvement >= threshold;
     }
 
     /** 评估结果：整体改进率 + 三个包长档的改进率。 */

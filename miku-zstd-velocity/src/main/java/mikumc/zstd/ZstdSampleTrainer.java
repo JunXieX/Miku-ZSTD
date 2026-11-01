@@ -24,6 +24,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import mikumc.zstd.protocol.ZstdDictId;
 import mikumc.zstd.protocol.ZstdVarInts;
 
+import mikumc.zstd.protocol.ZstdDictAdoption;
 import mikumc.zstd.protocol.ZstdDictAdoption.EvalResult;
 
 import static mikumc.zstd.protocol.ZstdDictAdoption.bandOf;
@@ -575,7 +576,9 @@ public class ZstdSampleTrainer {
                     boolean accept = shouldAdoptDict(firstDict, ev.overall, adoptRatioImprovement);
                     if (!accept) {
                         LOGGER.debug("[Zstd] {} dict insufficient improvement: {} (阈值 {}，分档：{})",
-                                name, pct(ev.overall), firstDict ? "首部字典需>0" : pct(adoptRatioImprovement),
+                                name, pct(ev.overall),
+                        firstDict ? "首部字典需>=" + pct(ZstdDictAdoption.FIRST_DICT_FLOOR)
+                                : pct(adoptRatioImprovement),
                                 ev.bandSummary());
                     } else {
                         synchronized (this) {
@@ -587,7 +590,7 @@ public class ZstdSampleTrainer {
                         // DEBUG：字典换代是正常运转，不进控制台（要看状态用 /mikuzstd status）
                         LOGGER.debug("[Zstd] {} dict adopted: id={} size={}B improvement={}{} samples={}（{}B）分档：{}",
                                 name, dictId, newDict.length, pct(ev.overall),
-                                firstDict ? "（首部字典，只要不劣化即采纳）" : "",
+                                firstDict ? "（首部字典，容差 -2% 内即采纳）" : "",
                                 snapshot.size(), totalBytes, ev.bandSummary());
                     }
                 }
