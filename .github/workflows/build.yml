@@ -99,6 +99,9 @@ jobs:
       matrix:
         threshold: [0, 256]
         negotiate: [11, 10]
+        include:
+          - threshold: -1
+            negotiate: 11
     needs: [paper]
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -145,13 +148,27 @@ jobs:
         run: |
           set -euo pipefail
           cd server
-          nohup java -Xms768M -Xmx1536M -jar ../paper.jar --nogui > server.log 2>&1 &
+          mkfifo console.pipe
+          nohup bash -c 'exec 3<>console.pipe; exec java -Dterminal.jline=false -Dterminal.ansi=false -Xms768M -Xmx1536M -jar ../paper.jar --nogui <&3' > server.log 2>&1 &
           echo $! > server.pid
           for i in $(seq 1 180); do
             if grep -q 'Done (' server.log; then echo "server up in ${i}s"; exit 0; fi
             sleep 1
           done
           echo "server did not start"; tail -80 server.log; exit 1
+      - name: Verify backend bar command
+        run: |
+          set -euo pipefail
+          printf 'mikuzstd bar\n' > server/console.pipe
+          for i in $(seq 1 15); do
+            if grep -q "BossBar 需要由玩家执行" server/server.log; then
+              echo "bar command is registered and executable"
+              exit 0
+            fi
+            sleep 1
+          done
+          tail -60 server/server.log
+          exit 1
       - name: Run protocol client
         run: |
           set -euo pipefail
@@ -165,8 +182,9 @@ jobs:
           PROTOCOL = 776
           NEGOTIATE = 11
           CLIENT_NEGOTIATE = int("${{ matrix.negotiate }}")
-          expected_zstd = CLIENT_NEGOTIATE == NEGOTIATE
-          required = ["set_compression", "negotiate"] + (["switch", "frame"] if expected_zstd else ["vanilla_login"])
+          compression_enabled = int("${{ matrix.threshold }}") >= 0
+          expected_zstd = compression_enabled and CLIENT_NEGOTIATE == NEGOTIATE
+          required = (["set_compression", "negotiate"] if compression_enabled else []) + (["switch", "frame"] if expected_zstd else ["vanilla_login"])
 
           def varint(n):
               out = bytearray()
@@ -338,9 +356,12 @@ jobs:
                       break
                   elif pid == 0x02:
                       assert not expected_zstd, "版本 11 客户端应启用下行 zstd"
-                      assert pending_negotiate is None and seen["negotiate"], "原版登录前必须已发送回落应答"
+                      if compression_enabled:
+                          assert pending_negotiate is None and seen["negotiate"], "原版登录前必须已发送回落应答"
+                      else:
+                          assert not any(seen[key] for key in ("set_compression", "negotiate", "switch", "frame")), "关闭压缩时不应接管原版链路"
                       seen["vanilla_login"] = True
-                      print("E2E_PASS version_mismatch_stays_vanilla")
+                      print("E2E_PASS vanilla_login")
                       rc = 0
                       break
           except Exception as e:
@@ -359,7 +380,10 @@ jobs:
           echo "----- activation / fallback lines -----"
           grep -E "zstd transport activated|anchors 未出现|frame rejected|dict generation mismatch|保持原版 zlib" server.log || true
           echo "----- check -----"
-          if [ "${{ matrix.negotiate }}" = "11" ]; then
+          if [ "${{ matrix.threshold }}" = "-1" ]; then
+            grep -q "仅保留命令与监控" server.log
+            if grep -q "zstd transport activated on Paper" server.log; then echo "关闭压缩时误激活"; exit 1; fi
+          elif [ "${{ matrix.negotiate }}" = "11" ]; then
             grep -q "zstd transport activated on Paper" server.log || { echo "未激活：zstd 没有生效"; tail -60 server.log; exit 1; }
           else
             if grep -q "zstd transport activated on Paper" server.log; then echo "旧版客户端误激活"; exit 1; fi

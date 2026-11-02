@@ -67,7 +67,7 @@ public final class ZstdPaperCommand implements BasicCommand {
                         ? "§7（区域化多线程：监控任务跟随玩家实体）"
                         : "§7（单主线程）"));
         sender.sendMessage(threshold < 0
-                ? "§c  原版压缩阈值 = " + threshold + "（已关闭）→ 本插件会自动停用"
+                ? "§e  原版压缩阈值 = " + threshold + "（已关闭）→ 仅提供命令与监控，不接管压缩"
                 : "§a  原版压缩阈值 = " + threshold + " → zstd 可接管");
         sender.sendMessage("§e── 运行概况 ──");
         sender.sendMessage("§7  压缩等级=" + cfg.level + " 窗口指数=" + cfg.windowLog

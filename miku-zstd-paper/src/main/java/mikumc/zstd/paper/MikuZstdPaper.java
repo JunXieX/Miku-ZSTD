@@ -66,34 +66,24 @@ public class MikuZstdPaper extends JavaPlugin {
             applyDebugLogLevel();
         }
 
-        // ⚠️ 服务端关闭原版压缩（network-compression-threshold=-1）时本插件无法工作：
-        // zstd 需要借原版的 SetCompression 做双端同步信号、借它装好的 compress/decompress
-        // 做插入锚点；该配置下这二者都不存在（伪造切换信号会导致协议切换期异常、无法进服）。
-        // 与其静默失效，不如明确停用并说明原因。
-        int compressionThreshold = ZstdPaperCommandSupport.readCompressionThreshold();
-        if (compressionThreshold < 0) {
-            LOGGER.error("[Zstd] 检测到 network-compression-threshold={}（服务端已关闭原版压缩）。", compressionThreshold);
-            LOGGER.error("[Zstd] 本插件依赖原版压缩流程作为切换信号与插入锚点，该配置下无法工作，");
-            LOGGER.error("[Zstd] 因此自动停用（不影响正常进服）。如需 zstd，请把该值设为 >= 0，推荐 256。");
-            getServer().getPluginManager().disablePlugin(this);
-            return;
-        }
-
+        // 命令与监控不依赖压缩管线。代理后端常将阈值设为 -1，仍须注册可执行命令。
         registerPermissions();
-        ZstdCompressPool.init(ZstdPaperConfig.INSTANCE.compressThreads, 5);
-        // onEnable 阶段 MC 的监听通道通常还没建立，等服务器就绪后再挂钩。
-        // ⚠️ 这里不能用 BukkitScheduler：Folia 上 Bukkit.getScheduler() 直接抛
-        // UnsupportedOperationException（BukkitScheduler 建立在"唯一主线程"这个前提上，Folia 没有该前提）。
-        // GlobalRegionScheduler 在 Paper 上等价于主线程、在 Folia 上是真正的全局区域线程，
-        // 而挂钩动作本身不属于任何区域（只走反射替换 Netty 的 childHandler），因此两端共用同一份代码。
-        getServer().getGlobalRegionScheduler().run(this, task -> installHook());
-        // ⚠️ Paper 插件不支持在 paper-plugin.yml 里声明命令，getCommand() 会抛
-        // UnsupportedOperationException（曾因此导致插件启用失败、自动停用）。
-        // 必须走生命周期事件注册。
         getLifecycleManager().registerEventHandler(
                 io.papermc.paper.plugin.lifecycle.event.types.LifecycleEvents.COMMANDS,
                 commands -> commands.registrar().register(
                         "mikuzstd", "查看 Miku-ZSTD 状态与压缩统计", new ZstdPaperCommand()));
+
+        // 只跳过压缩接管；缺少 SetCompression 时绝不伪造切换信号或安装协商器。
+        int compressionThreshold = ZstdPaperCommandSupport.readCompressionThreshold();
+        if (compressionThreshold < 0) {
+            LOGGER.warn("[Zstd] network-compression-threshold={}，原版压缩已关闭。", compressionThreshold);
+            LOGGER.warn("[Zstd] 仅保留命令与监控，不安装压缩挂钩；玩家连接保持原版。");
+            return;
+        }
+
+        ZstdCompressPool.init(ZstdPaperConfig.INSTANCE.compressThreads, 5);
+        // 监听通道在服务器就绪后建立；全局调度器在 Paper / Folia 上均可用。
+        getServer().getGlobalRegionScheduler().run(this, task -> installHook());
         LOGGER.info("[Zstd] Miku-ZSTD Paper 已启用（目标 Paper/Folia 26.2+，平台={}，无 Bukkit 兼容层）",
                 platformName());
     }
