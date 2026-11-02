@@ -1,26 +1,30 @@
 package mikumc.zstd.protocol;
 
+import com.github.luben.zstd.EndDirective;
 import com.github.luben.zstd.ZstdCompressCtx;
+import com.github.luben.zstd.ZstdDecompressCtx;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import org.junit.jupiter.api.Test;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Random;
 
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * 同一份合成语料对照无字典与生产滚动历史，只统计压缩体，不含线路帧头。
- * 每个样本按一次 flush 的单包批次补长度前缀；历史喂入与轮换直接使用生产实现。
+ * one-shot 与同一ctx多次CONTINUE/FLUSH的合成消融，仅记录压缩体，不含运输帧头。
+ * 不依赖已退出的滚动字典，不把探针比率作为生产收益或通过门槛。
  */
 class DictAblationTest {
-
     private static final int LEVEL = 3;
     private static final int[] BAND_LIMIT = {128, 4096};
     private static final long CORPUS_BYTES = 12L * 1024 * 1024;
@@ -29,81 +33,109 @@ class DictAblationTest {
         final long[] band = new long[3];
         long total;
         int count;
-        int rotations;
     }
 
     @Test
     void ablation() throws IOException {
         Corpus corpus = build();
-        Result none = run(corpus.packets, false);
-        Result rolling = run(corpus.packets, true);
-
-        StringBuilder sb = new StringBuilder();
-        sb.append(String.format("==== dict ablation (synthetic, production rolling history) ====%n"));
-        sb.append(String.format("raw=%dB, samples=%d, chunks=%d, level=%d, dict=%dB, rotate=%dB%n",
-                corpus.rawTotal, none.count, corpus.chunks, LEVEL,
-                ZstdRollingDict.DICT_BYTES, ZstdRollingDict.ROTATE_AFTER_BYTES));
-        sb.append(String.format("%-12s %11s %11s %8s%n",
-                "band", "none", "rolling", "vs none"));
-        String[] names = {"<128B", "128B-4KB", ">=4KB"};
-        for (int i = 0; i < names.length; i++) {
-            sb.append(String.format("%-12s %11d %11d %7.1f%%%n",
-                    names[i], none.band[i], rolling.band[i], pct(none.band[i], rolling.band[i])));
+        Result oneShot = run(corpus.packets, false);
+        Result continuous = run(corpus.packets, true);
+        StringBuilder report = new StringBuilder();
+        report.append("==== synthetic one-shot vs continuous probe ====\n");
+        report.append("Probe only: not a production bandwidth, latency or CPU claim.\n");
+        report.append("Body bytes only. continuous: one FLUSH/packet, no END/reset; one-shot: independent complete frames.\n");
+        report.append(String.format(Locale.ROOT, "raw=%dB samples=%d chunks=%d level=%d%n",
+                corpus.rawTotal, corpus.packets.size(), corpus.chunks, LEVEL));
+        report.append(String.format(Locale.ROOT, "%-12s %12s %12s %12s%n",
+                "band", "one-shot", "continuous", "body delta"));
+        String[] bands = {"<128B", "128B-4KB", ">=4KB"};
+        for (int i = 0; i < bands.length; i++) {
+            report.append(String.format(Locale.ROOT, "%-12s %12d %12d %11.2f%%%n",
+                    bands[i], oneShot.band[i], continuous.band[i], pct(oneShot.band[i], continuous.band[i])));
         }
-        sb.append(String.format("%-12s %11d %11d %7.1f%%%n",
-                "TOTAL", none.total, rolling.total, pct(none.total, rolling.total)));
-        sb.append(String.format("生产滚动次数：%d%n", rolling.rotations));
-        System.out.print(sb);
+        report.append(String.format(Locale.ROOT, "%-12s %12d %12d %11.2f%%%n",
+                "TOTAL", oneShot.total, continuous.total, pct(oneShot.total, continuous.total)));
+        System.out.print(report);
+        // 保持现有CI报告产物路径；类名仅为兼容现有test过滤器。
         Path out = Path.of("build", "ablation-report.txt");
         Files.createDirectories(out.getParent());
-        Files.writeString(out, sb.toString(), StandardCharsets.UTF_8);
-
-        assertTrue(rolling.rotations > 0, "语料必须触发真实滚动历史轮换，避免对照空转");
-        assertTrue(rolling.total <= none.total * 1.01,
-                "滚动历史不得让压缩体变差，实际 " + pct(none.total, rolling.total) + "%");
+        Files.writeString(out, report.toString(), StandardCharsets.UTF_8);
+        assertEquals(corpus.packets.size(), oneShot.count);
+        assertEquals(oneShot.count, continuous.count);
+        assertTrue(oneShot.total > 0 && continuous.total > 0);
+        // 不断言哪种更小：语料、flush频率和参数都可能影响消融结果。
     }
 
     private static double pct(long base, long value) {
         return base == 0 ? 0 : (1.0 - (double) value / base) * 100;
     }
 
-    private Result run(List<byte[]> corpus, boolean useRolling) {
-        Result r = new Result();
-        r.count = corpus.size();
-        ZstdRollingDict history = useRolling ? new ZstdRollingDict() : null;
-        byte[] appliedDict = null;
-        ZstdCompressCtx ctx = new ZstdCompressCtx();
-        try {
-            ctx.setLevel(LEVEL);
-            ctx.setMagicless(true);
-            ctx.setContentSize(false);
-            ctx.setDictID(false);
+    private static Result run(List<byte[]> corpus, boolean continuous) {
+        Result result = new Result();
+        try (ZstdCompressCtx compress = new ZstdCompressCtx();
+             ZstdDecompressCtx decompress = new ZstdDecompressCtx()) {
+            compress.setLevel(LEVEL).setMagicless(true).setContentSize(false).setDictID(false);
+            decompress.setMagicless(true);
+            ByteBuffer source = ByteBuffer.allocateDirect(64 * 1024);
+            ByteBuffer destination = ByteBuffer.allocateDirect(1021);
+            ByteBuffer decodeDestination = ByteBuffer.allocateDirect(4093);
             for (byte[] packet : corpus) {
-                byte[] raw = new byte[ZstdVarInts.length(packet.length) + packet.length];
-                ByteBuf batch = Unpooled.wrappedBuffer(raw);
-                try {
-                    batch.clear();
-                    ZstdVarInts.write(batch, packet.length);
-                    batch.writeBytes(packet);
-                } finally {
-                    batch.release();
+                byte[] raw = inner(packet);
+                byte[] compressed;
+                if (continuous) {
+                    source.clear(); source.put(raw).flip();
+                    ByteArrayOutputStream output = new ByteArrayOutputStream();
+                    while (source.hasRemaining()) {
+                        int before = source.position(); destination.clear();
+                        compress.compressDirectByteBufferStream(destination, source, EndDirective.CONTINUE);
+                        int produced = append(output, destination);
+                        assertTrue(source.position() != before || produced > 0, "CONTINUE须有位置进展");
+                    }
+                    boolean flushed;
+                    do {
+                        destination.clear();
+                        flushed = compress.compressDirectByteBufferStream(destination, source, EndDirective.FLUSH);
+                        int produced = append(output, destination);
+                        assertTrue(flushed || produced > 0, "FLUSH未完成时须输出字节");
+                    } while (!flushed);
+                    compressed = output.toByteArray();
+                    ByteBuffer encoded = ByteBuffer.allocateDirect(compressed.length);
+                    encoded.put(compressed).flip();
+                    ByteArrayOutputStream decoded = new ByteArrayOutputStream();
+                    boolean full;
+                    do {
+                        int before = encoded.position(); decodeDestination.clear();
+                        boolean ended = decompress.decompressDirectByteBufferStream(decodeDestination, encoded);
+                        full = !decodeDestination.hasRemaining();
+                        int produced = append(decoded, decodeDestination);
+                        assertFalse(ended, "连续探针只FLUSH，不应出现native END");
+                        if (encoded.hasRemaining()) assertTrue(encoded.position() != before || produced > 0);
+                    } while (encoded.hasRemaining() || full);
+                    assertArrayEquals(raw, decoded.toByteArray(), "连续ctx逐样本真实往返");
+                } else {
+                    compressed = compress.compress(raw);
+                    assertArrayEquals(raw, decompress.decompress(compressed, raw.length), "one-shot真实往返");
                 }
-                if (history != null && history.activeDict() != appliedDict) {
-                    appliedDict = history.activeDict();
-                    ctx.loadDict(appliedDict);
-                }
-                int n = ctx.compress(raw).length;
-                r.band[bandOf(packet.length)] += n;
-                r.total += n;
-                if (history != null) {
-                    history.feed(raw, 0, raw.length);
-                }
+                assertTrue(compressed.length > 0);
+                result.count++;
+                result.band[bandOf(packet.length)] += compressed.length;
+                result.total += compressed.length;
             }
-        } finally {
-            ctx.close();
         }
-        r.rotations = history == null ? 0 : history.generation();
-        return r;
+        return result;
+    }
+
+    private static int append(ByteArrayOutputStream output, ByteBuffer buffer) {
+        int produced = buffer.position(); buffer.flip();
+        byte[] bytes = new byte[produced]; buffer.get(bytes); output.writeBytes(bytes); return produced;
+    }
+
+    private static byte[] inner(byte[] packet) {
+        ByteBuf buf = Unpooled.buffer(packet.length + 5);
+        try {
+            ZstdVarInts.write(buf, packet.length); buf.writeBytes(packet);
+            byte[] raw = new byte[buf.readableBytes()]; buf.readBytes(raw); return raw;
+        } finally { buf.release(); }
     }
 
     private static int bandOf(int len) {
@@ -119,17 +151,17 @@ class DictAblationTest {
     }
 
     /**
-     * 造语料：区块流 + 小包 + 引用当前区块的中包。
+     * 合成语料：区块形态 + 小包 + 引用当前片段的中包，仅作为可复现探针。
      *
-     * <p>关键点：<b>每个区块的调色板都不一样</b>，所以跨区块的字节重复很低——静态字典学不到
-     * 未来区块的调色板，而滚动历史也只能吃到"刚刚发过的那片"。这才是 MC 的真实形态。</p>
+     * <p>每个合成区块的调色板不同，包含人为选择的短期重复。探针不代表真实MC抓包，
+     * 不据此推断生产带宽、CPU、延迟或玩家规模收益。</p>
      */
     private static Corpus build() {
         Random rnd = new Random(20261101L);
         Corpus c = new Corpus();
         long bytes = 0;
         long chunkIndex = 0;
-        // 共享小词表：维度名、常见字符串、字段名（真实世界里这些确实跨会话重复）
+        // 合成共享词表；不代表生产频次。
         byte[][] words = {
                 "minecraft:overworld".getBytes(StandardCharsets.US_ASCII),
                 "minecraft:the_nether".getBytes(StandardCharsets.US_ASCII),
@@ -176,7 +208,7 @@ class DictAblationTest {
                 c.packets.add(b);
                 bytes += b.length;
             } else {
-                // 中包：引用"当前区块调色板"的方块更新 —— 只有滚动历史吃得到
+                // 中包：人为植入当前片段的短期重复，供连续流历史探针观察。
                 int len = 200 + rnd.nextInt(2800);
                 byte[] b = new byte[len];
                 b[0] = 0x31;

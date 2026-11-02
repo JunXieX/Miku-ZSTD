@@ -139,7 +139,7 @@ public final class ZstdCommand {
         //   · batch_window_ms / batch_max_packets：编码器 handlerAdded 时快照；
         //   · threads：线程池只在首次 init 时固定。
         source.sendMessage(Component.text(
-                "即时生效：logging.debug、bossbar.format、skip_compress_below_bytes；"
+                "即时生效：logging.debug、bossbar.format；"
                         + "需新连接：level、window_log、batch_window_ms、batch_max_packets；"
                         + "需重启代理：threads。已有连接仍在用旧值。",
                 NamedTextColor.YELLOW));

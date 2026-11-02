@@ -71,8 +71,7 @@ public final class ZstdPaperCommand implements BasicCommand {
                 : "§a  原版压缩阈值 = " + threshold + " → zstd 可接管");
         sender.sendMessage("§e── 运行概况 ──");
         sender.sendMessage("§7  压缩等级=" + cfg.level + " 窗口指数=" + cfg.windowLog
-                + " 下行批处理=" + cfg.batchWindowMs + "ms/" + cfg.batchMaxPackets + "包"
-                + " 直存阈值=" + cfg.skipCompressBelowBytes + "B");
+                + " 下行批处理=" + cfg.batchWindowMs + "ms/" + cfg.batchMaxPackets + "包");
 
         sender.sendMessage("§7  在线玩家：" + org.bukkit.Bukkit.getOnlinePlayers().size());
         sender.sendMessage("§7  线程池：" + ZstdCompressPool.summary());
@@ -81,8 +80,8 @@ public final class ZstdPaperCommand implements BasicCommand {
         }
 
         sender.sendMessage("§e── 跨帧历史 ──");
-        sender.sendMessage("§7  滚动历史：§a自动§7（每帧把最近 64KB 原始字节当字典，每 256KB 轮换一次）"
-                + " §8无需配置、不下发");
+        sender.sendMessage("§7  连续流历史：§a自动§7（同一连接持续压缩，批次随 flush 输出）"
+                + " §8无需字典配置或下发");
     }
 
     /**

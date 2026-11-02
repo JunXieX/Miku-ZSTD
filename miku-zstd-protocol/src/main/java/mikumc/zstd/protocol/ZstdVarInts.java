@@ -3,34 +3,13 @@ package mikumc.zstd.protocol;
 import io.netty.buffer.ByteBuf;
 
 /**
- * Minecraft VarInt 编解码，以及 varint 相关字节级读取（<b>三端共用的唯一实现</b>）。
- *
- * <p>本类位于共享协议模块 {@code miku-zstd-protocol}，由三端各自通过 {@code sourceSets}
- * 引用同一份源码编译（见模块 README）。
- * 3.0.0 之前项目里存在四份独立实现（两端的管理器、Hijacker 的通用循环版、
- * 嗅探器的 ByteBuffer 版），行为与性能均不一致；后来又有 6 处新写的循环。
- * 现在 byte[] / ByteBuf 两种输入都有唯一的入口：{@link #tryRead}、{@link #readAt}、{@link #readOr}。</p>
- *
- * <p>写路径带 1~3 字节快路径（覆盖 99% 的 MC 包长），读路径支持"数据不足时
- * 不消费缓冲"的尽力语义。</p>
- *
- * <h2>术语：本项目里的 "v几" 有三个不同含义，不要混用</h2>
- * <ul>
- *   <li><b>协商版本</b>：{@link ZstdProtocolVersion#NEGOTIATE}（当前 <b>7</b>），在登录期
- *       negotiate 载荷里交换。三端必须一致，不一致即回落原版 zlib。
- *       v4 = 字典改为按需推送；v6 = 帧内分块；v7 = 帧头 {@code dictGen} + 两端不再替换原版处理器。</li>
- *   <li><b>帧格式</b>：{@link ZstdProtocolVersion#FRAME}（当前 <b>6</b>），
- *       {@code [bodyLen?][rawSize][dictGen][blockCount] + block...}（压缩帧）或
- *       {@code [0][packet]}（直存帧，与原版未压缩帧<b>逐字节同形</b>，因此不带 {@code dictGen}）。
- *       v3 做帧头精简（magicless / 无 contentSize / 无 dictID）与"一帧多包"批处理；
- *       v4 把直存帧改成"一帧一包、不带内层长度前缀"；v6 加块头与 {@code dictGen}。</li>
- *   <li><b>v1 / v2 / v5</b>：历史版本，只应出现在"我们为什么这么改"的说明里。</li>
- * </ul>
- * <p>所以"帧格式 v6"与"协商版本 v7"是两个维度的编号，同一份代码同时属于这两者。</p>
+ * 三端共享的非负 VarInt 与协议尺寸常量。
+ * 外层运输帧最多21bit；内层包可跨运输帧，原始单包上限32MiB。
+ * 协商与帧版本仅以 {@link ZstdProtocolVersion} 为准。
  */
 public final class ZstdVarInts {
 
-    /** 单帧长度上限的默认值（32MB，26.x configuration 阶段存在超大 Registry 包） */
+    /** 内层原始单包长度上限（32MiB，配置阶段可能含大型 Registry 包）。 */
     public static final int DEFAULT_MAX_VALUE = 32 * 1024 * 1024;
 
     /**
@@ -41,9 +20,8 @@ public final class ZstdVarInts {
      * 直接抛 {@code CorruptedFrameException: length wider than 21-bit}，服务端侧则是
      * prepender 抛 "unable to fit ... into 3 bytes" 后断连。</p>
      *
-     * <p>⚠️ 这是<b>帧</b>的上限，不是包的上限：一个包超过它就无法上线，无论内容多合法。
-     * 5.0.42 删除字典下发后，本项目已没有任何"自己拼大包"的路径（{@code zstd:dict} 已不存在），
-     * 这个常量保留只作为帧解析的硬上限。</p>
+     * <p>这是压缩运输帧体的上限，不是内层原始包的上限。连续流可以把同一个
+     * 压缩块或内层包拆到多个合法运输帧，接收端持有流与半包状态。</p>
      */
     public static final int MC_MAX_FRAME_BYTES = (1 << 21) - 1;
 

@@ -44,15 +44,14 @@ public final class ZstdLoginNetworking {
 
             // Fabric LoginQueryRequestHandler.receive 的线程契约是 Netty event loop。
             // 新 negotiate 先同步摘除旧下行 handler、清 ACTIVATED，再更换 native 上下文；
-            // 旧 decoder 的 handlerRemoved0 负责释放滚动历史与字典引用。
-            // 仅此入口清理，重复 SetCompression 仍保留当前 decoder 和历史。
+            // 旧 decoder 的 handlerRemoved 负责释放未完成包与暂存输出。
+            // 仅此入口开启新流，重复 SetCompression 仍保留当前 decoder 和流状态。
             channel.attr(ZstdChannelManager.ZSTD_STATE).set(ZstdChannelManager.TransportState.PLAIN);
             ZstdClientActivation.onRoundDeclined(channel);
 
             // ⚠️ 本轮判定之前就要把上一轮的上下文换掉：这条连接可能被重放登录流程
-            //（ViaFabricPlus 协议切换 / 重连到另一台服务器）。滚动历史算出的字典是
-            //「装载进上下文」的，而 zstd 没有卸载接口——上一轮那份历史会留在上下文里，
-            // 新一轮的滑窗却从零开始，两边的 dictGen 与字典内容立刻错位，帧被静默解成垃圾。
+            //（ViaFabricPlus 协议切换 / 重连到另一台服务器）。上一轮的解压流状态不属于
+            // 新一轮连接；先撤旧 decoder 再换新 ctx，避免旧半包或历史进入新流。
             // 版本不匹配时也照做：这一轮不参与，但上下文不能把脏状态留给下一轮。
             ZstdChannelManager existing = channel.attr(ZstdChannelManager.KEY).get();
             if (existing != null) {

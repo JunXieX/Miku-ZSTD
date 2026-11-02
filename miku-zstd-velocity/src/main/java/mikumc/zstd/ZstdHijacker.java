@@ -296,8 +296,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
             // 而激活要等协商应答（一个 RTT）。若不拦下这段窗口内的包，它们会走原版压缩编码器
             // 发出去，而客户端收到 SetCompression 后已经把解码器换成了 zstd —— 原版压缩帧
             // （[dataLength>0][deflate]）会被 zstd 解码器按 zstd 帧解析，必然错乱/断连。
-            //（未压缩帧 [0][packet] 与 zstd 直存帧逐字节同形、不在其中；但 LoginSuccess 这类
-            // 数据量较大的包会被原版压缩器真正压缩，所以整段窗口都必须扣住。）
+            // 原版 [0][packet] 也不是连续 Zstd 字节，因此整段窗口内的游戏包都必须扣住。
             holding = true;
             super.write(ctx, msg, promise); // SetCompression 本身原样透传（此刻尚未压缩）
             ctx.channel().eventLoop().execute(() -> tryActivate(ctx, 0));
@@ -579,8 +578,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
             return false;
         }
 
-        // 这里原先要"按门控装载训练字典"，5.0.42 起训练字典整体删除：跨帧重复由协议基类的
-        // 滚动历史（每方向 64KB 滑窗）在帧边界自动维护，本端不需要任何准备动作。
+        // 连续流上下文已由 manager 初始化；激活时不再装载字典或重置流状态。
 
         // ⚠️ 先在**代码路径上**把下行编码器、闸门和确认嗅探器都装上，成功了才置 replaced。
         //
@@ -752,8 +750,8 @@ public class ZstdHijacker extends ChannelDuplexHandler {
      * 通知客户端"服务端已切换到 zstd，请切换并发确认"（{@code zstd:switch}，载荷 4 字节魔数）。
      *
      * <p>⚠️ <b>从原版压缩处理器的 context 写出</b>（与 {@code ZstdBatchEncoder#downstream}
-     * 同一个位置）：本帧是<b>已经成好形</b>的 zstd 直存帧，不能再让任何编码器处理它；
-     * 对端（已切换到 zstd 的解码器）按直存帧读出裸包。</p>
+     * 同一个位置）：本帧是<b>已经成好形</b>的原版控制帧，不能再让任何编码器处理它；
+     * 对端由连续流解码器上游的 switch 嗅探器截获，不进入 Zstd 流。</p>
      *
      * <p>⚠️ 接收方要看<b>包 id 之后</b>的魔数，而不是通道名：本端写的是完整登录查询包
      * {@code [0x04][txId][channelName][magic]}，但客户端一侧的"裸包"只包含
@@ -763,7 +761,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
      */
     static boolean sendSwitchRequest(Channel channel) {
         // ⚠️ 写出位置是<b>原版压缩处理器的 context</b>，理由逐条：
-        //   · 本帧已是最终形态的 zstd 直存帧，不能再被任何编码器处理一次；
+        //   · 本帧已是最终形态的原版 switch 控制帧，不能再被任何编码器处理一次；
         //   · 从 zstd_encoder 的 ctx 写会落到原版压缩处理器上——它会把我们的帧再包一层
         //     [dataLength>0][deflate]，而客户端此刻已经切到 zstd，解出来还是 zstd 帧，
         //     解析必然错乱（2.0.0 的断连回归就是这个形态）；
@@ -771,7 +769,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
         //   · Velocity 侧写外层长度的就是这个「长度 + 压缩」合一的处理器，它被跳过后没人
         //     替我们补长度，所以下面的帧必须自带 bodyLen —— 若照旧注释去"补 frame-encoder"，
         //     会写出双层长度前缀，同样回到 2.0.0 的回归形态。
-        // 几十字节远低于压缩阈值，直存即可。
+        // switch 控制帧固定采用原版未压缩形态，由客户端专用嗅探器截获。
         ChannelHandlerContext writeCtx = compressionWriteCtx(channel.pipeline());
         if (writeCtx == null) {
             LOGGER.debug("[Zstd] cannot send switch request — compression anchor missing");
@@ -791,9 +789,8 @@ public class ZstdHijacker extends ChannelDuplexHandler {
                 // "写帧的一方"自带（本方法、以及 ZstdBatchEncoder 里的 writeBodyLen）。
                 // 既然我们从原版压缩处理器之后写，就必须自己把 bodyLen 补上，
                 // 否则客户端 frame-decoder 会把首字节 0x00 当成"帧长为 0"直接抛异常。
-                // 帧格式（v6）：[bodyLen][rawSize=0][packet] —— 直存帧一帧一包、不带内层长度前缀，
-                // 与原版未压缩帧逐字节同形（见 ZstdBatchEncoderBase 的帧格式说明）。
-                int bodyLen = 1 /*rawSize=0*/ + packet.readableBytes();
+                // 原版控制帧：[bodyLen][dataLength=0][packet]，不进入连续 Zstd 流。
+                int bodyLen = 1 /* dataLength=0 */ + packet.readableBytes();
                 mikumc.zstd.protocol.ZstdVarInts.write(frame, bodyLen);
                 mikumc.zstd.protocol.ZstdVarInts.write(frame, 0);
                 frame.writeBytes(packet);

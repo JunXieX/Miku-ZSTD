@@ -89,7 +89,7 @@ jobs:
   #
   # 为什么必须单独有这个 job：EmbeddedChannel 测不出"写是否来自非 event loop 线程"，
   # 也测不出登录期的出站顺序 —— 而这两类问题只会让"玩家进不去服"，只能靠真实 NIO
-  # 连接验证。它同时是帧格式 v6 的唯一端到端验证（dictGen / 直存帧同形 / flush 成帧）。
+  # 连接验证。帧格式 v8 使用持久 magicless 解压流，累积内层字节直到完整 LoginSuccess。
   #
   # 脚本内联在 workflow 里（仓库只入库源码与构建文件，见 .gitignore 的约定）。
   # ──────────────────────────────────────────────────────────────────────
@@ -98,10 +98,10 @@ jobs:
     strategy:
       matrix:
         threshold: [0, 256]
-        negotiate: [11, 10]
+        negotiate: [12, 11]
         include:
           - threshold: -1
-            negotiate: 11
+            negotiate: 12
     needs: [paper]
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -180,7 +180,7 @@ jobs:
           HOST, PORT = "127.0.0.1", 25600
           MAGIC = 0x5A535743
           PROTOCOL = 776
-          NEGOTIATE = 11
+          NEGOTIATE = 12
           CLIENT_NEGOTIATE = int("${{ matrix.negotiate }}")
           compression_enabled = int("${{ matrix.threshold }}") >= 0
           expected_zstd = compression_enabled and CLIENT_NEGOTIATE == NEGOTIATE
@@ -244,6 +244,55 @@ jobs:
               assert len(packet) == raw, "原版压缩帧解压长度不符"
               return packet
 
+          MAX_PACKET_BYTES = 32 * 1024 * 1024
+          MAX_FRAME_BYTES = (1 << 21) - 1
+
+          def take_inner_packet(buffer):
+              length = 0
+              for i in range(5):
+                  if i >= len(buffer):
+                      return None  # 长度前缀可跨 Minecraft 传输帧。
+                  b = buffer[i]
+                  assert i != 4 or not (b & 0xF0), "内层包长 VarInt 溢出"
+                  length |= (b & 0x7F) << (7 * i)
+                  if not (b & 0x80):
+                      assert 1 <= length <= MAX_PACKET_BYTES, "内层包长越界"
+                      end = i + 1 + length
+                      if len(buffer) < end:
+                          return None  # 包体可跨传输帧，保留半包供后续追加。
+                      packet = bytes(buffer[i + 1:end])
+                      del buffer[:end]
+                      return packet
+              raise AssertionError("内层包长 VarInt 超过 5 字节")
+
+          def login_string(packet, pos, max_chars):
+              size, start = dv(packet, pos)
+              assert 0 <= size <= 3 * max_chars and start + size <= len(packet), "LoginSuccess 字符串截断或超限"
+              text = packet[start:start + size].decode("utf-8", errors="strict")
+              assert len(text.encode("utf-16-le")) // 2 <= max_chars, "LoginSuccess 字符串字符数超限"
+              return text, start + size
+
+          def verify_login_success(packet, username):
+              pid, pos = dv(packet, 0)
+              assert pid == 0x02, "登录完成包应为 LoginSuccess，实际 id=%d" % pid
+              assert len(packet) >= pos + 16, "LoginSuccess 缺少 UUID"
+              actual, pos = login_string(packet, pos + 16, 16)
+              assert actual == username, "LoginSuccess 用户名不符：%s" % actual
+              count, pos = dv(packet, pos)
+              assert 0 <= count <= 16, "LoginSuccess profile properties 数量超限"
+              for _ in range(count):
+                  _, pos = login_string(packet, pos, 64)
+                  _, pos = login_string(packet, pos, 32767)
+                  assert pos < len(packet) and packet[pos] in (0, 1), "LoginSuccess 缺少合法签名标志"
+                  signed = packet[pos]
+                  pos += 1
+                  if signed:
+                      _, pos = login_string(packet, pos, 1024)
+              # 26.2 LoginFinished 在 GameProfile 后还有一个 sessionId UUID。
+              assert len(packet) - pos == 16, "LoginSuccess sessionId 截断或存在尾随数据"
+              pos += 16
+              assert pos == len(packet), "LoginSuccess 未完整消费"
+
           sock = socket.create_connection((HOST, PORT), timeout=20)
           sock.settimeout(25)
           hs = varint(0) + varint(PROTOCOL) + s("127.0.0.1\x00ZSTD\x00") + struct.pack(">H", PORT) + varint(2)
@@ -258,56 +307,36 @@ jobs:
           compression_threshold = None
           zstd_mode = False
           pending_negotiate = None
+          # format 在创建时传入；同一 decompressobj 在全部传输帧之间保留原生流状态。
+          stream_context = zstd.ZstdDecompressor(format=zstd.FORMAT_ZSTD1_MAGICLESS) if expected_zstd else None
+          stream_decoder = stream_context.decompressobj(read_across_frames=False) if expected_zstd else None
+          inner_bytes = bytearray()
           deadline = time.time() + 40
           rc = 1
           try:
               while time.time() < deadline:
                   ln = rv(sock)
+                  assert 1 <= ln <= MAX_FRAME_BYTES, "Minecraft 传输帧长度越界"
                   body = recvn(sock, ln)
                   if not body: break
                   if not zstd_mode:
                       packet = vanilla_packet(body, compression_threshold)
                   else:
-                      raw, pos = dv(body, 0)
-                      if raw == 0:
-                          # 直存帧同样是 v7 帧（与原版未压缩帧逐字节同形）：小包本来就该走这条路径。
-                          # 只认压缩帧会让用例在"首个包很小"时误判失败。
-                          packet = body[pos:]
-                          pid2, _ = dv(packet, 0)
-                          print("  stored frame, %d bytes, packet id=%d" % (len(packet), pid2))
-                          seen["frame"] = True
-                          frames += 1
-                          # 首个帧就够：真机上这通常正是 LoginSuccess（包 id 0x02）。
-                          # 再往后是 configuration 阶段，需要客户端回 ClientInformation 才会继续推，
-                          # 本用例不复述那一整套（压缩帧路径由单测与 dictGen 校验覆盖）。
-                          if pid2 == 0x02:
-                              print("E2E_PASS login_success_in_zstd_frame")
-                          else:
-                              print("E2E_PASS frame_ok packet id=%d" % pid2)
-                          rc = 0
-                          break
-                      else:
-                          # 压缩帧：[rawSize][dictGen][blockCount] + 每块 [blockRawLen][chunkLen][chunk]
-                          gen, pos = dv(body, pos)
-                          blocks, pos = dv(body, pos)
-                          print("  compressed frame rawSize=%d dictGen=%d blocks=%d" % (raw, gen, blocks))
-                          assert gen == 0, "首次登录不该出现滚动历史代数（gen=%d）" % gen
-                          total = 0
-                          for i in range(blocks):
-                              br, pos = dv(body, pos)
-                              cl, pos = dv(body, pos)
-                              chunk = body[pos:pos + cl]; pos += cl
-                              assert br > 0 and cl > 0 and len(chunk) == cl, "压缩块长度或边界非法"
-                              dec = zstd.ZstdDecompressor(format=zstd.FORMAT_ZSTD1_MAGICLESS)
-                              out = dec.decompress(chunk, max_output_size=br, allow_extra_data=False)
-                              assert len(out) == br, "块 %d 解压长度不符 %d != %d" % (i, len(out), br)
-                              total += len(out)
-                          assert pos == len(body), "压缩帧存在截断或尾随字节"
-                          assert total == raw, "块合计 %d != rawSize %d" % (total, raw)
-                          seen["frame"] = True
-                          print("E2E_PASS frame_ok")
-                          rc = 0
-                          break
+                      assert stream_decoder is not None, "未协商成功就进入持续流"
+                      out = stream_decoder.decompress(body)
+                      assert not stream_decoder.eof, "协议只允许 FLUSH，不应收到 END"
+                      assert not stream_decoder.unused_data and not stream_decoder.unconsumed_tail, "持续流存在未消费输入"
+                      assert len(out) <= MAX_PACKET_BYTES + 5, "单个传输帧解压输出越界"
+                      inner_bytes.extend(out)
+                      frames += 1
+                      packet = take_inner_packet(inner_bytes)
+                      if packet is None:
+                          continue
+                      verify_login_success(packet, "E2EBot")
+                      seen["frame"] = True
+                      print("E2E_PASS login_success_in_continuous_zstd frames=%d packet_bytes=%d" % (frames, len(packet)))
+                      rc = 0
+                      break
                   pid, pos = dv(packet, 0)
                   if pid == 0x03 and not compressed:
                       thr, _ = dv(packet, pos)
@@ -330,7 +359,7 @@ jobs:
                       payload = packet[p + sl:]
                       if chan == "zstd:negotiate":
                           server_version = struct.unpack(">i", payload)[0]
-                          assert server_version == NEGOTIATE, "服务端协商版本应为 11"
+                          assert server_version == NEGOTIATE, "服务端协商版本应为 12"
                           status = 0 if server_version == CLIENT_NEGOTIATE else 2
                           if status == 2 and compression_threshold is None:
                               pending_negotiate = (tx, status)
@@ -341,7 +370,7 @@ jobs:
                           seen["negotiate"] = True
                           print("  negotiate answered")
                       elif chan == "zstd:switch":
-                          assert expected_zstd, "版本 10 客户端保持原版时不应收到切换询问"
+                          assert expected_zstd, "版本 11 客户端保持原版时不应收到切换询问"
                           confirm = varint(0x02) + varint(tx) + b"\x01" + struct.pack(">I", MAGIC)
                           zlib_confirm = send(sock, confirm, compression_threshold)
                           assert zlib_confirm == (compression_threshold == 0), "确认帧应遵守原版压缩阈值"
@@ -355,11 +384,12 @@ jobs:
                       print("  DISCONNECT: %s" % packet[pos:pos + 120])
                       break
                   elif pid == 0x02:
-                      assert not expected_zstd, "版本 11 客户端应启用下行 zstd"
+                      assert not expected_zstd, "版本 12 客户端应启用下行 zstd"
                       if compression_enabled:
                           assert pending_negotiate is None and seen["negotiate"], "原版登录前必须已发送回落应答"
                       else:
                           assert not any(seen[key] for key in ("set_compression", "negotiate", "switch", "frame")), "关闭压缩时不应接管原版链路"
+                      verify_login_success(packet, "E2EBot")
                       seen["vanilla_login"] = True
                       print("E2E_PASS vanilla_login")
                       rc = 0
@@ -383,7 +413,7 @@ jobs:
           if [ "${{ matrix.threshold }}" = "-1" ]; then
             grep -q "仅保留命令与监控" server.log
             if grep -q "zstd transport activated on Paper" server.log; then echo "关闭压缩时误激活"; exit 1; fi
-          elif [ "${{ matrix.negotiate }}" = "11" ]; then
+          elif [ "${{ matrix.negotiate }}" = "12" ]; then
             grep -q "zstd transport activated on Paper" server.log || { echo "未激活：zstd 没有生效"; tail -60 server.log; exit 1; }
           else
             if grep -q "zstd transport activated on Paper" server.log; then echo "旧版客户端误激活"; exit 1; fi
@@ -402,19 +432,19 @@ jobs:
   # ──────────────────────────────────────────────────────────────────────
   # Velocity 端真机冒烟：真代理 + 协议级客户端，只跑到"登录完成"。
   #
-  # 为什么要单独一个 job：v7 在 Velocity 上走的字节路径与 Paper 不同（外层 bodyLen 由
+  # 为什么要单独一个 job：Velocity 与 Paper 的字节路径不同（外层 bodyLen 由
   # 编码器自带、且没有 prepender）。2026-11-01 的 5.0.36 就只在代理端坏掉，而 Paper 的
   # E2E 全绿 —— 这条路径当时没有任何门禁。
   #
   # 不需要后端服务器：本用例只验证登录阶段（SetCompression → negotiate → switch →
-  # 第一个 zstd 帧），LoginSuccess 在选服之前就发出了。
+  # 连续流中完整的 LoginSuccess），不把收到非空压缩体视为成功。
   # ──────────────────────────────────────────────────────────────────────
   e2e-velocity:
     name: E2E (Velocity, threshold=${{ matrix.threshold }}, client=${{ matrix.negotiate }})
     strategy:
       matrix:
         threshold: [0, 256]
-        negotiate: [11, 10]
+        negotiate: [12, 11]
     needs: [velocity]
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -451,7 +481,7 @@ jobs:
 
           # 必须注册一个服务器：Velocity 会因为"fallback 服务器未注册"直接拒绝启动。
           # 本用例只跑到登录完成（LoginSuccess 在选服之前就发出），所以这里给一个必然连不上的
-          # 占位后端即可 —— 客户端在收到第一个 zstd 帧时就退出，不会走到选服。
+          # 占位后端即可 —— 客户端验证完整 LoginSuccess，不进入后端配置阶段。
           [servers]
           lobby = "127.0.0.1:25601"
           try = ["lobby"]
@@ -485,7 +515,7 @@ jobs:
           HOST, PORT = "127.0.0.1", 25565
           MAGIC = 0x5A535743
           PROTOCOL = 776
-          NEGOTIATE = 11
+          NEGOTIATE = 12
           CLIENT_NEGOTIATE = int("${{ matrix.negotiate }}")
           expected_zstd = CLIENT_NEGOTIATE == NEGOTIATE
           required = ["set_compression", "negotiate"] + (["switch", "frame"] if expected_zstd else ["vanilla_login"])
@@ -545,6 +575,55 @@ jobs:
               assert len(packet) == raw, "原版压缩帧解压长度不符"
               return packet
 
+          MAX_PACKET_BYTES = 32 * 1024 * 1024
+          MAX_FRAME_BYTES = (1 << 21) - 1
+
+          def take_inner_packet(buffer):
+              length = 0
+              for i in range(5):
+                  if i >= len(buffer):
+                      return None  # 长度前缀可跨 Minecraft 传输帧。
+                  b = buffer[i]
+                  assert i != 4 or not (b & 0xF0), "内层包长 VarInt 溢出"
+                  length |= (b & 0x7F) << (7 * i)
+                  if not (b & 0x80):
+                      assert 1 <= length <= MAX_PACKET_BYTES, "内层包长越界"
+                      end = i + 1 + length
+                      if len(buffer) < end:
+                          return None  # 包体可跨传输帧，保留半包供后续追加。
+                      packet = bytes(buffer[i + 1:end])
+                      del buffer[:end]
+                      return packet
+              raise AssertionError("内层包长 VarInt 超过 5 字节")
+
+          def login_string(packet, pos, max_chars):
+              size, start = dv(packet, pos)
+              assert 0 <= size <= 3 * max_chars and start + size <= len(packet), "LoginSuccess 字符串截断或超限"
+              text = packet[start:start + size].decode("utf-8", errors="strict")
+              assert len(text.encode("utf-16-le")) // 2 <= max_chars, "LoginSuccess 字符串字符数超限"
+              return text, start + size
+
+          def verify_login_success(packet, username):
+              pid, pos = dv(packet, 0)
+              assert pid == 0x02, "登录完成包应为 LoginSuccess，实际 id=%d" % pid
+              assert len(packet) >= pos + 16, "LoginSuccess 缺少 UUID"
+              actual, pos = login_string(packet, pos + 16, 16)
+              assert actual == username, "LoginSuccess 用户名不符：%s" % actual
+              count, pos = dv(packet, pos)
+              assert 0 <= count <= 16, "LoginSuccess profile properties 数量超限"
+              for _ in range(count):
+                  _, pos = login_string(packet, pos, 64)
+                  _, pos = login_string(packet, pos, 32767)
+                  assert pos < len(packet) and packet[pos] in (0, 1), "LoginSuccess 缺少合法签名标志"
+                  signed = packet[pos]
+                  pos += 1
+                  if signed:
+                      _, pos = login_string(packet, pos, 1024)
+              # 26.2 LoginFinished 在 GameProfile 后还有一个 sessionId UUID。
+              assert len(packet) - pos == 16, "LoginSuccess sessionId 截断或存在尾随数据"
+              pos += 16
+              assert pos == len(packet), "LoginSuccess 未完整消费"
+
           sock = socket.create_connection((HOST, PORT), timeout=20)
           sock.settimeout(25)
           hs = varint(0) + varint(PROTOCOL) + s("127.0.0.1\x00ZSTD\x00") + struct.pack(">H", PORT) + varint(2)
@@ -555,38 +634,36 @@ jobs:
           seen = {"set_compression": False, "negotiate": False, "switch": False, "frame": False, "vanilla_login": False}
           compressed = False; compression_threshold = None; zstd_mode = False; rc = 1
           pending_negotiate = None
+          # format 在创建时传入；同一 decompressobj 在全部传输帧之间保留原生流状态。
+          stream_context = zstd.ZstdDecompressor(format=zstd.FORMAT_ZSTD1_MAGICLESS) if expected_zstd else None
+          stream_decoder = stream_context.decompressobj(read_across_frames=False) if expected_zstd else None
+          inner_bytes = bytearray()
+          frames = 0
           deadline = time.time() + 40
           try:
               while time.time() < deadline:
-                  ln = rv(sock); body = recvn(sock, ln)
+                  ln = rv(sock)
+                  assert 1 <= ln <= MAX_FRAME_BYTES, "Minecraft 传输帧长度越界"
+                  body = recvn(sock, ln)
                   if not body: break
                   if not zstd_mode:
                       packet = vanilla_packet(body, compression_threshold)
                   else:
-                      raw, pos = dv(body, 0)
-                      if raw == 0:
-                          packet = body[pos:]
-                          pid2, _ = dv(packet, 0)
-                          print("  stored frame, %d bytes, packet id=%d" % (len(packet), pid2))
-                          seen["frame"] = True
-                          print("E2E_PASS frame_ok packet id=%d" % pid2); rc = 0; break
-                      gen, pos = dv(body, pos)
-                      blocks, pos = dv(body, pos)
-                      print("  compressed frame rawSize=%d dictGen=%d blocks=%d" % (raw, gen, blocks))
-                      assert gen == 0, "首次登录不该出现滚动历史代数（gen=%d）" % gen
-                      total = 0
-                      for i in range(blocks):
-                          br, pos = dv(body, pos); cl, pos = dv(body, pos)
-                          chunk = body[pos:pos + cl]; pos += cl
-                          assert br > 0 and cl > 0 and len(chunk) == cl, "压缩块长度或边界非法"
-                          dec = zstd.ZstdDecompressor(format=zstd.FORMAT_ZSTD1_MAGICLESS)
-                          out = dec.decompress(chunk, max_output_size=br, allow_extra_data=False)
-                          assert len(out) == br, "块 %d 解压长度不符 %d != %d" % (i, len(out), br)
-                          total += len(out)
-                      assert pos == len(body), "压缩帧存在截断或尾随字节"
-                      assert total == raw, "块合计 %d != rawSize %d" % (total, raw)
+                      assert stream_decoder is not None, "未协商成功就进入持续流"
+                      out = stream_decoder.decompress(body)
+                      assert not stream_decoder.eof, "协议只允许 FLUSH，不应收到 END"
+                      assert not stream_decoder.unused_data and not stream_decoder.unconsumed_tail, "持续流存在未消费输入"
+                      assert len(out) <= MAX_PACKET_BYTES + 5, "单个传输帧解压输出越界"
+                      inner_bytes.extend(out)
+                      frames += 1
+                      packet = take_inner_packet(inner_bytes)
+                      if packet is None:
+                          continue
+                      verify_login_success(packet, "E2EVelocity")
                       seen["frame"] = True
-                      print("E2E_PASS compressed_frame_ok"); rc = 0; break
+                      print("E2E_PASS login_success_in_continuous_zstd frames=%d packet_bytes=%d" % (frames, len(packet)))
+                      rc = 0
+                      break
                   pid, pos = dv(packet, 0)
                   if pid == 0x03 and not compressed:
                       thr, _ = dv(packet, pos); compressed = True; compression_threshold = thr
@@ -606,7 +683,7 @@ jobs:
                       payload = packet[pp + sl:]
                       if chan == "zstd:negotiate":
                           server_version = struct.unpack(">i", payload)[0]
-                          assert server_version == NEGOTIATE, "服务端协商版本应为 11"
+                          assert server_version == NEGOTIATE, "服务端协商版本应为 12"
                           status = 0 if server_version == CLIENT_NEGOTIATE else 2
                           if status == 2 and compression_threshold is None:
                               pending_negotiate = (tx, status)
@@ -616,7 +693,7 @@ jobs:
                           send(sock, varint(0x02) + varint(tx) + b"\x01" + varint(status), compression_threshold)
                           seen["negotiate"] = True; print("  negotiate answered")
                       elif chan == "zstd:switch":
-                          assert expected_zstd, "版本 10 客户端保持原版时不应收到切换询问"
+                          assert expected_zstd, "版本 11 客户端保持原版时不应收到切换询问"
                           confirm = varint(0x02) + varint(tx) + b"\x01" + struct.pack(">I", MAGIC)
                           zlib_confirm = send(sock, confirm, compression_threshold)
                           assert zlib_confirm == (compression_threshold == 0), "确认帧应遵守原版压缩阈值"
@@ -627,8 +704,9 @@ jobs:
                   elif pid == 0x00:
                       print("  DISCONNECT: %s" % packet[pos:pos + 160]); break
                   elif pid == 0x02:
-                      assert not expected_zstd, "版本 11 客户端应启用下行 zstd"
+                      assert not expected_zstd, "版本 12 客户端应启用下行 zstd"
                       assert pending_negotiate is None and seen["negotiate"], "原版登录前必须已发送回落应答"
+                      verify_login_success(packet, "E2EVelocity")
                       seen["vanilla_login"] = True
                       print("E2E_PASS version_mismatch_stays_vanilla"); rc = 0; break
           except Exception as e:
@@ -647,7 +725,7 @@ jobs:
           echo "----- zstd lines -----"
           grep -E "zstd|Zstd" velocity.log | tail -30 || true
           echo "----- check -----"
-          if [ "${{ matrix.negotiate }}" = "11" ]; then
+          if [ "${{ matrix.negotiate }}" = "12" ]; then
             grep -q "Zstd transport activated" velocity.log || { echo "未激活"; tail -60 velocity.log; exit 1; }
           else
             if grep -q "Zstd transport activated" velocity.log; then echo "旧版客户端误激活"; exit 1; fi

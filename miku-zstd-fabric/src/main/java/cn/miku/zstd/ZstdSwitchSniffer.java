@@ -26,9 +26,8 @@ import java.util.List;
  *
  * <p>协议 v7 起 {@code zstd_decoder} 与 {@code decompress} <b>并存</b>（我们不再替换原版），
  * 所以锚点顺序是 {@code zstd_decoder} → {@code decompress} → {@code compression-decoder}：
- * 必须排在<b>我们的解码器上游</b>。若被插到我们下游，这条询问会被我们的解码器当"直存帧"
- * 处理——既喂进了滚动历史（服务端那条询问绕过编码器写、没有喂，两端历史当场分叉），
- * 又会被交到包解码器，客户端按未注册通道回一条 {@code success=false}。
+ * 必须排在<b>我们的解码器上游</b>。询问属于原版控制帧，不是连续 Zstd 流的一部分；
+ * 若先交给我们的解码器，会因流格式不符而关闭连接。
  * 锚点都不在时安装方只记 debug 等下一次触发，不做兜底位置。</p>
  *
  * <h2>为什么继承 {@code MessageToMessageDecoder}</h2>

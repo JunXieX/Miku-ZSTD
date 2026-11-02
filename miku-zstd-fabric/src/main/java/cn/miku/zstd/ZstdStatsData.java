@@ -21,7 +21,7 @@ public final class ZstdStatsData {
     private ZstdStatsData() {
     }
 
-    /** 入站：in = 收到的帧负载字节数，out = 解压后字节数。 */
+    /** 入站：in = 含 Minecraft 外层长度的线路字节，out = 含包长前缀的原始流字节。 */
     public static void addRxBatch(int inBytes, int outBytes) {
         ACCUM_RX_IN.add(inBytes);
         ACCUM_RX_OUT.add(outBytes);

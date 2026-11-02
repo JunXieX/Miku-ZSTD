@@ -10,30 +10,20 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.LongAdder;
 
 /**
- * 下行帧带宽剖析（全服聚合，默认 60 秒一行）。
+ * 下行压缩批次带宽剖析（全服聚合，默认 60 秒一行）。
  *
- * <h2>为什么需要它</h2>
- * <p>"怎么继续降低带宽"这个问题<b>必须用真实流量分布来回答</b>，因为不同帧长区间的
- * 优化手段完全不同。实测（合成流量，见 <code>开发期探针 MemProbe7~9</code>）：</p>
- * <ul>
- *   <li>小包（&lt;48B）：无字典时压缩后<b>膨胀到 105%</b>（全部直存、纯浪费 CPU），
- *       有字典后降到 80%——<b>字典的价值全在这里</b>；</li>
- *   <li>大包（&gt;1KB）：字典几乎无用（0.8%），且压缩等级 9/15/19 结果几乎相同；</li>
- *   <li>因此"下一步该优化什么"取决于你自己的字节分布。</li>
- * </ul>
+ * <p>按完成批次的原始流字节大小分档，记录原始字节与包含 Minecraft 外层长度的线路字节。
+ * 一个批次可输出多个传输帧，因此分档与计数不代表单个游戏包或传输帧的大小分布。</p>
  *
- * <p>本剖析按帧长分档统计<b>原始字节 / 线路字节 / 直存帧数</b>，直接告诉运维：
- * 字节都花在哪个区间、该区间压缩率如何、值不值得继续投入。</p>
- *
- * <p>代价：每帧一次数组下标 + {@link LongAdder#add}，可忽略。</p>
+ * <p>压缩效果以当前实例的实际流量为准；同一连接的批次共享连续流历史。</p>
  */
 public final class ZstdBandwidthProfiler {
 
     private static final Logger LOGGER = LoggerFactory.getLogger("miku-zstd");
 
-    /** 原始帧大小分档上界（字节）：&lt;128B、&lt;512B、&lt;4KB、≥4KB */
+    /** 原始批次大小分档上界（字节）：&lt;128B、&lt;512B、&lt;4KB、≥4KB */
     private static final int[] BAND_LIMIT = {128, 512, 4096, Integer.MAX_VALUE};
-    private static final String[] BAND_NAME = {"小帧 <128B", "中帧 128B-512B", "大帧 512B-4KB", "巨帧 ≥4KB"};
+    private static final String[] BAND_NAME = {"小批 <128B", "中批 128B-512B", "大批 512B-4KB", "巨批 ≥4KB"};
 
     private static final LongAdder[] RAW = new LongAdder[BAND_LIMIT.length];
     private static final LongAdder[] WIRE = new LongAdder[BAND_LIMIT.length];
@@ -95,7 +85,7 @@ public final class ZstdBandwidthProfiler {
         }
     }
 
-    /** 编码器热路径调用：记录一个下行帧。 */
+    /** 编码器在一个下行批次完成时聚合调用。 */
     public static void record(int rawSize, int wireSize, boolean compressed) {
         if (!enabled) return;
         int band = bandOf(rawSize);
@@ -130,7 +120,7 @@ public final class ZstdBandwidthProfiler {
                 long frames = FRAMES[i].sumThenReset();
                 long stored = STORED[i].sumThenReset();
                 if (raw == 0) continue;
-                sb.append(String.format("%n    %-14s 原始 %8s (%4.1f%%)  线路 %8s  压缩率 %5.1f%%  帧 %6d  直存 %6d",
+                sb.append(String.format("%n    %-14s 原始 %8s (%4.1f%%)  线路 %8s  压缩率 %5.1f%%  批 %6d  直存 %6d",
                         BAND_NAME[i], fmt(raw), 100.0 * raw / totalRaw, fmt(wire),
                         100.0 * wire / raw, frames, stored));
             }

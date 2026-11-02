@@ -73,7 +73,7 @@ public final class ZstdCtxPool {
             return;
         }
         synchronized (COMPRESS) {
-            if (COMPRESS.size() < LIMIT) {
+            if (!closed && COMPRESS.size() < LIMIT) {
                 COMPRESS.addFirst(ctx);
                 return;
             }
@@ -108,7 +108,7 @@ public final class ZstdCtxPool {
             return;
         }
         synchronized (DECOMPRESS) {
-            if (DECOMPRESS.size() < LIMIT) {
+            if (!closed && DECOMPRESS.size() < LIMIT) {
                 DECOMPRESS.addFirst(ctx);
                 return;
             }

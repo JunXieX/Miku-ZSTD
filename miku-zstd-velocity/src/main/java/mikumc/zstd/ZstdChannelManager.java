@@ -16,19 +16,14 @@ import org.slf4j.LoggerFactory;
  * <p>持有下行 zstd 压缩上下文与协商状态机。生命周期：嗅探器检测到
  * {@code \0ZSTD\0} 握手标记时创建，连接关闭时释放本地资源。</p>
  *
- * <h2>帧格式（v7；协商版本见 {@link #PROTOCOL_VERSION}）</h2>
+ * <h2>帧格式（v8；协商版本见 {@link #PROTOCOL_VERSION}）</h2>
  * <ul>
- *   <li>服务端 → 客户端帧（<b>压缩</b>）：{@code [varint bodyLen][varint rawSize][zstd(payload)]}
- *       或直存 {@code [varint bodyLen][0][packet]} —— Velocity 把「写外层长度」与「压缩」
- *       放在<b>同一个</b>处理器里，我们的帧要从它之后写出（才能跳过它），于是 bodyLen 由
- *       编码器<b>自带</b>（见 {@code ZstdBatchEncoder#writeBodyLen}）。</li>
- *   <li>客户端 → 服务端始终使用原版压缩协议：原版压缩解码器处理
- *       {@code [0][packet]} 或 {@code [dataLength][zlib(packet)]}，再交给包解码器。</li>
- *   <li>下行 {@code rawSize == 0} 表示未压缩直存：帧体<b>恰好是一个包</b>（{@code [0][packet]}），
- *       与原版未压缩帧逐字节同形；{@code rawSize > 0} 才是压缩帧，其
- *       {@code payload = [varint pktLen][pkt]...} 可含多个包。</li>
- *   <li>「v几」有三种含义（协商版本 / 帧格式 / 历史版本），见
- *       {@link ZstdVarInts} 类注释里的术语表——不要混用。</li>
+ *   <li>下行：{@code [varint bodyLen][magicless Zstd 连续字节]}，内层为连续的
+ *       {@code [varint packetLen][packet]}，一个包允许跨传输帧。Velocity 把外层长度与压缩
+ *       放在同一个原版处理器里，绕过它后由本编码器写 bodyLen。</li>
+ *   <li>同一连接只用一个压缩上下文；每批末尾 FLUSH，不 END，不装字典、不 reset。</li>
+ *   <li>上行始终沿用原版压缩协议：{@code [0][packet]} 或
+ *       {@code [dataLength][zlib(packet)]}，交给原版解码器。</li>
  * </ul>
  *
  * <h2>协商应答门控</h2>
@@ -37,9 +32,7 @@ import org.slf4j.LoggerFactory;
  *（帧层，主路径）与 Hijacker（包层，兜底）捕获并回填 {@link #markNegotiateResponse}，
  * 激活前必须看到"已应答且状态为就绪"，否则一律回落原版。</p>
  *
- * <p>⚠️ 5.0.42 起没有"字典协商"这一段了：训练字典整套删除，跨帧重复交给
- * {@link mikumc.zstd.protocol.ZstdRollingDict}（下行两端自动维护 64KB 滑窗）。
- * 因此本类不再持有任何字典对象，也不再需要引用计数/归还。</p>
+ * <p>跨批次匹配由持续的原生流状态维护，本类不持有或下发字典对象。</p>
  *
  * <h2>3.1.0 变更</h2>
  * <ul>
@@ -94,47 +87,30 @@ public class ZstdChannelManager {
         // 上下文从租借池取（见 ZstdCtxPool 的说明）：池内实例已被 reset，参数需重设。
         this.compressCtx = ZstdCtxPool.borrowCompress(cfg.level);
         this.compressCtx.setWindowLog(cfg.windowLog);
-        this.compressCtx.setLong(1); // LDM：提升区块级长距离重复的压缩率
+        // 保留显式windowLog；setLong的参数是窗口位数，不是启用布尔值。
         applySlimFrameFormat();
-        // 注意：这里不装载任何字典。跨帧重复由协议基类的滚动历史（ZstdRollingDict）
-        // 在帧边界自行维护，本类不参与，也不需要在激活路径上做任何字典准备。
+        // 仅在新借到的上下文上初始化；连接存续期间保留流状态，不装载字典或 reset。
     }
 
-    /**
-     * 帧头精简（自帧格式 v3 起）：去掉双方都已知道的冗余字段。
-     *
-     * <ul>
-     *   <li>{@code magicless}：省 4 字节 magic（对几十字节的小包占比可观）；</li>
-     *   <li>{@code contentSize=false}：省 1~4 字节——解压尺寸由协议里的 rawSize 提供，帧内不必再写；</li>
-     *   <li>{@code dictID=false}：省 1~4 字节——字典由双方按同一份滚动历史各自生成，
-     *       帧内既不必也不该带 id。</li>
-     * </ul>
-     *
-     * <p>三者都只是"不再重复写入双方已知的信息"，语义不变。实测（每包一帧）可再省约 10.7%。
-     * 解压端必须设置相同的 magicless 开关。</p>
-     *
-     * <p>本方法本身就是幂等的，构造器里施加一次即可；协议基类在换滚动历史字典时会重新
-     * loadDict，那里也会重新施加同样三个开关（见 {@code ZstdBatchEncoderBase}）。</p>
-     */
+    /** 新上下文的流格式：省略 magic、总原长和字典 ID；只在构造时调用一次。 */
     private void applySlimFrameFormat() {
         compressCtx.setMagicless(true);
         compressCtx.setContentSize(false);
+        compressCtx.setChecksum(false);
         compressCtx.setDictID(false);
     }
 
     /**
-     * 压缩上下文的互斥锁。
+     * 压缩上下文的生命周期租约，与编码器共用。
      *
-     * <p>压缩已卸载到线程池执行，因此任何改写 {@link #compressCtx} 的操作
-     * （换字典、重申帧头参数、close）都必须与池线程互斥——{@code ZstdCompressCtx} 不是线程安全的。
-     * 编码器通过 {@code ZstdBatchEncoderBase#compressLock()} 取得同一把锁。</p>
+     * <p>编码器取得租约后才读取上下文，并在使用结束后释放；关闭只禁止新租借并登记归还，
+     * 最后一个使用者退出后再归还池。监视器不包围原生压缩，event loop 不等待在途批次。</p>
      *
-     * <p>⚠️ 类型是 {@link ZstdCompressLock} 而不是 {@code Object}：它同时承载"上下文已关闭"
-     * 标志，池线程在锁内读它来避免 use-after-free（详见该类注释）。</p>
+     * <p>租约只保护上下文的存活期；原生压缩调用仍由编码器的单在途批次串行化。</p>
      */
     private final ZstdCompressLock compressLock = new ZstdCompressLock();
 
-    /** 供编码器使用：所有对 compressCtx 的访问都收敛到这一把锁上。 */
+    /** 供编码器使用：取得租约后才可访问 compressCtx，使用结束必须释放。 */
     public ZstdCompressLock compressLock() {
         return compressLock;
     }
@@ -459,14 +435,8 @@ public class ZstdChannelManager {
         stats.remove();
         // 走 setReplaced 归还计数（幂等），而不是直接判断 replaced —— 重复 close 不会多减
         setReplaced(false);
-        // ⚠️ 必须与池线程拿的是**同一把锁**：压缩在 ZstdCompressPool 的线程上执行，
-        // 若在途压缩还没回来就 close 掉 native 上下文，池线程会继续写已释放的内存 → SIGSEGV。
-        // ⚠️ 且必须**先立标志再关上下文**：标志与 close 在同一段持锁区内，池线程在锁内读到
-        // 标志即可安全放弃；顺序反了（先 close 后立标志）等于没防（详见 ZstdCompressLock 注释）。
-        synchronized (compressLock) {
-            compressLock.markClosed();
-            // 归还池（内部 reset）；池满/已停用时才真正 close
-            ZstdCtxPool.returnCompress(compressCtx);
-        }
+        // 只登记归还，不等待工作池的在途压缩；最后一个租约退出后由释放者归还。
+        // 归还动作在租约锁外执行，重复 close 也只归还一次。
+        compressLock.closeWhenIdle(() -> ZstdCtxPool.returnCompress(compressCtx));
     }
 }

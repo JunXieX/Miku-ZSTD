@@ -120,10 +120,10 @@ class ProtocolUnitsTest {
     // ────────────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("协议版本：上行回归原版使用 negotiate=11，下行仍为 frame=7")
-    void vanillaUpstreamKeepsDownstreamFrameVersion() {
-        assertEquals(11, ZstdProtocolVersion.NEGOTIATE);
-        assertEquals(7, ZstdProtocolVersion.FRAME);
+    @DisplayName("协议版本：原版上行与连续下行使用 negotiate=12 / frame=8")
+    void continuousDownstreamKeepsVanillaUpstream() {
+        assertEquals(12, ZstdProtocolVersion.NEGOTIATE);
+        assertEquals(8, ZstdProtocolVersion.FRAME);
     }
 
     @Test

@@ -58,6 +58,7 @@ class ZstdVelocityConfigLoadTest {
             assertEquals(Boolean.FALSE, logging.get("debug"));
         }
         String generated = Files.readString(file, StandardCharsets.UTF_8);
+        assertFalse(generated.contains("skip_compress_below_bytes"), "新模板不再生成旧直存阈值");
         ZstdVelocityConfig.load(file);
         assertFalse(ZstdVelocityConfig.INSTANCE.debug);
         assertEquals(generated, Files.readString(file, StandardCharsets.UTF_8));
@@ -78,12 +79,12 @@ class ZstdVelocityConfigLoadTest {
 
     @ParameterizedTest
     @ValueSource(booleans = {true, false})
-    @DisplayName("显式debug值与用户注释配置在重复真实load后保持不变")
+    @DisplayName("显式debug值、旧阈值与未知键在重复真实load后原文保留")
     void explicitDebugAndUserContentsSurviveRepeatedLoad(boolean debug) throws IOException {
         Path file = directory.resolve("config.yml");
         String contents = """
                 # 保留用户注释
-                compression: {level: 6}
+                compression: {level: 6, skip_compress_below_bytes: 65536}
                 logging: {debug: %s}
                 custom-key: keep
                 """.formatted(debug);

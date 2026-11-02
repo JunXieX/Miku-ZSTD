@@ -207,8 +207,7 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
     /**
      * 发协商查询：载荷只有 {@code [int 协议版本]}。
      *
-     * <p>5.0.42 起不再带 dictId 与 flags ——训练字典整套删除，滚动历史完全在本机按流量
-     * 自动维护，两端只要版本号对得上就能直接开始。</p>
+     * <p>不携带字典或压缩流状态；版本匹配且切换确认完成后，双方开始一条新连续流。</p>
      */
     private void sendNegotiate(ChannelHandlerContext ctx) {
         ZstdPaperChannelManager mgr = ctx.channel().attr(ZstdPaperChannelManager.KEY).get();
@@ -358,7 +357,7 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
         }
 
         // 走到这里说明应答是 0（就绪）：isRefused 那条分支已经处理了 2（保持原版）。
-        // 5.0.42 起不再有"缺字典待补偿"的中间态——滚动历史不下发，客户端也不会停在等字典上。
+        // 没有字典下发或补偿阶段；安装就绪后等待原版 switch 确认。
         LOGGER.debug("[Zstd] 正在安装下行 zstd 编码器 (pipeline={})", channel.pipeline().names());
         // 安装阶段仍然走自己的重试循环（计数从 0 起）：它等的是原版 handler 出现，
         // 与"等协商应答"是两条独立的时序，共用一个 attempt 会让晚进入安装阶段的一方
@@ -638,8 +637,8 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
             if (mgr != null) mgr.expectSwitchTxId(txId);
             mikumc.zstd.protocol.ZstdStepFrames.writeQuery(packet, txId,
                     mikumc.zstd.protocol.ZstdSwitchGate.CHANNEL);
-            // 帧格式（v6）：[rawSize=0][packet] —— 直存帧一帧一包、不带内层长度前缀，
-            // 与原版未压缩帧逐字节同形（见 ZstdBatchEncoderBase 的帧格式说明）。
+            // 原版 switch 控制帧：[dataLength=0][packet]，不进入连续 Zstd 流。
+            // 外层 Minecraft 长度仍由原版 prepender 添加。
             ZstdVarInts.write(frame, 0);
             frame.writeBytes(packet);
             writeCtx.writeAndFlush(frame);

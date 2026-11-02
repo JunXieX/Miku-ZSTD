@@ -7,7 +7,7 @@ import mikumc.zstd.protocol.ZstdCompressLock;
 import mikumc.zstd.protocol.ZstdTrafficCounter;
 
 /**
- * Miku-ZSTD 编码器（服务端 → 客户端）帧格式 <b>v7</b>（协商版本见共享协议常量）。
+ * Miku-ZSTD 编码器（服务端 → 客户端）连续流帧格式 <b>v8</b>（协商版本见共享协议常量）。
  *
  * <p>批处理、建帧、promise 编排等全部逻辑在共享基类
  * {@link ZstdBatchEncoderBase} 中（两端同一份源码）；本类只声明服务端的
@@ -34,36 +34,14 @@ public class ZstdBatchEncoder extends ZstdBatchEncoderBase {
     }
 
     /**
-     * 压缩已卸载到线程池；字典由 ChannelManager 改写 {@code compressCtx}、且它负责在
-     * 关连接时 close 该上下文，所以这里必须返回<b>与它相同的那把锁</b>——否则池线程压缩
-     * 会与「换字典 / close」并发，后者是 use-after-free（SIGSEGV）。
+     * 压缩已卸载到线程池；ChannelManager 负责在关连接时归还 {@code compressCtx}，
+     * 所以这里必须返回<b>与它相同的那把锁</b>——否则池线程压缩
+     * 会与「归还上下文」并发，后者是 use-after-free（SIGSEGV）。
      */
     @Override
     protected ZstdCompressLock compressLock() {
         ZstdChannelManager m = manager;
         return m == null ? super.compressLock() : m.compressLock();
-    }
-
-    /**
-     * 小包跳过压缩的阈值。
-     *
-     * <p>5.0.42 删掉训练字典后只剩这一个值（原来按"有没有训练字典"二选一）。
-     * 滚动历史生效后小包同样能压出收益，但判据仍是"这一批有多大"；
-     * 协议层另有 16B 硬地板，保证切换握手包永远直存。</p>
-     */
-    @Override
-    protected int skipCompressThreshold() {
-        return ZstdVelocityConfig.INSTANCE.skipCompressBelowBytes;
-    }
-
-    @Override
-    protected int configLevel() {
-        return ZstdVelocityConfig.INSTANCE.level;
-    }
-
-    @Override
-    protected int configWindowLog() {
-        return ZstdVelocityConfig.INSTANCE.windowLog;
     }
 
     /**
@@ -88,9 +66,8 @@ public class ZstdBatchEncoder extends ZstdBatchEncoderBase {
      * <p>两种叫法都要认：不同分支/移植版把同一个处理器注册成
      * {@code compression-encoder} 或 {@code compress}。</p>
      *
-     * <p>⚠️ 都找不到时返回 {@code null}（基类退回本处理器自己的 ctx）：那一帧多半会被
-     * 原版压缩再包一层、对端解不开，但至少不丢包——真实场景里只有第三方插件在激活后
-     * 拆改管线才会走到这里。</p>
+     * <p>⚠️ 都找不到时返回 {@code null}，由基类关闭连接；已进入的连续流
+     * 不能退回原版压缩、另起上下文或跳过失败批次。</p>
      */
     @Override
     protected ChannelHandlerContext downstream(ChannelHandlerContext ctx) {

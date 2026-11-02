@@ -19,10 +19,8 @@ import org.slf4j.LoggerFactory;
  *   <li>入站：{@code splitter} → {@code decompress} → {@code decoder}。</li>
  * </ul>
  *
- * <p>5.0.42 起没有"训练字典"这一层了：跨帧匹配全部由
- * {@link mikumc.zstd.protocol.ZstdRollingDict} 提供（每帧把最近 64KB 原始字节当字典，
- * 两端对称维护），本类只管上下文与互斥锁，不再持有任何字典对象——省掉下发通道，
- * 也省掉一处"两端字典不一致就断连"的故障源。</p>
+ * <p>同一条下行连接使用一个持续的 magicless Zstd 流，跨批次历史由原生上下文保留。
+ * 本类只在借到新上下文时配置参数；传输期间不装载字典、不重置上下文。</p>
  */
 public class ZstdPaperChannelManager {
 
@@ -50,26 +48,25 @@ public class ZstdPaperChannelManager {
         // 池里归还的实例已被 reset 成"刚创建"的状态，因此下面必须重新设全部参数。
         this.compressCtx = ZstdCtxPool.borrowCompress(cfg.level);
         this.compressCtx.setWindowLog(cfg.windowLog);
-        this.compressCtx.setLong(1); // LDM：提升区块级长距离重复的压缩率
+        // 保留显式windowLog；setLong的参数是窗口位数，不是启用布尔值。
         // 帧头精简必须与客户端一致（magicless / 无 contentSize / 无 dictID）
         this.compressCtx.setMagicless(true);
         this.compressCtx.setContentSize(false);
+        compressCtx.setChecksum(false);
         this.compressCtx.setDictID(false);
     }
 
     /**
-     * 压缩上下文的互斥锁。
+     * 压缩上下文的生命周期租约，与编码器共用。
      *
-     * <p>压缩已卸载到线程池执行，因此任何改写 {@link #compressCtx} 的操作
-     * （装载滚动历史、重申帧头参数、close）都必须与池线程互斥——{@code ZstdCompressCtx} 不是线程安全的。
-     * 编码器通过 {@code ZstdBatchEncoderBase#compressLock()} 取得同一把锁。</p>
+     * <p>编码器取得租约后才读取上下文，并在使用结束后释放；关闭只禁止新租借并登记归还，
+     * 最后一个使用者退出后再归还池。监视器不包围原生压缩，event loop 不等待在途批次。</p>
      *
-     * <p>⚠️ 类型是 {@link ZstdCompressLock} 而不是 {@code Object}：它同时承载"上下文已关闭"
-     * 标志，池线程在锁内读它来避免 use-after-free（详见该类注释）。</p>
+     * <p>租约只保护上下文的存活期；原生压缩调用仍由编码器的单在途批次串行化。</p>
      */
     private final ZstdCompressLock compressLock = new ZstdCompressLock();
 
-    /** 供编码器使用：所有对 compressCtx 的访问都收敛到这一把锁上。 */
+    /** 供编码器使用：取得租约后才可访问 compressCtx，使用结束必须释放。 */
     public ZstdCompressLock compressLock() {
         return compressLock;
     }
@@ -105,7 +102,7 @@ public class ZstdPaperChannelManager {
     /**
      * 回填协商结论。语义与另两端完全一致：
      * {@code 0 = 客户端启用 zstd}、{@code 2 = 客户端保持原版}
-     *（5.0.42 删掉了原来的 {@code 1 = 需要字典}——滚动历史不需要任何下发）。
+     *（旧客户端的 {@code 1 = 需要字典} 已废弃，不再有字典下发阶段）。
      *
      * <p>状态码先经 {@link ZstdNegotiateStatus#sanitize} 归一化：旧客户端的 1、以及畸形载荷里的
      * 任何其它值都按 2 处理。"不动"永远比"单侧动"安全——服务端一旦激活、客户端没激活，
@@ -165,7 +162,7 @@ public class ZstdPaperChannelManager {
     /**
      * 安装出站编码器：插在原版 {@code compress} <b>之后</b>（出站方向上先经过我们）。
      *
-     * <p>⚠️ 这里<b>不换掉</b>原版处理器。协议 v7 起编码器只负责"把攒下的包合成一帧"，
+     * <p>⚠️ 这里<b>不换掉</b>原版处理器。编码器把攒下的包写进连续流并 flush 输出，
      * 成帧结果从 {@code ZstdBatchEncoderBase#downstream(ChannelHandlerContext)} 指的位置
      * 写出——也就是原版 {@code compress} 的 context：绕过它，但不拆它。留下它换回三件事：
      * 按名字查找 {@code compress}/{@code prepender} 的插件（ViaVersion / PacketEvents /
@@ -336,15 +333,8 @@ public class ZstdPaperChannelManager {
         stats.remove();
         // 走 setReplaced 归还计数（幂等），而不是直接判断 replaced —— 重复 close 不会多减
         setReplaced(false);
-        // ⚠️ 必须与池线程拿的是**同一把锁**：压缩在 ZstdCompressPool 的线程上执行，
-        // 若在途压缩还没回来就 close 掉 native 上下文，池线程会继续写已释放的内存 → SIGSEGV。
-        // ⚠️ 且必须**先立标志再关上下文**：标志与 close 在同一段持锁区内，池线程在锁内读到
-        // 标志即可安全放弃；顺序反了（先 close 后立标志）等于没防（详见 ZstdCompressLock 注释）。
-        synchronized (compressLock) {
-            if (compressLock.isClosed()) return;
-            compressLock.markClosed();
-            // 归还而非关闭：池内部会 reset（清字典与参数），池满或已停用时才真正 close
-            ZstdCtxPool.returnCompress(compressCtx);
-        }
+        // 只登记归还，不等待工作池的在途压缩；最后一个租约退出后由释放者归还。
+        // 归还动作在租约锁外执行，重复 close 也只归还一次。
+        compressLock.closeWhenIdle(() -> ZstdCtxPool.returnCompress(compressCtx));
     }
 }

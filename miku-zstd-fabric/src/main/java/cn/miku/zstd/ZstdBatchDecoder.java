@@ -5,19 +5,24 @@ import io.netty.channel.ChannelHandlerContext;
 import mikumc.zstd.protocol.ZstdBatchDecoderBase;
 
 /**
- * 服务端 → 客户端的 zstd 下行解码器，帧格式保持 v7，协商版本取共享常量。
+ * 服务端 → 客户端的 zstd 下行解码器，连续流帧格式 v8，协商版本取共享常量。
  *
- * <p>共享基类负责帧解析、分块解压、内层切包与边界检查。本类只提供下行上下文、
+ * <p>共享基类负责持续解压、跨帧内层切包与边界检查。本类只提供下行上下文、
  * 已解包的转发位置与 HUD 下行统计，不实现任何上行或原版压缩帧兼容分支。</p>
  * <pre>
  *   socket → decrypt → splitter → zstd_switch_sniffer → zstd_decoder → decompress → decoder
  * </pre>
  * <p>收到的是已解密且剥掉外层长度的帧体；解出的普通包从 decompress 的 context 向后交付，
- * 跳过原版/Krypton 重复解压。直存帧仍为 {@code [0][packet]}，压缩帧格式保持不变。</p>
+ * 跳过原版/Krypton 重复解压。每个帧体仅含同一条 magicless Zstd 流的后续字节。</p>
  */
 public class ZstdBatchDecoder extends ZstdBatchDecoderBase {
 
     private ZstdChannelManager manager;
+    private boolean streamStarted;
+
+    boolean hasStartedStream() {
+        return streamStarted;
+    }
 
     @Override
     protected ZstdDecompressCtx resolveDecompressContext(ChannelHandlerContext ctx) {
@@ -33,8 +38,8 @@ public class ZstdBatchDecoder extends ZstdBatchDecoderBase {
      * 每帧重新取解压上下文。
      *
      * <p>重放登录（重新协商）时 {@code ZstdChannelManager#resetContexts()}
-     * 会把旧上下文归还池、换一个新的。旧实例里绑着上一轮滚动历史算出的字典，继续用就会按
-     * 错代的字典解压 —— 帧头 {@code dictGen} 对不上，或者更糟：解出一堆看着像包的东西。
+     * 会把旧上下文归还池、换一个新的；旧实例的流状态属于上一轮协商，不能继续复用。
+     * 同一轮连接期间始终使用同一个上下文，不在传输帧之间重置或装载字典。
      * 读取发生在 decode（event loop）上，替换也只在 event loop 上发生（协商回调），
      * 因此不存在并发。</p>
      */
@@ -58,21 +63,17 @@ public class ZstdBatchDecoder extends ZstdBatchDecoderBase {
      */
     @Override
     protected ChannelHandlerContext decodeForwardTarget(ChannelHandlerContext ctx) {
+        // 交包可能同步触发压缩设置；必须先标记，不能等整帧统计回调。
+        streamStarted = true;
         io.netty.channel.ChannelHandlerContext c = ctx.pipeline().context("decompress");
         if (c != null) return c;
         return ctx.pipeline().context("compression-decoder");
     }
 
     @Override
-    protected void onStoredFrame(int frameBodyBytes) {
-        // ⚠️ 两侧口径必须一致（都含 rawSize 标记），否则直存帧会显示成 99.9% 而不是 100%
-        // —— 直存帧本来就没有解压步骤，把协议头算成"膨胀"是纯误导。
-        ZstdStatsData.addRxBatch(1 + frameBodyBytes, 1 + frameBodyBytes);
-    }
-
-    @Override
-    protected void onCompressedFrame(int inBytes, int outBytes) {
-        // 线路侧已含完整帧头；原始侧保持一字节直存标记的既有比较基线。
-        ZstdStatsData.addRxBatch(inBytes, 1 + outBytes);
+    protected void onCompressedFrame(int wireBytes, int rawBytes) {
+        streamStarted = true;
+        // 基类已计入 MC 外层长度；原始侧是实际解出的内层流字节，不另补标记。
+        ZstdStatsData.addRxBatch(wireBytes, rawBytes);
     }
 }

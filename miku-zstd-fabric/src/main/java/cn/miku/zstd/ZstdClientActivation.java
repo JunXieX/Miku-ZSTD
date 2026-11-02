@@ -46,7 +46,7 @@ public final class ZstdClientActivation {
         channel.eventLoop().execute(() -> activateInEventLoop(channel, false));
     }
 
-    /** 阈值关闭时仅摘掉下行处理器，原版上下行处理器由 Connection 自行管理。 */
+    /** 初始阈值关闭仍用原版；已推进的连续流关闭连接，不丢半包后另装解码器。 */
     public static void onCompressionThreshold(Channel channel, int threshold) {
         if (channel == null) return;
         if (threshold < 0) {
@@ -62,9 +62,18 @@ public final class ZstdClientActivation {
 
     private static void deactivateQuietly(Channel channel) {
         if (!channel.isActive()) return;
+        var handler = channel.pipeline().get("zstd_decoder");
+        boolean started = handler instanceof ZstdBatchDecoder decoder
+                ? decoder.hasStartedStream() : Boolean.TRUE.equals(channel.attr(ACTIVATED).get());
+        if (started) {
+            channel.attr(ACTIVATED).set(Boolean.FALSE);
+            LOGGER.warn("[Zstd] closing continuous stream — compression disabled after stream input");
+            channel.close();
+            return;
+        }
         boolean changed = removeOwnHandlers(channel.pipeline());
         channel.attr(ACTIVATED).set(Boolean.FALSE);
-        // 保留协商状态，允许同一连接再次收到 SetCompression 时重装下行处理器。
+        // 尚未消费任何流字节时才允许保留协商状态，等待后续 SetCompression。
         if (changed) {
             LOGGER.info("[Zstd] 压缩被对端禁用（threshold<0）——客户端下行退回原版; pipeline={}",
                     channel.pipeline().names());
@@ -173,9 +182,12 @@ public final class ZstdClientActivation {
 
         if (Boolean.TRUE.equals(channel.attr(ACTIVATED).get())) {
             if (handlersPositionedCorrectly(p)) return;
+            // 旧解码器可能持有半包；重建会丢失边界，持续流也没有可重新同步的帧头。
             channel.attr(ACTIVATED).set(Boolean.FALSE);
-            LOGGER.debug("[Zstd] reactivating — downstream handlers missing or misplaced; pipeline={}",
+            LOGGER.warn("[Zstd] closing continuous stream — downstream handlers missing or misplaced; pipeline={}",
                     p.names());
+            channel.close();
+            return;
         }
 
         ZstdChannelManager.TransportState state = channel.attr(ZstdChannelManager.ZSTD_STATE).get();
@@ -208,7 +220,7 @@ public final class ZstdClientActivation {
             LOGGER.error("[Zstd] activation aborted — downstream decoder insert failed; pipeline={}", p.names());
             return;
         }
-        // switch 询问绕过服务端 zstd 编码器，不得进入本端滚动历史。
+        // switch 询问绕过服务端 zstd 流，必须先由嗅探器截获。
         installSwitchSniffer(p);
         if (p.get("zstd_switch_sniffer") == null || !handlersPositionedCorrectly(p)) {
             LOGGER.warn("[Zstd] 下行激活校验失败——解码器或切换嗅探器缺失/错位; pipeline={}", p.names());
@@ -220,7 +232,7 @@ public final class ZstdClientActivation {
         LOGGER.info("[Zstd] Client downstream zstd activated; upstream remains vanilla; pipeline={}", p.names());
     }
 
-    /** switch 必须先于 zstd_decoder 截获，否则会污染下行滚动历史。 */
+    /** switch 必须先于 zstd_decoder 截获，否则原版控制帧会被误作 Zstd 流。 */
     private static void installSwitchSniffer(ChannelPipeline p) {
         String anchor = firstPresent(p, SNIFFER_ANCHORS);
         if (anchor == null) return;
@@ -232,7 +244,7 @@ public final class ZstdClientActivation {
         p.addBefore(anchor, "zstd_switch_sniffer", new ZstdSwitchSniffer());
     }
 
-    /** 只在确实错位时重插；正常激活保留解码器及其滚动历史。 */
+    /** 仅安装就绪前允许调整位置；重复激活保留既有解码器与半包状态。 */
     private static boolean installDecoder(ChannelPipeline p) {
         String anchor = firstPresent(p, DECODER_ANCHORS);
         if (anchor == null) return false;
