@@ -43,6 +43,7 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
     private ScheduledFuture<?> windowTask;
     private int batchWindowMs = 50;
     private int batchMaxPackets = 64;
+    private int batchMaxBytes;
     private boolean compressing;
     private boolean draining;
     private Batch inflight;
@@ -55,6 +56,17 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
     protected abstract void onFrame(int rawBytes, int wireBytes, boolean compressed);
     protected abstract int configBatchWindowMs();
     protected abstract int configBatchMaxPackets();
+
+    /**
+     * 每批的原始字节预算，0 = 不启用（只按包数上限收批）。
+     *
+     * <p>包数上限对大小差异极大的流量不成立：64 个聊天包只有几 KB，64 个区块包可能
+     * 上兆，同一个数字代表两个数量级的字节量。给了字节预算后，大包场景不再被拆成
+     * 多次小批，小包场景仍能凑满批。默认关闭，避免改变既有部署的行为。</p>
+     */
+    protected int configBatchMaxBytes() {
+        return 0;
+    }
 
     protected ChannelHandlerContext downstream(ChannelHandlerContext ctx) {
         return ctx;
@@ -76,6 +88,7 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
         }
         batchWindowMs = Math.max(0, configBatchWindowMs());
         batchMaxPackets = Math.max(1, configBatchMaxPackets());
+        batchMaxBytes = Math.max(0, configBatchMaxBytes());
     }
 
     @Override
@@ -111,7 +124,9 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
                 abort(ctx, new IllegalStateException("outbound backlog exceeds " + MAX_PENDING_BYTES));
                 return;
             }
-            if (pendingPackets >= batchMaxPackets || batchWindowMs == 0) {
+            if (pendingPackets >= batchMaxPackets
+                    || (batchMaxBytes > 0 && pendingBytes >= batchMaxBytes)
+                    || batchWindowMs == 0) {
                 emitBatch(ctx);
             } else {
                 scheduleFallback(ctx);
@@ -199,6 +214,8 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
             packets.add(packet);
             if (!entry.promise().isVoid()) promises.add(entry.promise());
             rawBytes += encoded;
+            // 字节预算达标即收批；上面已保证至少收进一个包。
+            if (batchMaxBytes > 0 && rawBytes >= batchMaxBytes) break;
         }
         Batch batch = new Batch(packets, promises, rawBytes, writeBodyLen());
         compressing = true;

@@ -95,4 +95,9 @@ public class ZstdBatchEncoder extends ZstdBatchEncoderBase {
     protected int configBatchMaxPackets() {
         return ZstdVelocityConfig.INSTANCE.batchMaxPackets;
     }
+
+    @Override
+    protected int configBatchMaxBytes() {
+        return ZstdVelocityConfig.INSTANCE.batchMaxBytes;
+    }
 }

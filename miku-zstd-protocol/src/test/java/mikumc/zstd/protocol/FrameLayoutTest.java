@@ -107,6 +107,32 @@ class FrameLayoutTest {
     }
 
     @Test
+    @DisplayName("按字节预算收批：包数上限未到也按预算切分，且每批至少一个包")
+    void byteBudgetSplitsBatches() {
+        int budget = 4096;
+        TestEncoder encoder = encoder(true, 64, NEVER_DUE_MS, budget);
+        EmbeddedChannel out = channel(encoder);
+        EmbeddedChannel in = channel(new OuterSplitter(), decoder());
+        List<byte[]> sentPackets = new ArrayList<>();
+        for (int i = 0; i < 12; i++) {
+            byte[] packet = randomBytes(1500, 5000L + i);
+            sentPackets.add(packet);
+            // 不 flush：这里要验证的是字节预算自己触发收批，而不是上游 flush 触发。
+            out.write(input(packet, i % 3));
+        }
+        out.flush();
+        await(out, () -> encoder.frames.size() >= 4);
+        for (byte[] body : takeBodies(out, true)) feedTcp(in, body, 77L);
+        assertPackets(in, sentPackets);
+        assertTrue(encoder.frames.size() >= 4,
+                "12×1500B 在 4096B 预算下应拆成至少 4 批，实际 " + encoder.frames.size());
+        for (int[] frame : encoder.frames) {
+            assertTrue(frame[0] <= budget + 1600,
+                    "单批原始字节 " + frame[0] + " 超过预算加上一个包的余量");
+        }
+    }
+
+    @Test
     @DisplayName("heap/direct/复合输入均从原 readerIndex 往返，且由worker持有原包")
     void inputKindsAndNonZeroReaderIndices() {
         for (int kind = 0; kind < 3; kind++) {
@@ -1141,6 +1167,12 @@ class FrameLayoutTest {
         encoders.add(encoder); return encoder;
     }
 
+    private TestEncoder encoder(boolean bodyLen, int maxPackets, int windowMs, int maxBytes) {
+        TestEncoder encoder = new TestEncoder(bodyLen, maxPackets, windowMs);
+        encoder.maxBytes = maxBytes;
+        encoders.add(encoder); return encoder;
+    }
+
     private TestDecoder decoder() {
         ZstdDecompressCtx ctx = new ZstdDecompressCtx(); ctx.setMagicless(true);
         decoders.add(ctx); return new TestDecoder(ctx);
@@ -1295,6 +1327,7 @@ class FrameLayoutTest {
         final boolean bodyLen;
         final int maxPackets;
         final int windowMs;
+        int maxBytes;
         String forwardHandler;
         volatile RuntimeException batchFailure;
         final Thread testThread = Thread.currentThread();
@@ -1377,6 +1410,7 @@ class FrameLayoutTest {
         }
         @Override protected int configBatchWindowMs() { return windowMs; }
         @Override protected int configBatchMaxPackets() { return maxPackets; }
+        @Override protected int configBatchMaxBytes() { return maxBytes; }
     }
 
     private static final class TestDecoder extends ZstdBatchDecoderBase {

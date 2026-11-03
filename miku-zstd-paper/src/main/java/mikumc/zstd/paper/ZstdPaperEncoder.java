@@ -79,4 +79,9 @@ public class ZstdPaperEncoder extends ZstdBatchEncoderBase {
     protected int configBatchMaxPackets() {
         return ZstdPaperConfig.INSTANCE.batchMaxPackets;
     }
+
+    @Override
+    protected int configBatchMaxBytes() {
+        return ZstdPaperConfig.INSTANCE.batchMaxBytes;
+    }
 }
