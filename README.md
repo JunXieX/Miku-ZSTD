@@ -1,4 +1,4 @@
-# Miku-ZSTD
+# Miku-ZSTD 6.1.0
 
 作者：JunXieX　|　MikuMC系列插件交流群：1105054380　|　非开源项目，请勿二次分发
 
@@ -12,6 +12,7 @@
 - 新生成的服务端配置默认关闭调试日志，已有配置中的显式设置保持原样。
 - 代理上 `/mikuzstd bar` 对后端同名命令的遮蔽：具备代理权限时在代理执行，否则已连接后端的玩家交由后端鉴权。
 - 关闭后端原版压缩时，仍保留 `/mikuzstd bar` 的执行与补全。
+- 6.1.0 新增分段耗时（`latency`）、往返探测（`ping`）与精确字节计数（`traffic`）三个诊断命令；`batch_max_packets` 默认提高到 256，新增默认关闭的 `batch_max_bytes` 字节预算。
 - 6.0.4 修复 Fabric + Krypton 在协商应答早于 SetCompression 时发出未封装登录包的问题；使用 FRP 转发仍可保持 `transport.useCompression=true`。
 - 6.0.2 起不再设置小包直存阈值，所有接管后的下行包都进入连续压缩流；旧协商协议的客户端协商不匹配时保持原版。
 
