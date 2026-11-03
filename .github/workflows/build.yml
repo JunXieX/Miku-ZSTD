@@ -208,6 +208,13 @@ jobs:
           EOF
           nohup /tmp/frp-bin/frps -c /tmp/frp-bin/frps.toml > /tmp/frps.log 2>&1 < /dev/null &
           echo $! > /tmp/frps.pid
+          for i in $(seq 1 30); do
+            if (echo > /dev/tcp/127.0.0.1/7000) 2>/dev/null; then break; fi
+            sleep 1
+          done
+          if ! (echo > /dev/tcp/127.0.0.1/7000) 2>/dev/null; then
+            echo "frps did not start"; cat /tmp/frps.log; exit 1
+          fi
           nohup /tmp/frp-bin/frpc -c /tmp/frp-bin/frpc.toml > /tmp/frpc.log 2>&1 < /dev/null &
           echo $! > /tmp/frpc.pid
           python3 - <<'PY'
