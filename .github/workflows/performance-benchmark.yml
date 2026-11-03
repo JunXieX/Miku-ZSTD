@@ -143,7 +143,8 @@ jobs:
             --candidate-paper-jar "$GITHUB_WORKSPACE"/dist/candidate/Miku-ZSTD-*-Paper.jar \
             --candidate-sha "$CANDIDATE_SHA" --frp-compression true --clients "$CLIENTS" \
             --duration-minutes "$DURATION" --rounds "$ROUNDS" --warmup-minutes 2 \
-            --randomize-order --result-dir "$result"
+            --randomize-order --result-dir "$result" \
+            --event-log "$EVIDENCE_DIR/sanitized/lifecycle.jsonl"
           python3 scripts/ci/validate_real_client_result.py benchmark-pair "$result/summary.json" \
             --expected-clients "$CLIENTS" --expected-sha "$CANDIDATE_SHA" \
             --expected-baseline-sha "$BASELINE_SHA" \
@@ -161,6 +162,7 @@ jobs:
           path: |
             ${{ steps.evidence.outputs.dir }}/sanitized/summary.json
             ${{ steps.evidence.outputs.dir }}/sanitized/runner-preflight.json
+            ${{ steps.evidence.outputs.dir }}/sanitized/lifecycle.jsonl
           if-no-files-found: warn
           retention-days: 30
 

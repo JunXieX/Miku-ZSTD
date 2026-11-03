@@ -98,7 +98,8 @@ jobs:
           python3 scripts/ci/lab_harness.py smoke --config "$MZSTD_SMOKE_CONFIG" \
             --fabric-jar "$GITHUB_WORKSPACE"/dist/Miku-ZSTD-*-Fabric.jar \
             --paper-jar "$GITHUB_WORKSPACE"/dist/Miku-ZSTD-*-Paper.jar \
-            --frp-compression true --duration-seconds "$SMOKE_SECONDS" --candidate-sha "$GITHUB_SHA" --result-dir "$result"
+            --frp-compression true --duration-seconds "$SMOKE_SECONDS" --candidate-sha "$GITHUB_SHA" --result-dir "$result" \
+            --event-log "$EVIDENCE_DIR/sanitized/lifecycle.jsonl"
           python3 scripts/ci/validate_real_client_result.py smoke "$result/summary.json" \
             --expected-clients 1 --expected-sha "$GITHUB_SHA" \
             --min-duration-seconds "$SMOKE_SECONDS" --expected-nonce "$MZSTD_RUN_NONCE" \
@@ -112,6 +113,7 @@ jobs:
           path: |
             ${{ steps.evidence.outputs.dir }}/sanitized/summary.json
             ${{ steps.evidence.outputs.dir }}/sanitized/runner-preflight.json
+            ${{ steps.evidence.outputs.dir }}/sanitized/lifecycle.jsonl
           if-no-files-found: warn
           retention-days: 14
 

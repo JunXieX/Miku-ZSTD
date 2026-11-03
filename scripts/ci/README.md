@@ -76,7 +76,7 @@ python3 scripts/ci/runner_doctor.py \
 
 诊断文件固定标记 runner_preflight_only、measurement_produced=false，失败返回非零并列出固定问题代码；仅导出白名单硬件/版本/摘要/计数，不输出配置路径、原始命令输出和会话资料。runtime 中给出的路径必须指向实验机已经安装的文件，示例不是安装脚本。existing 显示模式要求 DISPLAY；xvfb 模式需要指定 Xvfb 可执行文件；二者都不是图形渲染验收。
 
-两个自托管 job 在运行场景之前自动执行相同预检。运行配置、原始测量报告和白名单 artifact 使用不同子目录，避免预检输出干扰编排器的新报告检查。Actions 只按文件名白名单上传 summary.json 和 runner-preflight.json；预检通过不增加任何真实测试通过计数。
+两个自托管 job 在运行场景之前自动执行相同预检。运行配置、原始测量报告和白名单 artifact 使用不同子目录，避免预检输出干扰编排器的新报告检查。Actions 只按文件名白名单上传 summary.json、runner-preflight.json 和 lifecycle.jsonl；预检通过不增加任何真实测试通过计数。
 
 ## 场景驱动接口
 
@@ -117,9 +117,17 @@ READY/config 缺失时，托管 preflight 会给出 skip 提示，自托管测�
 
 ## 日志与凭据
 
-每次 job 都创建带 run_id/run_attempt 的唯一临时目录和随机 nonce。校验器重新读取实际下载 JAR 的 SHA256，并校验每轮客户端人数、持续时间与指标。Actions 只上传校验器导出的 sanitized/summary.json 和独立 sanitized/runner-preflight.json 白名单；原始游戏/launcher/FRP 日志和会话留在实验机，不整体上传。
+每次 job 都创建带 run_id/run_attempt 的唯一临时目录和随机 nonce。校验器重新读取实际下载 JAR 的 SHA256，并校验每轮客户端人数、持续时间与指标。Actions 只上传校验器导出的 sanitized/summary.json、独立 sanitized/runner-preflight.json 与 sanitized/lifecycle.jsonl 白名单；原始游戏/launcher/FRP 日志和会话留在实验机，不整体上传。
 
 发现 credential 字段时拒收整个报告；未知附加字段不输出到摘要或 stdout。此白名单不代替对驱动的人工验收：受信任驱动仍需确保 client id 与各数值字段不包含认证信息。私有原始日志的访问、留存与清理由实验机管理员控制。
+
+## 编排阶段日志
+
+公共编排器接受可选 --event-log，两个工作流会启用独立 sanitized/lifecycle.jsonl。每条记录仅含固定阶段代码、序号、相对单调时钟毫秒数、受限模式以及可选轮次/变体。内容由公共编排器构造，不复制场景驱动的 stdout、异常文本、命令参数、路径或配置。
+
+它记录编排开始/结束/失败/取消、实验室锁、变体开始、收到报告与清理成败，失败时也保留已经产生的阶段记录。每行固定 measurement_produced=false：这是定位启动和清理问题的控制流程日志，不是客户端加载、真实登录或性能通过的证据；相对时间也不是游戏 RTT。游戏事实与性能判断仍需独立 report/summary 验收，原始游戏日志留在实验机。
+
+日志采用0600独占新建，只允许写入指定证据根目录的 sanitized/lifecycle.jsonl；已有文件或链接目标拒绝写入，不会追加到历史日志。未指定 --event-log 的手动调用不创建阶段日志。
 
 ## 验证边界
 

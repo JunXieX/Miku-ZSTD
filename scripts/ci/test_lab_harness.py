@@ -334,5 +334,352 @@ class LabHarnessTest(unittest.TestCase):
                          {"measurement_produced": False})
 
 
+    def lifecycle_args(self, mode="smoke", rounds=3):
+        args = self.args(mode, rounds)
+        sanitized = self.output / "sanitized"
+        sanitized.mkdir(parents=True, exist_ok=True)
+        args.result_dir = str(self.output / "scenario")
+        args.event_log = str(sanitized / "lifecycle.jsonl")
+        return args
+
+    @staticmethod
+    def event_rows(args):
+        return [json.loads(line) for line in Path(args.event_log).read_text(
+            encoding="utf-8").splitlines()]
+
+    def test_lifecycle_smoke_success_has_fixed_sequence_and_schema(self):
+        self.install_runner()
+        args = self.lifecycle_args()
+        result = lab.execute(args)
+        rows = self.event_rows(args)
+        self.assertEqual([row["event"] for row in rows], [
+            "orchestration_started", "lock_acquired", "variant_started",
+            "report_received", "cleanup_started", "cleanup_finished",
+            "orchestration_finished"])
+        self.assertEqual([row["seq"] for row in rows], list(range(1, 8)))
+        base = {"schema_version", "type", "event", "seq", "monotonic_elapsed_ms",
+                "mode", "measurement_produced"}
+        for row in rows:
+            scoped = row["event"] in ("variant_started", "report_received",
+                                      "cleanup_started", "cleanup_finished")
+            self.assertEqual(set(row), base | ({"round_id", "variant"} if scoped else set()))
+            self.assertEqual(row["schema_version"], 1)
+            self.assertEqual(row["type"], "orchestration_event")
+            self.assertEqual(row["mode"], "smoke")
+            self.assertIs(row["measurement_produced"], False)
+            self.assertIs(type(row["seq"]), int)
+            self.assertIs(type(row["monotonic_elapsed_ms"]), int)
+            self.assertGreaterEqual(row["monotonic_elapsed_ms"], 0)
+            if scoped:
+                self.assertEqual((row["round_id"], row["variant"]), (1, "candidate"))
+        self.assertEqual(result["metrics"]["duration_seconds"], 2)
+        self.assertEqual(result["metrics"]["unknown_native_metric"], {"must_survive": 123})
+        self.assertEqual([p.name for p in Path(args.result_dir).iterdir()], ["summary.json"])
+
+    def test_lifecycle_pair_records_actual_round_and_variant_order(self):
+        self.install_runner()
+        args = self.lifecycle_args("benchmark-pair", rounds=2)
+        with mock.patch.object(lab.secrets, "randbelow", return_value=0):
+            result = lab.execute(args)
+        rows = self.event_rows(args)
+        starts = [row for row in rows if row["event"] == "variant_started"]
+        self.assertEqual([(row["round_id"], row["variant"]) for row in starts],
+                         [(1, "baseline"), (1, "candidate"),
+                          (2, "candidate"), (2, "baseline")])
+        self.assertTrue(all(row["mode"] == "benchmark-pair" for row in rows))
+        self.assertEqual(len(rows), 19)
+        self.assertEqual(result["metrics"]["duration_seconds"], 12)
+        self.assertEqual(rows[-1]["event"], "orchestration_finished")
+
+    def test_lifecycle_failure_preserves_exception_and_excludes_sensitive_text(self):
+        secret = "private-driver-argv-stdout-config-path-exception"
+        failure = RuntimeError(secret)
+        self.install_runner(failure=failure)
+        args = self.lifecycle_args()
+        with self.assertRaises(RuntimeError) as raised:
+            lab.execute(args)
+        self.assertIs(raised.exception, failure)
+        rows = self.event_rows(args)
+        self.assertEqual([row["event"] for row in rows], [
+            "orchestration_started", "lock_acquired", "variant_started",
+            "cleanup_started", "cleanup_finished", "orchestration_failed"])
+        text = Path(args.event_log).read_text(encoding="utf-8")
+        for value in (secret, str(self.config), str(self.work), str(self.fabric),
+                      "fixture-command-never-run", "mock-only private output"):
+            self.assertNotIn(value, text)
+        self.assertFalse((Path(args.result_dir) / "summary.json").exists())
+        self.assertTrue(self.calls[-1]["cleanup"])
+
+    def test_lifecycle_cancelled_still_cleans_up_and_closes(self):
+        failure = lab.Cancelled("private cancellation details")
+        self.install_runner(failure=failure)
+        args = self.lifecycle_args()
+        events = lab.LifecycleLog(args.event_log, args.result_dir, args.mode)
+        with mock.patch.object(lab, "lifecycle", return_value=events):
+            with self.assertRaises(lab.Cancelled) as raised:
+                lab.execute(args)
+        self.assertIs(raised.exception, failure)
+        self.assertTrue(events.stream.closed)
+        self.assertEqual([row["event"] for row in self.event_rows(args)][-3:],
+                         ["cleanup_started", "cleanup_finished", "orchestration_cancelled"])
+        self.assertTrue(self.calls[-1]["cleanup"])
+        self.assertNotIn("private cancellation", Path(args.event_log).read_text(encoding="utf-8"))
+
+    def test_lifecycle_keyboard_interrupt_is_cancelled_after_cleanup(self):
+        self.install_runner(failure=KeyboardInterrupt("private interrupt"))
+        args = self.lifecycle_args()
+        with self.assertRaises(KeyboardInterrupt):
+            lab.execute(args)
+        self.assertTrue(self.calls[-1]["cleanup"])
+        self.assertEqual(self.event_rows(args)[-1]["event"], "orchestration_cancelled")
+
+    def test_lifecycle_cleanup_failure_blocks_summary_and_records_failure(self):
+        self.install_runner(cleanup_failure=True)
+        args = self.lifecycle_args()
+        with self.assertRaisesRegex(lab.HarnessError, "cleanup"):
+            lab.execute(args)
+        self.assertEqual([row["event"] for row in self.event_rows(args)], [
+            "orchestration_started", "lock_acquired", "variant_started",
+            "report_received", "cleanup_started", "cleanup_failed", "orchestration_failed"])
+        self.assertFalse((Path(args.result_dir) / "summary.json").exists())
+
+    def test_lifecycle_cleanup_failure_retains_precedence_over_cancellation(self):
+        self.install_runner(failure=lab.Cancelled("private cancellation"), cleanup_failure=True)
+        args = self.lifecycle_args()
+        with self.assertRaisesRegex(lab.HarnessError, "cleanup") as raised:
+            lab.execute(args)
+        self.assertNotIsInstance(raised.exception, lab.Cancelled)
+        self.assertEqual([row["event"] for row in self.event_rows(args)][-2:],
+                         ["cleanup_failed", "orchestration_failed"])
+
+    def test_lifecycle_lock_conflict_records_failure_and_closes(self):
+        runner = self.install_runner()
+        args = self.lifecycle_args()
+        events = lab.LifecycleLog(args.event_log, args.result_dir, args.mode)
+        with mock.patch.object(lab, "work_lock", side_effect=lab.HarnessError("locked")), \
+                mock.patch.object(lab, "lifecycle", return_value=events):
+            with self.assertRaisesRegex(lab.HarnessError, "locked"):
+                lab.execute(args)
+        runner.assert_not_called()
+        self.assertTrue(events.stream.closed)
+        self.assertEqual([row["event"] for row in self.event_rows(args)],
+                         ["orchestration_started", "orchestration_failed"])
+
+    def test_lifecycle_config_failure_is_fixed_event_without_raw_details(self):
+        args = self.lifecycle_args()
+        with mock.patch.object(lab, "load_config", side_effect=OSError("private-config-error")):
+            with self.assertRaises(OSError):
+                lab.execute(args)
+        self.assertEqual([row["event"] for row in self.event_rows(args)],
+                         ["orchestration_started", "orchestration_failed"])
+        self.assertNotIn("private-config-error", Path(args.event_log).read_text(encoding="utf-8"))
+
+    def test_lifecycle_rejects_relative_wrong_name_and_wrong_parent(self):
+        args = self.lifecycle_args()
+        other = self.root / "other"
+        other.mkdir()
+        paths = [Path("sanitized/lifecycle.jsonl"), self.config,
+                 Path(args.result_dir) / "summary.json", self.work / "scenario.log",
+                 other / "lifecycle.jsonl"]
+        before = self.config.read_bytes()
+        for path in paths:
+            with self.subTest(path=path.name):
+                with self.assertRaises((lab.HarnessError, OSError)):
+                    with lab.LifecycleLog(path, args.result_dir, args.mode):
+                        self.fail("invalid lifecycle path accepted")
+        self.assertEqual(self.config.read_bytes(), before)
+        self.assertFalse((other / "lifecycle.jsonl").exists())
+
+    def test_lifecycle_rejects_missing_parent_without_creating_directories(self):
+        args = self.args()
+        args.result_dir = str(self.output / "scenario")
+        path = self.output / "sanitized" / "lifecycle.jsonl"
+        with self.assertRaises((lab.HarnessError, OSError)):
+            with lab.LifecycleLog(path, args.result_dir, args.mode):
+                self.fail("missing parent accepted")
+        self.assertFalse(self.output.exists())
+
+    def test_lifecycle_rejects_symlink_file_parent_and_ancestor_before_open(self):
+        args = self.lifecycle_args()
+        path = Path(args.event_log)
+        original = Path.is_symlink
+        for symlink in (path, path.parent, path.parent.parent):
+            with self.subTest(component=symlink.name):
+                with mock.patch.object(Path, "is_symlink", autospec=True,
+                                       side_effect=lambda p: p == symlink or original(p)), \
+                        mock.patch.object(lab.os, "open") as opened:
+                    with self.assertRaisesRegex(lab.HarnessError, "symlink"):
+                        with lab.LifecycleLog(path, args.result_dir, args.mode):
+                            self.fail("symlink accepted")
+                opened.assert_not_called()
+        self.assertFalse(path.exists())
+
+    def test_lifecycle_exclusive_creation_preserves_existing_files(self):
+        args = self.lifecycle_args()
+        path = Path(args.event_log)
+        path.write_text("private existing log", encoding="utf-8")
+        before = path.read_bytes()
+        with self.assertRaises(FileExistsError):
+            with lab.LifecycleLog(path, args.result_dir, args.mode):
+                self.fail("existing file overwritten")
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.config.read_text(encoding="utf-8"), json.dumps(self.configuration))
+
+    def test_lifecycle_existing_hardlink_does_not_overwrite_config(self):
+        args = self.lifecycle_args()
+        path = Path(args.event_log)
+        os.link(self.config, path)
+        before = self.config.read_bytes()
+        with self.assertRaises(FileExistsError):
+            with lab.LifecycleLog(path, args.result_dir, args.mode):
+                self.fail("existing hardlink accepted")
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.config.read_bytes(), before)
+
+    def test_lifecycle_creation_uses_exclusive_nofollow_and_private_mode(self):
+        args = self.lifecycle_args()
+        original = os.open
+        with mock.patch.object(lab.os, "open", side_effect=original) as opened:
+            with lab.LifecycleLog(args.event_log, args.result_dir, args.mode) as events:
+                self.assertFalse(events.stream.closed)
+        call = next(call for call in opened.call_args_list if len(call.args) == 3)
+        self.assertEqual(call.args[2], 0o600)
+        self.assertTrue(call.args[1] & os.O_CREAT)
+        self.assertTrue(call.args[1] & os.O_EXCL)
+        self.assertTrue(call.args[1] & os.O_WRONLY)
+        if hasattr(os, "O_NOFOLLOW"):
+            self.assertTrue(call.args[1] & os.O_NOFOLLOW)
+        if os.name == "posix":
+            self.assertEqual(Path(args.event_log).stat().st_mode & 0o777, 0o600)
+        self.assertTrue(events.stream.closed)
+
+    def test_lifecycle_writer_rejects_unknown_events_variants_and_extra_fields(self):
+        args = self.lifecycle_args()
+        with lab.LifecycleLog(args.event_log, args.result_dir, args.mode) as events:
+            for value in ("private unknown driver output", {}, [], True, None):
+                with self.subTest(event=value):
+                    with self.assertRaises(lab.HarnessError):
+                        events.emit(value)
+            for value in ("private-variant", {}, True, 1):
+                with self.subTest(variant=value):
+                    with self.assertRaises(lab.HarnessError):
+                        events.emit("variant_started", variant=value)
+            for value in (0, -1, True, 1.5, "1"):
+                with self.subTest(round_id=value):
+                    with self.assertRaises(lab.HarnessError):
+                        events.emit("variant_started", round_id=value)
+            with self.assertRaises(TypeError):
+                events.emit("lock_acquired", arbitrary={"secret": "private"})
+            with self.assertRaises(TypeError):
+                events.emit("lock_acquired", **{"stdout": "private"})
+        self.assertEqual([row["event"] for row in self.event_rows(args)],
+                         ["orchestration_started", "orchestration_finished"])
+        self.assertNotIn("private", Path(args.event_log).read_text(encoding="utf-8"))
+        for mode in ("unknown", {}, True):
+            with self.assertRaises(lab.HarnessError):
+                lab.LifecycleLog(args.event_log, args.result_dir, mode)
+
+    def test_lifecycle_elapsed_is_relative_integer_and_never_decreases(self):
+        args = self.lifecycle_args()
+        with mock.patch.object(lab.time, "monotonic", side_effect=[10, 10, 11, 9, 12]):
+            with lab.LifecycleLog(args.event_log, args.result_dir, args.mode) as events:
+                events.emit("lock_acquired")
+                events.emit("cleanup_started")
+        rows = self.event_rows(args)
+        self.assertEqual([row["monotonic_elapsed_ms"] for row in rows], [0, 1000, 1000, 2000])
+        self.assertEqual([row["seq"] for row in rows], [1, 2, 3, 4])
+
+    def test_lifecycle_zero_elapsed_does_not_replace_required_measurement(self):
+        self.install_runner()
+        args = self.lifecycle_args()
+        with mock.patch.object(lab.time, "monotonic", return_value=10):
+            with self.assertRaisesRegex(lab.HarnessError, "observation interval"):
+                lab.execute(args)
+        rows = self.event_rows(args)
+        self.assertTrue(all(row["monotonic_elapsed_ms"] == 0 for row in rows))
+        self.assertTrue(all(row["measurement_produced"] is False for row in rows))
+        self.assertTrue(all("metrics" not in row and "duration_seconds" not in row for row in rows))
+        self.assertNotIn("report_received", [row["event"] for row in rows])
+        self.assertEqual(rows[-1]["event"], "orchestration_failed")
+        self.assertFalse((Path(args.result_dir) / "summary.json").exists())
+
+    def test_legacy_cli_without_event_log_uses_only_existing_clock_reads(self):
+        self.install_runner()
+        args = self.args()
+        self.assertIsNone(args.event_log)
+        del args.event_log  # Older direct callers may not have the new attribute.
+        with mock.patch.object(lab.time, "monotonic", side_effect=[0, 2]) as clock:
+            lab.execute(args)
+        self.assertEqual(clock.call_count, 2)
+        self.assertEqual(list(self.root.rglob("lifecycle.jsonl")), [])
+        self.assertEqual([p.name for p in self.output.iterdir()], ["summary.json"])
+
+    def test_lifecycle_optional_cli_is_present_for_both_modes(self):
+        for mode in ("smoke", "benchmark-pair"):
+            cli = lab.parser()._subparsers._group_actions[0].choices[mode]
+            options = cli._option_string_actions
+            self.assertIn("--event-log", options)
+            self.assertFalse(options["--event-log"].required)
+            self.assertIn("orchestration only", options["--event-log"].help)
+
+
+    def test_lifecycle_openat_pins_parent_and_requires_nofollow(self):
+        args = self.lifecycle_args()
+        opened = mock.Mock(side_effect=[88, 89])
+        stream = io.StringIO()
+        with mock.patch.object(lab.os, "open", opened), \
+                mock.patch.object(lab.os, "supports_dir_fd", {opened}), \
+                mock.patch.object(lab.os, "O_NOFOLLOW", 0x100000, create=True), \
+                mock.patch.object(lab.os, "O_DIRECTORY", 0x200000, create=True), \
+                mock.patch.object(lab.os, "fstat", return_value=mock.Mock(st_mode=0o100600)), \
+                mock.patch.object(lab.os, "fdopen", return_value=stream), \
+                mock.patch.object(lab.os, "close") as closed:
+            with lab.LifecycleLog(args.event_log, args.result_dir, args.mode):
+                pass
+        parent_call, file_call = opened.call_args_list
+        self.assertEqual(parent_call.args[0], str(Path(args.event_log).parent))
+        self.assertTrue(parent_call.args[1] & 0x100000)
+        self.assertTrue(parent_call.args[1] & 0x200000)
+        self.assertEqual(file_call.args[0], "lifecycle.jsonl")
+        self.assertEqual(file_call.args[2], 0o600)
+        self.assertTrue(file_call.args[1] & 0x100000)
+        self.assertTrue(file_call.args[1] & os.O_EXCL)
+        self.assertEqual(file_call.kwargs, {"dir_fd": 88})
+        closed.assert_called_once_with(88)
+        self.assertTrue(stream.closed)
+
+    def test_lifecycle_logging_failure_never_skips_cleanup_or_masks_driver_failure(self):
+        failure = RuntimeError("private driver failure")
+        self.install_runner(failure=failure)
+        args = self.lifecycle_args()
+        events = lab.LifecycleLog(args.event_log, args.result_dir, args.mode)
+        original = events.emit
+
+        def emit(event, **fields):
+            if event in ("cleanup_started", "cleanup_finished"):
+                raise OSError("private logging failure")
+            original(event, **fields)
+
+        with mock.patch.object(lab, "lifecycle", return_value=events), \
+                mock.patch.object(events, "emit", side_effect=emit):
+            with self.assertRaises(RuntimeError) as raised:
+                lab.execute(args)
+        self.assertIs(raised.exception, failure)
+        self.assertTrue(self.calls[-1]["cleanup"])
+        self.assertTrue(events.stream.closed)
+        self.assertEqual(self.event_rows(args)[-1]["event"], "orchestration_failed")
+        self.assertFalse((Path(args.result_dir) / "summary.json").exists())
+
+    def test_lifecycle_enter_write_failure_closes_stream(self):
+        args = self.lifecycle_args()
+        events = lab.LifecycleLog(args.event_log, args.result_dir, args.mode)
+        with mock.patch.object(events, "emit", side_effect=OSError("private write failure")):
+            with self.assertRaises(OSError):
+                with events:
+                    self.fail("write failure ignored")
+        self.assertTrue(events.stream.closed)
+        self.assertEqual(Path(args.event_log).read_bytes(), b"")
+
+
 if __name__ == "__main__":
     unittest.main()
