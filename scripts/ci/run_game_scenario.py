@@ -28,6 +28,7 @@ import re
 import secrets
 import shutil
 import signal
+import random
 import socket
 import subprocess
 import sys
@@ -926,7 +927,11 @@ class Scenario:
             # 固定长度：实测发现不定长的 chat 小包会让各次运行的 raw 相差 28%，
             # 那样测出来的"差异"其实是负载量差异。补齐到固定字节数后 raw 才可比。
             pad = max(0, env_int("LOAD_CHAT_BYTES", 380))
-            padding = "x" * pad
+            # 用确定性伪随机字母表而不是重复字符补齐：定长解决了"量在漂"，
+            # 但全 'x' 的填充会被 zstd 直接压成几个字节（实测 wire/raw 掉回 4%），
+            # 那样这个小包负载就又变成"高度可压缩"，测不出等级差异。
+            alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+            pad_rng = random.Random(0x6D7A)
             self.load_expected_packets = int(self.duration / interval) * len(clients)
 
             def chat_loop() -> None:
@@ -937,9 +942,10 @@ class Scenario:
                             return
                         seq += 1
                         try:
+                            body = "".join(pad_rng.choices(alphabet, k=pad))
                             # 不等待回显：20 条/秒逐条等确认会把节奏限制在日志轮询上。
                             self.write_console('tellraw %s {"text":"mz %d %s"}'
-                                               % (client["username"], seq, padding))
+                                               % (client["username"], seq, body))
                         except (ScenarioError, OSError) as failure:
                             self.load_error = failure
                             return
