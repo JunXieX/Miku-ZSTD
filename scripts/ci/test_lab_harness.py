@@ -319,6 +319,20 @@ class LabHarnessTest(unittest.TestCase):
         self.assertTrue(self.calls[-1]["cleanup"])
         self.assertFalse((self.output / "summary.json").exists())
 
+    def test_preflight_artifact_is_isolated_from_fresh_scenario_directory(self):
+        self.output.mkdir()
+        exported = self.output / "sanitized"
+        exported.mkdir()
+        diagnostic = exported / "runner-preflight.json"
+        diagnostic.write_text('{"measurement_produced": false}', encoding="utf-8")
+        args = self.args()
+        args.result_dir = str(self.output / "scenario")
+        self.install_runner()
+        lab.execute(args)
+        self.assertTrue((self.output / "scenario" / "summary.json").is_file())
+        self.assertEqual(json.loads(diagnostic.read_text(encoding="utf-8")),
+                         {"measurement_produced": False})
+
 
 if __name__ == "__main__":
     unittest.main()

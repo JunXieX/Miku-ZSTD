@@ -76,8 +76,15 @@ jobs:
           umask 077
           result=$(mktemp -d "$RUNNER_TEMP/miku-zstd-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-XXXXXXXX")
           echo "dir=$result" >> "$GITHUB_OUTPUT"
-          echo "RESULT_DIR=$result" >> "$GITHUB_ENV"
+          echo "EVIDENCE_DIR=$result" >> "$GITHUB_ENV"
+          echo "RESULT_DIR=$result/scenario" >> "$GITHUB_ENV"
           echo "MZSTD_RUN_NONCE=$(python3 -c 'import secrets; print(secrets.token_hex(32))')" >> "$GITHUB_ENV"
+      - name: Inspect installed lab prerequisites (not a game test)
+        run: |
+          set -euo pipefail
+          mkdir -m 700 "$EVIDENCE_DIR/sanitized"
+          python3 scripts/ci/runner_doctor.py --config "$MZSTD_SMOKE_CONFIG" \
+            --report-json "$EVIDENCE_DIR/sanitized/runner-preflight.json"
       - name: Check private harness contract
         run: |
           set -euo pipefail
@@ -97,12 +104,14 @@ jobs:
             --min-duration-seconds "$SMOKE_SECONDS" --expected-nonce "$MZSTD_RUN_NONCE" \
             --expected-fabric-jar "$GITHUB_WORKSPACE"/dist/Miku-ZSTD-*-Fabric.jar \
             --expected-paper-jar "$GITHUB_WORKSPACE"/dist/Miku-ZSTD-*-Paper.jar \
-            --sanitized-output "$result/sanitized/summary.json"
+            --sanitized-output "$EVIDENCE_DIR/sanitized/summary.json"
       - if: ${{ always() && steps.evidence.outputs.dir != '' }}
         uses: actions/upload-artifact@v7
         with:
           name: real-client-smoke-${{ github.run_id }}
-          path: ${{ steps.evidence.outputs.dir }}/sanitized/summary.json
+          path: |
+            ${{ steps.evidence.outputs.dir }}/sanitized/summary.json
+            ${{ steps.evidence.outputs.dir }}/sanitized/runner-preflight.json
           if-no-files-found: warn
           retention-days: 14
 

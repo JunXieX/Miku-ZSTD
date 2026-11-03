@@ -44,11 +44,39 @@
   "work_dir": "/srv/mzstd-lab/private",
   "startup_timeout_seconds": 120,
   "cleanup_timeout_seconds": 30,
-  "terminate_grace_seconds": 5
+  "terminate_grace_seconds": 5,
+  "runtime": {
+    "java_executable": "/opt/java25/bin/java",
+    "frps_executable": "/srv/mzstd-lab/bin/frps",
+    "frpc_executable": "/srv/mzstd-lab/bin/frpc",
+    "minecraft_jar": "/srv/mzstd-lab/game/26.2.jar",
+    "fabric_api_jar": "/srv/mzstd-lab/mods/fabric-api.jar",
+    "krypton_jar": "/srv/mzstd-lab/mods/krypton.jar",
+    "display_mode": "xvfb",
+    "xvfb_executable": "/usr/bin/Xvfb",
+    "network_interfaces": ["eth0"]
+  }
 }
 ~~~
 
 命令以 argv 数组直接执行，不经过 shell，不打印命令参数。不要把令牌放在 argv；让驱动读取本地会话配置。cleanup_command 必须幂等，失败时整轮失败；它负责确认本地和远端服务、游戏实例都已经退出，不能只依赖杀死本地进程组。
+
+## 实验机预检
+
+在启用 READY 前，可直接运行只读前置检查：
+
+~~~sh
+install -d -m 700 /srv/mzstd-lab/reports
+python3 scripts/ci/runner_doctor.py \
+  --config /srv/mzstd-lab/config/smoke.json \
+  --report-json /srv/mzstd-lab/reports/runner-preflight.json
+~~~
+
+预检检查 Linux x64/Python、配置权限与公共编排合同、Java 主版本 25、frps/frpc 版本一致、游戏 JAR 内 version.json 的 26.2 标识、Fabric API/Krypton 的模组标识和版本、显示模式及选定 NIC 计数。它不会启动游戏、访问账号缓存、登录服务器或跑负载，也不证明模组已加载、场景驱动可用或性能有效。
+
+诊断文件固定标记 runner_preflight_only、measurement_produced=false，失败返回非零并列出固定问题代码；仅导出白名单硬件/版本/摘要/计数，不输出配置路径、原始命令输出和会话资料。runtime 中给出的路径必须指向实验机已经安装的文件，示例不是安装脚本。existing 显示模式要求 DISPLAY；xvfb 模式需要指定 Xvfb 可执行文件；二者都不是图形渲染验收。
+
+两个自托管 job 在运行场景之前自动执行相同预检。运行配置、原始测量报告和白名单 artifact 使用不同子目录，避免预检输出干扰编排器的新报告检查。Actions 只按文件名白名单上传 summary.json 和 runner-preflight.json；预检通过不增加任何真实测试通过计数。
 
 ## 场景驱动接口
 
@@ -89,7 +117,7 @@ READY/config 缺失时，托管 preflight 会给出 skip 提示，自托管测�
 
 ## 日志与凭据
 
-每次 job 都创建带 run_id/run_attempt 的唯一临时目录和随机 nonce。校验器重新读取实际下载 JAR 的 SHA256，并校验每轮客户端人数、持续时间与指标。Actions 只上传校验器导出的 sanitized/summary.json 白名单；原始游戏/launcher/FRP 日志和会话留在实验机，不整体上传。
+每次 job 都创建带 run_id/run_attempt 的唯一临时目录和随机 nonce。校验器重新读取实际下载 JAR 的 SHA256，并校验每轮客户端人数、持续时间与指标。Actions 只上传校验器导出的 sanitized/summary.json 和独立 sanitized/runner-preflight.json 白名单；原始游戏/launcher/FRP 日志和会话留在实验机，不整体上传。
 
 发现 credential 字段时拒收整个报告；未知附加字段不输出到摘要或 stdout。此白名单不代替对驱动的人工验收：受信任驱动仍需确保 client id 与各数值字段不包含认证信息。私有原始日志的访问、留存与清理由实验机管理员控制。
 
