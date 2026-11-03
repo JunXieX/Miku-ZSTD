@@ -351,7 +351,9 @@ class Scenario:
         ("time set 6000", r"(?i)set .*6000"),
         ("weather clear", r"(?i)weather.*clear"),
         ("kill @e[type=!player]", r"(?i)(killed|no entity)"),
-        ("forceload add -64 -64 64 64", r"(?i)(added|force).*chunk"),
+        # 实际回显是 "Marked 81 chunks in minecraft:overworld from [-4, -4] to [4, 4] to be force loaded"，
+        # 关键字 chunk 在 force 之前，所以只能按 "marked/added ... chunk" 匹配。
+        ("forceload add -64 -64 64 64", r"(?i)(marked|added).*chunk"),
     )
 
     def stabilise_world(self) -> None:
