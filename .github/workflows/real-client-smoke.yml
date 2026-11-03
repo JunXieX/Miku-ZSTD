@@ -2,6 +2,8 @@ name: Real Client Smoke
 
 # Manual real-game smoke on an isolated private lab runner. Does not gate releases.
 on:
+  push:
+    branches: ["main"]
   workflow_dispatch:
     inputs:
       build_run_id:
@@ -36,23 +38,23 @@ jobs:
           SMOKE_SECONDS: ${{ inputs.duration_seconds }}
         run: |
           set -euo pipefail
-          if ! [[ "$SMOKE_SECONDS" =~ ^[0-9]+$ ]] || (( SMOKE_SECONDS < 30 || SMOKE_SECONDS > 600 )); then
-            echo "duration_seconds must be between 30 and 600" >&2
-            exit 1
-          fi
           if [[ "$GITHUB_REF" != "refs/heads/main" ]] || [[ "$RUNNER_READY" != "true" ]] || [[ -z "$LAB_HARNESS" ]] || [[ -z "$SMOKE_CONFIG" ]]; then
             echo "run_allowed=false" >> "$GITHUB_OUTPUT"
             echo "::notice::Smoke requires trusted main and an enabled lab runner; skipped, not passed."
             exit 0
           fi
+          if ! [[ "$SMOKE_SECONDS" =~ ^[0-9]+$ ]] || (( SMOKE_SECONDS < 30 || SMOKE_SECONDS > 600 )); then
+            echo "duration_seconds must be between 30 and 600" >&2
+            exit 1
+          fi
           actual=$(gh run view "$BUILD_RUN_ID" --repo "$GITHUB_REPOSITORY" --json workflowName,headBranch,headSha,status,conclusion)
           python3 -c 'import json,os,sys; d=json.loads(sys.argv[1]); assert d["workflowName"]=="Build" and d["headBranch"]=="main" and d["headSha"]==os.environ["EXPECTED_SHA"] and d["status"]=="completed" and d["conclusion"]=="success", d' "$actual"
           echo "run_allowed=true" >> "$GITHUB_OUTPUT"
-      - if: steps.check.outputs.run_allowed != 'true'
+      - if: ${{ steps.check.outputs.run_allowed != 'true' }}
         run: echo 'Real-client smoke skipped: configure the dedicated lab runner. This is not a pass.' >> "$GITHUB_STEP_SUMMARY"
   smoke:
     needs: preflight
-    if: needs.preflight.outputs.run_allowed == 'true'
+    if: ${{ needs.preflight.outputs.run_allowed == 'true' }}
     runs-on: [self-hosted, linux, x64, miku-zstd-real-client]
     timeout-minutes: 30
     env:

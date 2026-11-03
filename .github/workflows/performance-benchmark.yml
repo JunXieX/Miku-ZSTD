@@ -1,6 +1,8 @@
 name: Performance Benchmark
 
 on:
+  push:
+    branches: ["main"]
   workflow_dispatch:
     inputs:
       baseline_build_run_id:
@@ -64,11 +66,11 @@ jobs:
           python3 -c 'import json,os,sys; b,c=map(json.loads,sys.argv[1:]); good=lambda r:r["workflowName"]=="Build" and r["headBranch"]=="main" and r["status"]=="completed" and r["conclusion"]=="success"; assert good(b) and good(c), (b,c); assert c["headSha"]==os.environ["EXPECTED_CANDIDATE_SHA"], c; assert b["headSha"] != c["headSha"], "baseline and candidate SHA must differ"; print(b["headSha"])' "$baseline" "$candidate" > baseline.sha
           echo "baseline_sha=$(cat baseline.sha)" >> "$GITHUB_OUTPUT"
           echo "run_allowed=true" >> "$GITHUB_OUTPUT"
-      - if: steps.check.outputs.run_allowed != 'true'
+      - if: ${{ steps.check.outputs.run_allowed != 'true' }}
         run: echo 'Performance run skipped; fixed runner not configured, no measurement produced.' >> "$GITHUB_STEP_SUMMARY"
   benchmark:
     needs: preflight
-    if: needs.preflight.outputs.run_allowed == 'true'
+    if: ${{ needs.preflight.outputs.run_allowed == 'true' }}
     runs-on: [self-hosted, linux, x64, miku-zstd-performance]
     timeout-minutes: 180
     env:
