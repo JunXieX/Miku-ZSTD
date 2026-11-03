@@ -1,0 +1,122 @@
+[
+  {
+    "label": "base-a",
+    "config": {
+      "compression.level": 3,
+      "compression.window_log": 20,
+      "compression.threads": 0,
+      "compression.batch_max_packets": 64,
+      "compression.batch_window_ms": 50
+    }
+  },
+  {
+    "label": "base-b",
+    "config": {
+      "compression.level": 3,
+      "compression.window_log": 20,
+      "compression.threads": 0,
+      "compression.batch_max_packets": 64,
+      "compression.batch_window_ms": 50
+    }
+  },
+  {
+    "label": "level-1",
+    "config": {
+      "compression.level": 1,
+      "compression.window_log": 20,
+      "compression.threads": 0,
+      "compression.batch_max_packets": 64,
+      "compression.batch_window_ms": 50
+    }
+  },
+  {
+    "label": "level-6",
+    "config": {
+      "compression.level": 6,
+      "compression.window_log": 20,
+      "compression.threads": 0,
+      "compression.batch_max_packets": 64,
+      "compression.batch_window_ms": 50
+    }
+  },
+  {
+    "label": "window-19",
+    "config": {
+      "compression.level": 3,
+      "compression.window_log": 19,
+      "compression.threads": 0,
+      "compression.batch_max_packets": 64,
+      "compression.batch_window_ms": 50
+    }
+  },
+  {
+    "label": "window-22",
+    "config": {
+      "compression.level": 3,
+      "compression.window_log": 22,
+      "compression.threads": 0,
+      "compression.batch_max_packets": 64,
+      "compression.batch_window_ms": 50
+    }
+  },
+  {
+    "label": "threads-1",
+    "config": {
+      "compression.level": 3,
+      "compression.window_log": 20,
+      "compression.threads": 1,
+      "compression.batch_max_packets": 64,
+      "compression.batch_window_ms": 50
+    }
+  },
+  {
+    "label": "threads-4",
+    "config": {
+      "compression.level": 3,
+      "compression.window_log": 20,
+      "compression.threads": 4,
+      "compression.batch_max_packets": 64,
+      "compression.batch_window_ms": 50
+    }
+  },
+  {
+    "label": "packets-16",
+    "config": {
+      "compression.level": 3,
+      "compression.window_log": 20,
+      "compression.threads": 0,
+      "compression.batch_max_packets": 16,
+      "compression.batch_window_ms": 50
+    }
+  },
+  {
+    "label": "packets-256",
+    "config": {
+      "compression.level": 3,
+      "compression.window_log": 20,
+      "compression.threads": 0,
+      "compression.batch_max_packets": 256,
+      "compression.batch_window_ms": 50
+    }
+  },
+  {
+    "label": "batchwindow-0",
+    "config": {
+      "compression.level": 3,
+      "compression.window_log": 20,
+      "compression.threads": 0,
+      "compression.batch_max_packets": 64,
+      "compression.batch_window_ms": 0
+    }
+  },
+  {
+    "label": "batchwindow-200",
+    "config": {
+      "compression.level": 3,
+      "compression.window_log": 20,
+      "compression.threads": 0,
+      "compression.batch_max_packets": 64,
+      "compression.batch_window_ms": 200
+    }
+  }
+]

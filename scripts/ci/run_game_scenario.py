@@ -278,6 +278,8 @@ class Scenario:
         self.traffic_source = "unknown"
         self.console_lock = threading.Lock()
         self.load_profile = "idle"
+        self.plugin_config = {}
+        self.run_label = os.environ.get("MZSTD_RUN_LABEL", "")
         self.load_stop = None
         self.load_thread = None
         self.load_error = None
@@ -413,7 +415,39 @@ class Scenario:
             "motd=MikuZSTD-RealClient\n"
             % (self.threshold, self.ports["paper"]),
             encoding="ascii")
+        self.apply_plugin_config(server)
         return server
+
+    def apply_plugin_config(self, server: Path) -> None:
+        """Write the plugin's config.yml before the server starts.
+
+        Level/window/threads take effect only when a connection's compression
+        context is created, so a sweep must place the file before Paper boots and
+        before the test client joins. Only section.key=<scalar> pairs are accepted:
+        the driver never writes free-form YAML from the environment.
+        """
+        raw = os.environ.get("MZSTD_PLUGIN_CONFIG", "").strip()
+        if not raw:
+            return
+        parsed = json.loads(raw)
+        require(isinstance(parsed, dict), "MZSTD_PLUGIN_CONFIG must be a JSON object")
+        sections: dict[str, dict] = {}
+        for key, value in parsed.items():
+            parts = str(key).split(".", 1)
+            require(len(parts) == 2, "plugin config keys must be section.key: " + str(key))
+            require(isinstance(value, (int, float, bool, str)),
+                    "unsupported plugin config value for " + str(key))
+            sections.setdefault(parts[0], {})[parts[1]] = value
+            self.plugin_config[str(key)] = value
+        lines = []
+        for section, values in sections.items():
+            lines.append(section + ":")
+            for name, value in values.items():
+                lines.append("  %s: %s" % (name, value))
+        target = server / "plugins" / "Miku-ZSTD" / "config.yml"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        print("[lab] plugin config: %s" % json.dumps(self.plugin_config, sort_keys=True), flush=True)
 
     def start_paper(self, server: Path) -> None:
         self.spawn("paper",
@@ -1033,6 +1067,8 @@ class Scenario:
                 "fabric_api_version": FABRIC_API_VERSION,
                 "warmup_seconds": self.warmup,
                 "load_profile": self.load_profile,
+                "run_label": self.run_label,
+                "plugin_config": self.plugin_config,
                 "sampling_interval_ms": 250,
                 "interface": os.environ.get("MZSTD_NIC", "lo"),
                 "traffic_source": ("production plugin counters read through /mikuzstd top before "

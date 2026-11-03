@@ -538,6 +538,8 @@ def parser():
             sub.add_argument("--paper-jar", required=True)
             sub.add_argument("--candidate-sha", "--commit-sha", dest="candidate_sha")
             sub.add_argument("--duration-seconds", type=positive, required=True)
+            # 冒烟默认不预热；配置扫描需要先让首批区块流完，否则测的是登录瞬间。
+            sub.add_argument("--warmup-seconds", type=nonnegative, default=0)
             sub.set_defaults(rounds=1, warmup_seconds=0, randomize_order=False)
         else:
             for variant in ("baseline", "candidate"):
