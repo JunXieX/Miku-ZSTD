@@ -27,7 +27,8 @@ class RealClientResultTest(unittest.TestCase):
             "krypton_loaded": True,
             "miku_zstd_loaded": True,
             "login_success": True,
-            "clients": [{"id": f"c{i}", "joined": True, "play_traffic_received": True} for i in range(count)],
+            "clients": [{"id": f"c{i}", "joined": True, "play_traffic_received": True,
+                         "disconnected": False, "active_seconds": 10} for i in range(count)],
         }
 
     @staticmethod
@@ -52,6 +53,7 @@ class RealClientResultTest(unittest.TestCase):
     def smoke(self):
         return {
             "schema_version": 1,
+            "client_runtime": "minecraft_client",
             "test_type": "smoke",
             "status": "passed",
             "commit_sha": "candidate",
@@ -67,6 +69,10 @@ class RealClientResultTest(unittest.TestCase):
             "actual_clients": 2,
             "frp_use_compression": True,
             "duration_seconds": 5,
+            "rtt_sample_count": 10,
+            "clients": RealClientResultTest.client(2)["clients"],
+            "client_runtime": "minecraft_client",
+            "client": RealClientResultTest.client(2),
         }
         result.update({
             "rtt_p50_ms": 10,
@@ -87,12 +93,13 @@ class RealClientResultTest(unittest.TestCase):
     def pair(self):
         return {
             "schema_version": 1,
+            "client_runtime": "minecraft_client",
             "test_type": "benchmark-pair",
             "status": "passed",
             "commit_sha": "candidate",
             "frp": {"use_compression": True},
             "client": self.client(2),
-            "metrics": self.metrics(10),
+            "metrics": self.metrics(20),
             "paired_rounds": [
                 {"round_id": 1, "order": ["baseline", "candidate"], "baseline": self.variant("baseline"), "candidate": self.variant("candidate")},
                 {"round_id": 2, "order": ["candidate", "baseline"], "baseline": self.variant("baseline"), "candidate": self.variant("candidate")},
@@ -142,6 +149,130 @@ class RealClientResultTest(unittest.TestCase):
         self.write(data)
         with self.assertRaisesRegex(ValueError, "measured interval"):
             self.call_validate("benchmark-pair", 2)
+
+    def test_duplicate_client_ids_are_rejected(self):
+        data = self.pair()
+        data["client"]["clients"][1]["id"] = "c0"
+        self.write(data)
+        with self.assertRaisesRegex(ValueError, "unique"):
+            self.call_validate("benchmark-pair", 2)
+
+    def test_missing_client_id_is_rejected(self):
+        data = self.smoke()
+        del data["client"]["clients"][0]["id"]
+        self.write(data)
+        with self.assertRaisesRegex(ValueError, "client id"):
+            self.call_validate("smoke")
+
+    def test_disconnect_and_short_observation_are_rejected(self):
+        for field, value in (("disconnected", True), ("active_seconds", 0)):
+            with self.subTest(field=field):
+                data = self.pair()
+                data["paired_rounds"][0]["candidate"]["clients"][0][field] = value
+                self.write(data)
+                with self.assertRaises(ValueError):
+                    self.call_validate("benchmark-pair", 2)
+
+    def test_each_variant_requires_real_metrics(self):
+        for field, value in (("raw_bytes", 0), ("compressed_wire_bytes", 0),
+                             ("rtt_sample_count", 0), ("rtt_sample_count", 1.5),
+                             ("rtt_p50_ms", 50), ("server_rss_bytes", 0)):
+            with self.subTest(field=field, value=value):
+                data = self.pair()
+                data["paired_rounds"][0]["baseline"][field] = value
+                self.write(data)
+                with self.assertRaises(ValueError):
+                    self.call_validate("benchmark-pair", 2)
+
+    def test_each_variant_requires_unique_clients(self):
+        data = self.pair()
+        data["paired_rounds"][1]["baseline"]["clients"][1]["id"] = "c0"
+        self.write(data)
+        with self.assertRaisesRegex(ValueError, "unique"):
+            self.call_validate("benchmark-pair", 2)
+
+    def test_old_nonce_is_rejected(self):
+        data = self.smoke()
+        data["run_nonce"] = "old"
+        self.write(data)
+        with self.assertRaisesRegex(ValueError, "run_nonce"):
+            validate("smoke", self.path, 1, "candidate", None, 10, 0, expected_nonce="new")
+
+    def test_wrong_artifact_hash_is_rejected(self):
+        data = self.smoke()
+        data["artifact_sha256"] = {"fabric": "old", "paper": "old"}
+        self.write(data)
+        with self.assertRaisesRegex(ValueError, "SHA256"):
+            validate("smoke", self.path, 1, "candidate", None, 10, 0,
+                     expected_hashes={"candidate": {"fabric": "new", "paper": "new"}})
+
+    def test_credentials_are_rejected_without_echo(self):
+        data = self.smoke()
+        data["metrics"]["accessToken"] = "fixture-do-not-export"
+        self.write(data)
+        with self.assertRaisesRegex(ValueError, "credential field"):
+            self.call_validate("smoke")
+
+    def test_unknown_strings_are_not_exported_or_printed(self):
+        data = self.smoke()
+        data["metrics"]["extra"] = "fixture-do-not-export"
+        data["arbitrary_log"] = "fixture-do-not-export"
+        self.write(data)
+        output = Path(self.tmp.name) / "sanitized" / "summary.json"
+        stream = io.StringIO()
+        with contextlib.redirect_stdout(stream):
+            validate("smoke", self.path, 1, "candidate", None, 10, 0, sanitized_output=output)
+        self.assertNotIn("fixture-do-not-export", stream.getvalue())
+        self.assertNotIn("fixture-do-not-export", output.read_text(encoding="utf-8"))
+
+    def test_explicit_fixture_is_not_accepted_as_real_evidence(self):
+        data = self.smoke()
+        data["fixture_only"] = True
+        self.write(data)
+        with self.assertRaisesRegex(ValueError, "synthetic fixture"):
+            self.call_validate("smoke")
+
+    def test_harness_summary_contract_matches_validator(self):
+        from types import SimpleNamespace
+        import lab_harness
+        rounds = self.pair()["paired_rounds"]
+        for row in rounds:
+            for variant in ("baseline", "candidate"):
+                item = row[variant]
+                item["metrics"] = self.metrics(5)
+                item["client_runtime"] = "minecraft_client"
+                item["schema_version"] = 1
+                item["status"] = "passed"
+                item["client"] = self.client(2)
+                item["frp"] = {"use_compression": True}
+                item["run_nonce"] = "current-invocation"
+        result = lab_harness.summarize(SimpleNamespace(mode="benchmark-pair", baseline_sha="baseline"),
+                                       rounds, "current-invocation")
+        self.write(result)
+        with contextlib.redirect_stdout(io.StringIO()):
+            clean = validate("benchmark-pair", self.path, 2, "candidate", "baseline", 20, 2,
+                             expected_nonce="current-invocation")
+        self.assertEqual(clean["metrics"]["duration_seconds"], 20)
+        self.assertEqual(len(clean["paired_rounds"]), 2)
+
+    def test_every_variant_requires_runtime_and_all_mod_flags(self):
+        for variant in ("baseline", "candidate"):
+            for field in ("actual_minecraft_client", "fabric_loaded", "krypton_loaded",
+                          "miku_zstd_loaded", "login_success"):
+                with self.subTest(variant=variant, field=field):
+                    data = self.pair()
+                    data["paired_rounds"][0][variant]["client"][field] = False
+                    self.write(data)
+                    with self.assertRaises(ValueError):
+                        self.call_validate("benchmark-pair", 2)
+
+    def test_every_variant_rejects_missing_runtime_evidence(self):
+        for field in ("client", "client_runtime"):
+            data = self.pair()
+            del data["paired_rounds"][0]["baseline"][field]
+            self.write(data)
+            with self.assertRaises(ValueError):
+                self.call_validate("benchmark-pair", 2)
 
 
 if __name__ == "__main__":
