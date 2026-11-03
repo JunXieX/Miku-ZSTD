@@ -49,7 +49,8 @@ jobs:
           python3 -c 'import json,os,sys; d=json.loads(sys.argv[1]); assert d["workflowName"]=="Build" and d["headBranch"]=="main" and d["headSha"]==os.environ["EXPECTED_SHA"] and d["status"]=="completed" and d["conclusion"]=="success", d' "$actual"
           echo "run_allowed=true" >> "$GITHUB_OUTPUT"
       - if: ${{ steps.check.outputs.run_allowed != 'true' }}
-        run: echo 'Real-client smoke skipped: configure the dedicated lab runner. This is not a pass.' >> "$GITHUB_STEP_SUMMARY"
+        run: |
+          echo "Real-client smoke skipped: configure the dedicated lab runner. This is not a pass." >> "$GITHUB_STEP_SUMMARY"
   smoke:
     needs: preflight
     if: ${{ needs.preflight.outputs.run_allowed == 'true' }}
