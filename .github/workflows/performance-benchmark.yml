@@ -34,7 +34,7 @@ on:
       warmup_minutes:
         description: Warm-up per variant per round (excluded from measurement)
         required: true
-        default: "1"
+        default: "2"
         type: choice
         options: ["0.5", "1", "2"]
       baseline_build_run_id:

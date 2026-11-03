@@ -343,6 +343,44 @@ class Scenario:
                 "Paper server JAR does not match the pinned sha256")
         return target
 
+    STABILISING_COMMANDS = (
+        ("gamerule doDaylightCycle false", r"Gamerule doDaylightCycle is now set to: false"),
+        ("gamerule doWeatherCycle false", r"Gamerule doWeatherCycle is now set to: false"),
+        ("gamerule randomTickSpeed 0", r"Gamerule randomTickSpeed is now set to: 0"),
+        ("gamerule doMobSpawning false", r"Gamerule doMobSpawning is now set to: false"),
+        ("gamerule doFireTick false", r"Gamerule doFireTick is now set to: false"),
+        ("gamerule doEntityDrops false", r"Gamerule doEntityDrops is now set to: false"),
+        ("difficulty peaceful", r"[Dd]ifficulty has been set to [Pp]eaceful"),
+        ("time set 6000", r"Set the time to 6000"),
+        ("weather clear", r"(Changing to clear weather|Set the weather to clear)"),
+        ("forceload add -128 -128 128 128", r"[Aa]dded \d+ chunk"),
+        ("kill @e[type=!player]", r"(Killed|No entity was found)"),
+    )
+
+    def stabilise_world(self) -> None:
+        """Make the world deterministic before any client joins.
+
+        Byte volume in the first empty control swung 36%, and the cause was the
+        world itself: chunk generation, random ticks, mob spawning and the time of
+        day all change how much traffic the server sends. Freezing them (and force
+        loading the visible area) is what makes an A/B comparison meaningful.
+        """
+        for command, pattern in self.STABILISING_COMMANDS:
+            line = self.console(command, pattern, timeout=30.0)
+            require(line is not None,
+                    "world stabilisation command had no effect: " + command)
+        print("[lab] world stabilised for measurement", flush=True)
+
+    def fix_player_orientation(self, client: dict) -> None:
+        """Teleport the test client in place with a fixed yaw/pitch.
+
+        Position comes from the deterministic world spawn; the rotation must be
+        pinned because a different view angle changes how many chunks and entities
+        end up being sent.
+        """
+        command = "execute at %s run tp %s ~ ~ ~ 90 0" % (client["username"], client["username"])
+        self.console(command, r"Teleported", timeout=30.0)
+
     def prepare_paper(self) -> Path:
         server = self.artifacts / "paper"
         server.mkdir(parents=True, exist_ok=True)
@@ -673,6 +711,27 @@ class Scenario:
                     samples.append(float(nanos) / 1_000_000.0)
         return samples
 
+    def ping_diagnostics(self, clients: list[dict]) -> dict:
+        """How many pings the clients sent versus how many matched a pong."""
+        sent = 0
+        unmatched = 0
+        for client in clients:
+            evidence = client["evidence"]
+            if not evidence.is_file():
+                continue
+            final = None
+            for line in evidence.read_text(encoding="utf-8", errors="replace").splitlines():
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if record.get("type") == "final":
+                    final = record
+            if final:
+                sent += int(final.get("pings_sent", 0))
+                unmatched += int(final.get("pings_unmatched", 0))
+        return {"pings_sent": sent, "pings_unmatched": unmatched}
+
     def boot_record(self, client: dict) -> dict:
         evidence = client["evidence"]
         require(evidence.is_file(), "client evidence file is missing")
@@ -770,6 +829,7 @@ class Scenario:
             "write_p99_ms": round(latency.get("write_p99", 0.0), 3),
             "latency_sample_count": int(latency.get("samples", 0.0)),
             "rtt_sample_count": len(round_trips),
+            "rtt_pings_sent": self.ping_diagnostics(clients)["pings_sent"],
             "rtt_p50_ms": round(percentile(round_trips, 0.50), 3),
             "rtt_p95_ms": round(percentile(round_trips, 0.95), 3),
             "rtt_p99_ms": round(percentile(round_trips, 0.99), 3),
@@ -957,6 +1017,7 @@ class Scenario:
         try:
             server = self.prepare_paper()
             self.start_paper(server)
+            self.stabilise_world()
             self.start_frp()
             runtime = self.prepare_client_runtime()
             mods = self.prepare_mods(runtime)
@@ -964,6 +1025,8 @@ class Scenario:
             clients = [self.launch_client(index, runtime, mods)
                        for index in range(self.clients_requested)]
             self.wait_ready(clients, started)
+            for client in clients:
+                self.fix_player_orientation(client)
             self.install_play_watch(clients)
             if self.warmup > 0:
                 time.sleep(self.warmup)

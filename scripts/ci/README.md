@@ -105,6 +105,19 @@ Build 里的 Python 协议客户端只验证 Paper/Velocity 的线协议状态�
 
 判定为 `insufficient` 时报告仍会落盘（状态 `capacity_exceeded`，数字可在 "Report measured metrics" 步骤里看到），但编排器与校验器都会拒收。**不会因为换更少的人或换成协议机器人而放行。**
 
+## 场景稳定化（字节指标可比的前提）
+
+每个变体都会新开世界、新起客户端，首轮空对照显示 `compressed_wire_bytes` 的同源变异高达 36%，量级盖过任何真实优化。驱动因此在客户端进入前先把世界钉死：
+
+| 项 | 做法 |
+|---|---|
+| 世界演进 | `doDaylightCycle/doWeatherCycle/doMobSpawning/doFireTick/doEntityDrops` 全部关，`randomTickSpeed 0`，`difficulty peaceful`，`time set 6000`，`weather clear` |
+| 区块 | `forceload add -128 -128 128 128` 覆盖可见半径，避免测量期间边生成边发送 |
+| 实体 | `kill @e[type=!player]`，清掉世界里已有的实体 |
+| 玩家姿态 | 加入后 `execute at <玩家> run tp <玩家> ~ ~ ~ 90 0`，把位置留在确定性出生点、朝向钉死 |
+
+任一条命令没有产生预期回显，驱动会直接失败而不是带着不稳定的世界继续测。预热默认 2 分钟（`warmup_minutes`），仍然不计入测量区间。
+
 ## 配对 A/B 的现状
 
 `Performance Benchmark` 的 `github-hosted` 模式在**同一台 runner** 上现场构建 baseline 与 candidate 两个提交的成品，按轮交错、随机首轮顺序、每变体预热后测量，再做配对汇总。
