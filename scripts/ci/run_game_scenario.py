@@ -343,18 +343,15 @@ class Scenario:
                 "Paper server JAR does not match the pinned sha256")
         return target
 
+    # 只用在该版本上实测过能生效的命令：26.2 的控制台里 gamerule 无论用哪种规则名
+    # （camelCase / snake_case / 带命名空间）都会回 "Incorrect argument"，因此这里不依赖它。
+    # 环境差异由 difficulty / time / weather / forceload / kill 这五条覆盖。
     STABILISING_COMMANDS = (
-        ("gamerule doDaylightCycle false", r"Gamerule doDaylightCycle is now set to: false"),
-        ("gamerule doWeatherCycle false", r"Gamerule doWeatherCycle is now set to: false"),
-        ("gamerule randomTickSpeed 0", r"Gamerule randomTickSpeed is now set to: 0"),
-        ("gamerule doMobSpawning false", r"Gamerule doMobSpawning is now set to: false"),
-        ("gamerule doFireTick false", r"Gamerule doFireTick is now set to: false"),
-        ("gamerule doEntityDrops false", r"Gamerule doEntityDrops is now set to: false"),
-        ("difficulty peaceful", r"[Dd]ifficulty has been set to [Pp]eaceful"),
-        ("time set 6000", r"Set the time to 6000"),
-        ("weather clear", r"(Changing to clear weather|Set the weather to clear)"),
-        ("forceload add -128 -128 128 128", r"[Aa]dded \d+ chunk"),
-        ("kill @e[type=!player]", r"(Killed|No entity was found)"),
+        ("difficulty peaceful", r"(?i)difficulty.*peaceful"),
+        ("time set 6000", r"(?i)set .*6000"),
+        ("weather clear", r"(?i)weather.*clear"),
+        ("kill @e[type=!player]", r"(?i)(killed|no entity)"),
+        ("forceload add -64 -64 64 64", r"(?i)(added|force).*chunk"),
     )
 
     def stabilise_world(self) -> None:
@@ -367,8 +364,10 @@ class Scenario:
         """
         for command, pattern in self.STABILISING_COMMANDS:
             line = self.console(command, pattern, timeout=30.0)
-            require(line is not None,
-                    "world stabilisation command had no effect: " + command)
+            if line is None:
+                raise ScenarioError("world stabilisation command produced no confirmation: %s\n%s"
+                                    % (command, self.paper_log.tail(40)))
+            print("[lab] %s -> %s" % (command, line), flush=True)
         print("[lab] world stabilised for measurement", flush=True)
 
     def fix_player_orientation(self, client: dict) -> None:
@@ -379,7 +378,10 @@ class Scenario:
         end up being sent.
         """
         command = "execute at %s run tp %s ~ ~ ~ 90 0" % (client["username"], client["username"])
-        self.console(command, r"Teleported", timeout=30.0)
+        line = self.console(command, r"(?i)teleported", timeout=30.0)
+        require(line is not None,
+                "could not pin client orientation: %s\n%s" % (command, self.paper_log.tail(30)))
+        print("[lab] %s -> %s" % (command, line), flush=True)
 
     def prepare_paper(self) -> Path:
         server = self.artifacts / "paper"

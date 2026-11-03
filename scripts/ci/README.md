@@ -111,12 +111,14 @@ Build 里的 Python 协议客户端只验证 Paper/Velocity 的线协议状态�
 
 | 项 | 做法 |
 |---|---|
-| 世界演进 | `doDaylightCycle/doWeatherCycle/doMobSpawning/doFireTick/doEntityDrops` 全部关，`randomTickSpeed 0`，`difficulty peaceful`，`time set 6000`，`weather clear` |
-| 区块 | `forceload add -128 -128 128 128` 覆盖可见半径，避免测量期间边生成边发送 |
+| 世界演进 | `difficulty peaceful`、`time set 6000`、`weather clear` |
+| 区块 | `forceload add -64 -64 64 64`（该命令单次上限 256 区块）预先装载可见半径，避免测量期间边生成边发送 |
 | 实体 | `kill @e[type=!player]`，清掉世界里已有的实体 |
 | 玩家姿态 | 加入后 `execute at <玩家> run tp <玩家> ~ ~ ~ 90 0`，把位置留在确定性出生点、朝向钉死 |
 
 任一条命令没有产生预期回显，驱动会直接失败而不是带着不稳定的世界继续测。预热默认 2 分钟（`warmup_minutes`），仍然不计入测量区间。
+
+`gamerule` 不在本清单里：Paper 26.2 的控制台对 `gamerule <camelCase|snake_case|带命名空间> <值>` 一律回 `Incorrect argument`，实测无法用来关时间/天气/刷怪；上面的命令是可用的替代集。
 
 稳定化后的空对照仍要重测一次：只有同源变异明显下降，字节指标才允许进入优化结论；如果仍高于目标改动量级，就先继续收紧场景（例如固定区块预生成、缩短视距、固定实体数量），而不是急着做优化对比。
 
