@@ -26,6 +26,22 @@ on:
         required: false
         default: "1"
         type: string
+      sweep:
+        description: Run the configuration sweep in scripts/ci/sweep.json instead of one scenario
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+      sweep_seconds:
+        description: Measured interval per sweep configuration
+        required: false
+        default: "180"
+        type: string
+      sweep_warmup_seconds:
+        description: Warm-up per sweep configuration
+        required: false
+        default: "60"
+        type: string
 permissions:
   contents: read
   actions: read
@@ -37,7 +53,7 @@ jobs:
   hosted-smoke:
     name: Hosted smoke (real client)
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 180
     env:
       CI: "true"
       MZSTD_MC_VERSION: "26.2"
@@ -155,6 +171,7 @@ jobs:
           python3 scripts/ci/hosted_preflight.py \
             --report-json "$EVIDENCE_DIR/sanitized/runner-preflight.json"
       - name: Run the real Fabric + Krypton client through compressed FRP
+        if: ${{ inputs.sweep != 'true' }}
         env:
           SMOKE_SECONDS: ${{ inputs.duration_seconds || '120' }}
           SMOKE_CLIENTS: ${{ inputs.clients || '1' }}
@@ -173,20 +190,77 @@ jobs:
             --expected-fabric-jar "$GITHUB_WORKSPACE"/dist/Miku-ZSTD-*-Fabric.jar \
             --expected-paper-jar "$GITHUB_WORKSPACE"/dist/Miku-ZSTD-*-Paper.jar \
             --sanitized-output "$EVIDENCE_DIR/sanitized/summary.json"
+      - name: Run configuration sweep
+        if: ${{ inputs.sweep == 'true' }}
+        env:
+          SWEEP_SECONDS: ${{ inputs.sweep_seconds }}
+          SWEEP_WARMUP: ${{ inputs.sweep_warmup_seconds }}
+          MZSTD_LOAD_PROFILE: drive
+          MZSTD_LOAD_STEP_MS: "1000"
+          MZSTD_LOAD_STEP_BLOCKS: "16"
+        run: |
+          set -euo pipefail
+          # 每个配置单独一次真实客户端场景：配置只在新建压缩上下文时生效，
+          # 所以必须每次重启服务端并让客户端重新连接，不能在同一进程里换配置。
+          python3 - "$GITHUB_WORKSPACE/scripts/ci/sweep.json" <<'PY' > sweep.tsv
+          import json, sys
+          data = json.load(open(sys.argv[1], encoding="utf-8"))
+          for item in data:
+              print(item["label"] + "\t" + json.dumps(item["config"], separators=(",", ":")))
+          PY
+          while IFS=$'\t' read -r label cfg; do
+            echo "::group::sweep ${label}"
+            export MZSTD_PLUGIN_CONFIG="$cfg"
+            export MZSTD_RUN_LABEL="$label"
+            export MZSTD_RUN_NONCE="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+            out="$EVIDENCE_DIR/sweep/$label"
+            mkdir -p "$out/sanitized"
+            python3 scripts/ci/lab_harness.py smoke --config "$MZSTD_SMOKE_CONFIG" \
+              --fabric-jar "$GITHUB_WORKSPACE"/dist/Miku-ZSTD-*-Fabric.jar \
+              --paper-jar "$GITHUB_WORKSPACE"/dist/Miku-ZSTD-*-Paper.jar \
+              --frp-compression true --clients 1 \
+              --duration-seconds "$SWEEP_SECONDS" --warmup-seconds "$SWEEP_WARMUP" \
+              --candidate-sha "$GITHUB_SHA" --result-dir "$out/scenario" \
+              --event-log "$out/sanitized/lifecycle.jsonl"
+            python3 scripts/ci/validate_real_client_result.py smoke "$out/scenario/summary.json" \
+              --expected-clients 1 --expected-sha "$GITHUB_SHA" \
+              --min-duration-seconds "$SWEEP_SECONDS" --expected-nonce "$MZSTD_RUN_NONCE" \
+              --expected-fabric-jar "$GITHUB_WORKSPACE"/dist/Miku-ZSTD-*-Fabric.jar \
+              --expected-paper-jar "$GITHUB_WORKSPACE"/dist/Miku-ZSTD-*-Paper.jar \
+              --sanitized-output "$out/sanitized/summary.json"
+            echo "::endgroup::"
+          done < sweep.tsv
       - name: Report measured metrics
         if: always()
         run: |
           set -uo pipefail
           shopt -s nullglob
           # 只打印数值与口径说明，便于在 step 日志里核对分位点；不打印路径与客户端日志。
+          # 一行一个场景，便于把整轮扫描的数值直接摘出来核对。
           for report in "$RUNNER_TEMP"/mzstd-lab/work/.mzstd-private-*/*/report.json; do
             python3 - "$report" <<'PY'
           import json, sys
           data = json.load(open(sys.argv[1], encoding="utf-8"))
-          print(json.dumps({"metrics": data.get("metrics", {}),
-                            "capacity": data.get("capacity", {}),
-                            "measurement": data.get("measurement", {})},
-                           indent=2, sort_keys=True))
+          m = data.get("metrics", {})
+          meas = data.get("measurement", {})
+          print(json.dumps({
+              "label": meas.get("run_label") or "single",
+              "config": meas.get("plugin_config"),
+              "load": meas.get("load_profile"),
+              "duration_s": m.get("duration_seconds"),
+              "raw_bytes": m.get("raw_bytes"),
+              "wire_bytes": m.get("compressed_wire_bytes"),
+              "cpu_s": m.get("server_cpu_seconds"),
+              "rss_bytes": m.get("server_rss_bytes"),
+              "rtt_n": m.get("rtt_sample_count"),
+              "rtt_p50": m.get("rtt_p50_ms"),
+              "rtt_p99": m.get("rtt_p99_ms"),
+              "queue_p99": m.get("pool_queue_wait_p99_ms"),
+              "service_p99": m.get("pool_service_p99_ms"),
+              "eventloop_p99": m.get("event_loop_wait_p99_ms"),
+              "write_p99": m.get("write_p99_ms"),
+              "client_inbound": m.get("observed_client_inbound_bytes"),
+          }, sort_keys=True))
           PY
           done
       - name: Show scenario diagnostics
@@ -231,5 +305,6 @@ jobs:
             ${{ env.EVIDENCE_DIR }}/sanitized/summary.json
             ${{ env.EVIDENCE_DIR }}/sanitized/runner-preflight.json
             ${{ env.EVIDENCE_DIR }}/sanitized/lifecycle.jsonl
+            ${{ env.EVIDENCE_DIR }}/sweep/*/sanitized/summary.json
           if-no-files-found: warn
           retention-days: 14
