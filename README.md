@@ -1,4 +1,4 @@
-# Miku-ZSTD 6.0.3
+# Miku-ZSTD 6.0.4
 
 作者：JunXieX　|　MikuMC系列插件交流群：1105054380　|　非开源项目，请勿二次分发
 
@@ -12,7 +12,7 @@
 - 新生成的服务端配置默认关闭调试日志，已有配置中的显式设置保持原样。
 - 代理上 `/mikuzstd bar` 对后端同名命令的遮蔽：具备代理权限时在代理执行，否则已连接后端的玩家交由后端鉴权。
 - 关闭后端原版压缩时，仍保留 `/mikuzstd bar` 的执行与补全。
-- 6.0.3 修复 FRP 开启 `transport.useCompression` 时玩家登录中断的问题；通过 FRP 转发的服主无需关闭该选项。
+- 6.0.4 修复 Fabric + Krypton 在协商应答早于 SetCompression 时发出未封装登录包的问题；使用 FRP 转发仍可保持 `transport.useCompression=true`。
 - 6.0.2 起不再设置小包直存阈值，所有接管后的下行包都进入连续压缩流；旧协商协议的客户端协商不匹配时保持原版。
 
 压缩收益随区块、注册表、聊天与小包占比变化，请以本服监控数据判断效果。
@@ -25,7 +25,7 @@
 | 客户端 | Minecraft 26.2 + Fabric | 当前构建使用 Fabric Loader 0.19.5、Fabric API 0.160.0+26.2 |
 | 代理 | Velocity 4.x | 当前真实服务器登录回归使用 4.3.1 |
 | 直连服务端 | Paper / Folia 26.2 | 当前构建基于 Paper 26.2；真实服务器登录回归使用 Paper 26.2 |
-| 配套文件 | Miku-ZSTD 服务端插件与 Fabric 模组 | 建议服务端与 Fabric 客户端统一使用 6.0.3；旧协议客户端协商不匹配时保持原版 |
+| 配套文件 | Miku-ZSTD 服务端插件与 Fabric 模组 | 建议服务端与 Fabric 客户端统一使用 6.0.4；旧协议客户端协商不匹配时保持原版 |
 
 以上是当前构建与回归基线，不代表其他游戏或代理版本已经逐一验证。
 
@@ -35,8 +35,8 @@
 
 | 场景 | 安装位置 | 监控范围 |
 |---|---|---|
-| 玩家通过 Velocity 进服 | 代理安装 `Miku-ZSTD-6.0.3-Velocity.jar`，玩家安装 Fabric 产物 | 代理实例处理的玩家下行连接 |
-| 玩家直连 Paper / Folia | 服务端安装 `Miku-ZSTD-6.0.3-Paper.jar`，玩家安装 Fabric 产物 | 该服务端实例处理的下行连接 |
+| 玩家通过 Velocity 进服 | 代理安装 `Miku-ZSTD-6.0.4-Velocity.jar`，玩家安装 Fabric 产物 | 代理实例处理的玩家下行连接 |
+| 玩家直连 Paper / Folia | 服务端安装 `Miku-ZSTD-6.0.4-Paper.jar`，玩家安装 Fabric 产物 | 该服务端实例处理的下行连接 |
 | 代理与后端均安装插件 | 按各自用途安装，分别配置与授权 | 两端统计独立，后端面板不会自动汇总代理的玩家出口 |
 
 代理架构只需代理插件与客户端模组即可覆盖玩家侧链路；后端 Paper 插件属于独立安装项。
@@ -45,7 +45,7 @@
 
 1. 将对应产物放进运行实例的 `plugins/`，同一实例只保留一份本插件。
 2. Paper / Folia 将 `server.properties` 的 `network-compression-threshold` 设为非负值，建议从 `256` 开始。Velocity 使用其自身的压缩阈值配置。
-3. 重启对应实例。首次启动生成 `plugins/Miku-ZSTD/config.yml`；代理与后端各有自己的配置文件。经 FRP 转发时无需关闭 `transport.useCompression`，请让面向玩家的服务端/代理与客户端使用 6.0.3。
+3. 重启对应实例。首次启动生成 `plugins/Miku-ZSTD/config.yml`；代理与后端各有自己的配置文件。经 FRP 转发时无需关闭 `transport.useCompression`，请让面向玩家的服务端/代理与客户端使用 6.0.4。
 4. 使用配套客户端登录，并运行 `/mikuzstd status` 核对当前实例状态。需要图形监控时，再按权限说明执行 `/mikuzstd bar`。
 
 Paper / Folia 将原版压缩阈值设为 `-1` 时，只关闭本端压缩接管，命令与 BossBar 监控仍可使用，玩家连接继续按原版处理。后端监控不会自动包含代理出口流量。
@@ -53,7 +53,7 @@ Paper / Folia 将原版压缩阈值设为 `-1` 时，只关闭本端压缩接管
 ### 客户端
 
 1. 安装与 Minecraft 26.2 对应的 Fabric Loader、Fabric API。
-2. 将 `Miku-ZSTD-6.0.3-Fabric.jar` 放进该游戏实例的 `mods/`。
+2. 将 `Miku-ZSTD-6.0.4-Fabric.jar` 放进该游戏实例的 `mods/`。
 3. 首次启动生成 `<游戏目录>/Miku-ZSTD/config.yml`。进入游戏后按 **F8** 切换下行统计 HUD，按键切换只在本次运行期间生效。
 
 旧版配置按既有规则尝试迁移，已有文件不会被默认模板覆盖。Velocity 通常使用上文的大写目录；旧注入目录迁移失败时会记日志并继续使用旧目录，请以迁移日志确认实际配置位置。

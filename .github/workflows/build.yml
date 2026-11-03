@@ -453,11 +453,11 @@ jobs:
                       print("  SetCompression threshold=%d" % thr)
                       if pending_negotiate is not None:
                           pending_tx, pending_status = pending_negotiate
-                          assert pending_status == 2 and not expected_zstd
+                          assert pending_status == (0 if expected_zstd else 2)
                           send(sock, varint(0x02) + varint(pending_tx) + b"\x01" + varint(pending_status), compression_threshold)
                           pending_negotiate = None
                           seen["negotiate"] = True
-                          print("  deferred fallback answered after SetCompression")
+                          print("  deferred negotiate answer until SetCompression")
                   elif pid == 0x04:
                       tx, p = dv(packet, pos)
                       sl, p = dv(packet, p)
@@ -467,11 +467,10 @@ jobs:
                           server_version = struct.unpack(">i", payload)[0]
                           assert server_version == NEGOTIATE, "服务端协商版本应为 12"
                           status = 0 if server_version == CLIENT_NEGOTIATE else 2
-                          if status == 2 and compression_threshold is None:
+                          if compression_threshold is None:
                               pending_negotiate = (tx, status)
-                              print("  fallback answer deferred until SetCompression")
+                              print("  negotiate answer deferred until SetCompression")
                               continue
-                          assert status != 2 or seen["set_compression"], "旧版回落应答必须晚于 SetCompression"
                           send(sock, varint(0x02) + varint(tx) + b"\x01" + varint(status), compression_threshold)
                           seen["negotiate"] = True
                           print("  negotiate answered")
@@ -785,11 +784,11 @@ jobs:
                       print("  SetCompression threshold=%d" % thr)
                       if pending_negotiate is not None:
                           pending_tx, pending_status = pending_negotiate
-                          assert pending_status == 2 and not expected_zstd
+                          assert pending_status == (0 if expected_zstd else 2)
                           send(sock, varint(0x02) + varint(pending_tx) + b"\x01" + varint(pending_status), compression_threshold)
                           pending_negotiate = None
                           seen["negotiate"] = True
-                          print("  deferred fallback answered after SetCompression")
+                          print("  deferred negotiate answer until SetCompression")
                   elif pid == 0x04:
                       tx, pp = dv(packet, pos); sl, pp = dv(packet, pp)
                       chan = packet[pp:pp + sl].decode()
@@ -798,11 +797,10 @@ jobs:
                           server_version = struct.unpack(">i", payload)[0]
                           assert server_version == NEGOTIATE, "服务端协商版本应为 12"
                           status = 0 if server_version == CLIENT_NEGOTIATE else 2
-                          if status == 2 and compression_threshold is None:
+                          if compression_threshold is None:
                               pending_negotiate = (tx, status)
-                              print("  fallback answer deferred until SetCompression")
+                              print("  negotiate answer deferred until SetCompression")
                               continue
-                          assert status != 2 or seen["set_compression"], "旧版回落应答必须晚于 SetCompression"
                           send(sock, varint(0x02) + varint(tx) + b"\x01" + varint(status), compression_threshold)
                           seen["negotiate"] = True; print("  negotiate answered")
                       elif chan == "zstd:switch":

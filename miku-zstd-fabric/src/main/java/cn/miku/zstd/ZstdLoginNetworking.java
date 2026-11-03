@@ -27,6 +27,10 @@ import mikumc.zstd.protocol.ZstdNegotiateStatus;
  */
 public final class ZstdLoginNetworking {
     private static final Logger LOGGER = LoggerFactory.getLogger(MikuZstd.LOGGER_NAME);
+    private static final io.netty.util.AttributeKey<CompressionResponseBarrier> RESPONSE_BARRIER =
+            io.netty.util.AttributeKey.valueOf("zstd:compression-response-barrier");
+    private static final io.netty.util.AttributeKey<Boolean> RESPONSE_CLOSE_HOOK =
+            io.netty.util.AttributeKey.valueOf("zstd:compression-response-close-hook");
 
     private ZstdLoginNetworking() {
     }
@@ -38,9 +42,11 @@ public final class ZstdLoginNetworking {
     private static CompletableFuture<FriendlyByteBuf> handleNegotiate(
             Minecraft client, ClientHandshakePacketListenerImpl handler,
             FriendlyByteBuf data, Consumer<io.netty.channel.ChannelFutureListener> listenerConsumer) {
+        Channel channel = null;
         try {
             Connection connection = ((ClientHandshakePacketListenerAccessor) handler).getConnection();
-            Channel channel = ((ConnectionAccessor) connection).getChannel();
+            channel = ((ConnectionAccessor) connection).getChannel();
+            beginNegotiation(channel, handler);
 
             // Fabric LoginQueryRequestHandler.receive 的线程契约是 Netty event loop。
             // 新 negotiate 先同步摘除旧下行 handler、清 ACTIVATED，再更换 native 上下文；
@@ -63,7 +69,7 @@ public final class ZstdLoginNetworking {
                 LOGGER.error("[Zstd] Protocol version mismatch: server={}, client={} \u2014 staying vanilla",
                         protocolVersion, ZstdChannelManager.PROTOCOL_VERSION);
                 markDeclined(handler);
-                return CompletableFuture.completedFuture(unavailable());
+                return answerAfterCompression(channel, ZstdNegotiateStatus.VANILLA);
             }
 
             ZstdChannelManager mgr = existing;
@@ -84,15 +90,96 @@ public final class ZstdLoginNetworking {
 
             // 应答写出后再补一次 switch 嗅探器安装，覆盖首次查询时 packet decoder 锚点尚未挂好的管线。
             // 此回调只准备原版阶段的嗅探器，不能提前安装连续流解码器。
+            final Channel responseChannel = channel;
             listenerConsumer.accept(operation ->
-                    ZstdClientActivation.activateAfterQueryResponseSent(channel));
+                    ZstdClientActivation.activateAfterQueryResponseSent(responseChannel));
 
-            return CompletableFuture.completedFuture(answer(ZstdNegotiateStatus.READY));
+            // Fabric sends the completed Future immediately. Wait for handleCompression's TAIL so
+            // the vanilla/Krypton encoder adds the data-length prefix to this small response.
+            return answerAfterCompression(channel, ZstdNegotiateStatus.READY);
         } catch (Exception e) {
             LOGGER.error("[Zstd] Failed to process negotiate \u2014 staying vanilla", e);
             markDeclined(handler);
-            return CompletableFuture.completedFuture(unavailable());
+            return channel == null
+                    ? CompletableFuture.completedFuture(unavailable())
+                    : answerAfterCompression(channel, ZstdNegotiateStatus.VANILLA);
         }
+    }
+
+    /** Begin a new query round and retain a future until compression setup is observable. */
+    private static final io.netty.util.AttributeKey<Object> COMPRESSION_READY_HANDLER =
+            io.netty.util.AttributeKey.valueOf("zstd:compression-ready-handler");
+    private static final io.netty.util.AttributeKey<Object> COMPRESSION_SETUP_HANDLER =
+            io.netty.util.AttributeKey.valueOf("zstd:compression-setup-handler");
+    private static final io.netty.util.AttributeKey<Object> COMPRESSION_SETUP_PACKET =
+            io.netty.util.AttributeKey.valueOf("zstd:compression-setup-packet");
+
+    private static boolean compressionHandlersReady(Channel channel) {
+        return channel.pipeline().get("compress") != null
+                && channel.pipeline().get("decompress") != null;
+    }
+
+    static void beginNegotiation(Channel channel, Object loginHandler) {
+        CompressionResponseBarrier previous = channel.attr(RESPONSE_BARRIER).get();
+        if (previous != null) previous.cancel();
+        CompressionResponseBarrier barrier = new CompressionResponseBarrier(loginHandler);
+        channel.attr(RESPONSE_BARRIER).set(barrier);
+        channel.attr(COMPRESSION_SETUP_HANDLER).set(loginHandler);
+        if (channel.attr(RESPONSE_CLOSE_HOOK).setIfAbsent(Boolean.TRUE) == null) {
+            channel.closeFuture().addListener(ignored -> {
+                CompressionResponseBarrier pending = channel.attr(RESPONSE_BARRIER).getAndSet(null);
+                if (pending != null) pending.cancel();
+            });
+        }
+        if (loginHandler != null && channel.attr(COMPRESSION_READY_HANDLER).get() == loginHandler
+                && compressionHandlersReady(channel)) {
+            barrier.complete();
+        }
+    }
+
+    /** Called at handleCompression HEAD, before vanilla or Krypton rebuilds the compression handlers. */
+    public static void onCompressionSetupStarted(Channel channel, Object loginHandler, Object packet) {
+        if (channel == null) return;
+        channel.attr(COMPRESSION_SETUP_HANDLER).set(loginHandler);
+        channel.attr(COMPRESSION_SETUP_PACKET).set(packet);
+        channel.attr(COMPRESSION_READY_HANDLER).set(null);
+        CompressionResponseBarrier barrier = channel.attr(RESPONSE_BARRIER).get();
+        if (barrier != null && barrier.loginHandler == loginHandler) barrier.beginSetup();
+    }
+
+    /** Called only after handleCompression/Connection.setupCompression has completed. */
+    public static void markCompressionReady(Channel channel, Object loginHandler, Object packet) {
+        if (channel == null) return;
+        Runnable mark = () -> {
+            if (channel.attr(COMPRESSION_SETUP_HANDLER).get() != loginHandler
+                    || channel.attr(COMPRESSION_SETUP_PACKET).get() != packet) return;
+            if (channel.pipeline().get("compress") == null
+                    || channel.pipeline().get("decompress") == null) return;
+            channel.attr(COMPRESSION_READY_HANDLER).set(loginHandler);
+            ZstdClientActivation.prepareForSwitch(channel);
+            CompressionResponseBarrier barrier = channel.attr(RESPONSE_BARRIER).get();
+            if (barrier != null && barrier.loginHandler == loginHandler) barrier.complete();
+        };
+        if (channel.eventLoop().inEventLoop()) mark.run();
+        else channel.eventLoop().execute(mark);
+    }
+
+    static CompletableFuture<FriendlyByteBuf> answerAfterCompression(Channel channel, int status) {
+        CompressionResponseBarrier barrier = channel.attr(RESPONSE_BARRIER).get();
+        if (barrier == null) return CompletableFuture.completedFuture(answer(status));
+        return barrier.readyFuture().thenApply(ignored -> answer(status));
+    }
+
+    static final class CompressionResponseBarrier {
+        private final Object loginHandler;
+        private CompletableFuture<Void> ready = new CompletableFuture<>();
+        private CompressionResponseBarrier(Object loginHandler) { this.loginHandler = loginHandler; }
+        private synchronized void beginSetup() {
+            if (ready.isDone()) ready = new CompletableFuture<>();
+        }
+        private synchronized void complete() { ready.complete(null); }
+        private synchronized void cancel() { ready.cancel(false); }
+        private synchronized CompletableFuture<Void> readyFuture() { return ready; }
     }
 
     /**

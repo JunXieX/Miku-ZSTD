@@ -18,12 +18,20 @@ public class MixinHandshakeListener {
     @Shadow
     private net.minecraft.network.Connection connection;
 
+    @Inject(method = "handleCompression", at = @At("HEAD"))
+    private void zstd$compressionSetupStarted(ClientboundLoginCompressionPacket packet, CallbackInfo ci) {
+        if (this.connection != null) {
+            cn.miku.zstd.ZstdLoginNetworking.onCompressionSetupStarted(
+                    ((cn.miku.zstd.mixin.ConnectionAccessor) this.connection).getChannel(), this, packet);
+        }
+    }
+
     @Inject(method = "handleCompression", at = @At("TAIL"))
     private void zstd$activateAfterCompression(ClientboundLoginCompressionPacket packet, CallbackInfo ci) {
-        // 完整压缩设置回调末尾再次复核下行处理器的位置。
+        // 原版/Krypton均在这里完成压缩处理器安装；随后才能发送挂起的LoginQuery答复。
         if (this.connection != null) {
-            cn.miku.zstd.ZstdClientActivation.prepareForSwitch(
-                    ((cn.miku.zstd.mixin.ConnectionAccessor) this.connection).getChannel());
+            cn.miku.zstd.ZstdLoginNetworking.markCompressionReady(
+                    ((cn.miku.zstd.mixin.ConnectionAccessor) this.connection).getChannel(), this, packet);
         }
     }
 }
