@@ -9,8 +9,8 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
- * 登录压缩回调 TAIL 的下行安装兜底。
- * 原版或 Krypton 重建 decompress 后再次复核相对位置，不改动任何上行处理器。
+ * 登录压缩回调 TAIL 的 switch 嗅探器安装兜底。
+ * 原版或 Krypton 重建 decompress 后复核嗅探器相对位置；decoder 等待switch后同步安装。
  */
 @Mixin(ClientHandshakePacketListenerImpl.class)
 public class MixinHandshakeListener {

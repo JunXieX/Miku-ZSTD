@@ -74,16 +74,16 @@ public final class ZstdLoginNetworking {
                 channel.closeFuture().addListener(f -> toClose.close());
             }
 
-            // ⚠️ 这里<b>不</b>安装任何 handler：此刻压缩处理器还没装，唯一的锚点会是
-            // packet_handler —— 那里收到的是已解码的 Packet 对象，帧层处理根本不会执行。
-            // 正确时机在 ZstdClientActivation.activateInEventLoop（锚点齐备之后）。
+            // 此刻原版压缩处理器可能尚未安装；切换嗅探器允许暂时挂在packet decoder前，
+            // 等SetCompression插入decompress后仍位于它上游。连续解码器必须等实际switch帧。
             channel.attr(ZstdChannelManager.ZSTD_STATE)
                     .set(ZstdChannelManager.TransportState.NEGOTIATING);
-            LOGGER.debug("[Zstd] negotiate ok (version={}) \u2014 will activate zstd", protocolVersion);
+            // 在 READY 答复交给网络前尝试挂接轻量切换嗅探器，避免响应监听器迟于switch帧。
+            ZstdClientActivation.prepareForSwitch(channel);
+            LOGGER.debug("[Zstd] negotiate ok (version={}) \u2014 waiting for switch before activating zstd", protocolVersion);
 
-            // 应答写出之后再补一次激活尝试（quiet 版）：正常情况下 SetCompression 还没到、
-            // 锚点不存在，这里只会记 debug；但代理或其它模组把登录顺序调换时，它是唯一
-            // 能补上的时机。这里只准备下行；switch/confirm 仍承担安装就绪屏障。
+            // 应答写出后再补一次 switch 嗅探器安装，覆盖首次查询时 packet decoder 锚点尚未挂好的管线。
+            // 此回调只准备原版阶段的嗅探器，不能提前安装连续流解码器。
             listenerConsumer.accept(operation ->
                     ZstdClientActivation.activateAfterQueryResponseSent(channel));
 

@@ -94,14 +94,18 @@ jobs:
   # 脚本内联在 workflow 里（仓库只入库源码与构建文件，见 .gitignore 的约定）。
   # ──────────────────────────────────────────────────────────────────────
   e2e:
-    name: E2E (Paper, threshold=${{ matrix.threshold }}, client=${{ matrix.negotiate }})
+    name: E2E (Paper, threshold=${{ matrix.threshold }}, client=${{ matrix.negotiate }}, frp=${{ matrix.frp }})
     strategy:
       matrix:
         threshold: [0, 256]
         negotiate: [12, 11]
+        frp: [false]
         include:
           - threshold: -1
             negotiate: 12
+          - threshold: 256
+            negotiate: 12
+            frp: true
     needs: [paper]
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -169,15 +173,108 @@ jobs:
           done
           tail -60 server/server.log
           exit 1
+      - name: Start FRP Snappy compression tunnel
+        if: matrix.frp == true
+        run: |
+          set -euo pipefail
+          version=0.71.1
+          archive="frp_${version}_linux_amd64.tar.gz"
+          base="https://github.com/fatedier/frp/releases/download/v${version}"
+          curl -fsSL "${base}/${archive}" -o /tmp/frp.tar.gz
+          curl -fsSL "${base}/frp_sha256_checksums.txt" -o /tmp/frp_sha256_checksums.txt
+          grep -F "  ${archive}" /tmp/frp_sha256_checksums.txt | sha256sum -c -
+          mkdir -p /tmp/frp-bin
+          tar -xzf /tmp/frp.tar.gz -C /tmp/frp-bin --strip-components=1
+          cat > /tmp/frp-bin/frps.toml <<'EOF'
+          bindPort = 7000
+          auth.method = "token"
+          auth.token = "miku-zstd-frp-e2e"
+          EOF
+          cat > /tmp/frp-bin/frpc.toml <<'EOF'
+          serverAddr = "127.0.0.1"
+          serverPort = 7000
+          auth.method = "token"
+          auth.token = "miku-zstd-frp-e2e"
+          log.level = "trace"
+          [[proxies]]
+          name = "minecraft-e2e"
+          type = "tcp"
+          localIP = "127.0.0.1"
+          localPort = 25600
+          remotePort = 26600
+          transport.useCompression = true
+          EOF
+          nohup /tmp/frp-bin/frps -c /tmp/frp-bin/frps.toml > /tmp/frps.log 2>&1 < /dev/null &
+          echo $! > /tmp/frps.pid
+          nohup /tmp/frp-bin/frpc -c /tmp/frp-bin/frpc.toml > /tmp/frpc.log 2>&1 < /dev/null &
+          echo $! > /tmp/frpc.pid
+          python3 - <<'PY'
+          import socket, time
+
+          def vi(value):
+              out = bytearray()
+              while value & ~0x7f:
+                  out.append((value & 0x7f) | 0x80)
+                  value >>= 7
+              out.append(value)
+              return bytes(out)
+
+          def recv_vi(sock):
+              value = shift = 0
+              while shift <= 28:
+                  byte = sock.recv(1)
+                  if not byte:
+                      raise EOFError("FRP tunnel closed during VarInt")
+                  value |= (byte[0] & 0x7f) << shift
+                  if not byte[0] & 0x80:
+                      return value
+                  shift += 7
+              raise ValueError("invalid response VarInt")
+
+          def read_exact(sock, length):
+              chunks = bytearray()
+              while len(chunks) < length:
+                  part = sock.recv(length - len(chunks))
+                  if not part:
+                      raise EOFError("FRP tunnel closed during status response")
+                  chunks.extend(part)
+              return bytes(chunks)
+
+          host = b"127.0.0.1"
+          handshake = vi(0) + vi(776) + vi(len(host)) + host + (26600).to_bytes(2, "big") + vi(1)
+          request = vi(1) + b"\x00"
+          last = None
+          for _ in range(60):
+              try:
+                  with socket.create_connection(("127.0.0.1", 26600), timeout=3) as sock:
+                      sock.settimeout(3)
+                      sock.sendall(vi(len(handshake)) + handshake + request)
+                      length = recv_vi(sock)
+                      response = read_exact(sock, length)
+                      if not response or response[0] != 0:
+                          raise ValueError("invalid Minecraft status response")
+                  print("FRP Snappy tunnel completed a Minecraft status handshake")
+                  break
+              except Exception as error:
+                  last = error
+                  time.sleep(1)
+          else:
+              print("FRP compressed tunnel did not start: %s" % last)
+              raise SystemExit(1)
+          PY
       - name: Run protocol client
+        env:
+          MZ_E2E_HOST: 127.0.0.1
+          MZ_E2E_PORT: ${{ matrix.frp && '26600' || '25600' }}
         run: |
           set -euo pipefail
           python3 -m pip install --quiet zstandard
           python3 - <<'PY'
-          import socket, struct, sys, time, zlib
+          import os, socket, struct, sys, time, zlib
           import zstandard as zstd
 
-          HOST, PORT = "127.0.0.1", 25600
+          HOST = os.environ.get("MZ_E2E_HOST", "127.0.0.1")
+          PORT = int(os.environ.get("MZ_E2E_PORT", "25600"))
           MAGIC = 0x5A535743
           PROTOCOL = 776
           NEGOTIATE = 12
@@ -406,6 +503,13 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
+          if [ "${{ matrix.frp }}" = "true" ]; then
+            grep -q 'transport.useCompression = true' /tmp/frp-bin/frpc.toml || { echo "FRP transport compression was not configured"; exit 1; }
+            grep -q 'useCompression: true' /tmp/frpc.log || { echo "FRP did not exercise its compressed work-connection path"; tail -80 /tmp/frpc.log; exit 1; }
+            echo "FRP work connection confirms transport.useCompression=true"
+            echo "----- FRP logs -----"
+            tail -40 /tmp/frps.log /tmp/frpc.log || true
+          fi
           cd server
           echo "----- activation / fallback lines -----"
           grep -E "zstd transport activated|anchors 未出现|frame rejected|dict generation mismatch|保持原版 zlib" server.log || true

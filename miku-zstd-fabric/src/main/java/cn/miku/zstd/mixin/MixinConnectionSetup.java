@@ -9,7 +9,7 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
- * 原版 setupCompression 的 TAIL：压缩处理器安装后，准备下行 zstd 解码器与 switch 嗅探器。
+ * 原版 setupCompression 的 TAIL：压缩处理器安装后准备 switch 嗅探器，decoder 仅在 switch 后安装。
  * 上行的 compress、prepender 与加密处理全部沿用原版。
  */
 @Mixin(Connection.class)

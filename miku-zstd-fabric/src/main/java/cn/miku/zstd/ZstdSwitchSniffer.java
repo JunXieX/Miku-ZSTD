@@ -10,8 +10,8 @@ import org.slf4j.LoggerFactory;
 import java.util.List;
 
 /**
- * 切换询问嗅探器（Fabric 客户端，帧层）：识别服务端发来的 {@code zstd:switch} 询问，
- * 切换本端管道后回发确认。
+ * 切换询问嗅探器（Fabric 客户端，帧层）：识别原版 {@code zstd:switch} 帧，
+ * 在原版与连续 Zstd 解码之间建立有序屏障。
  *
  * <h2>为什么客户端需要它</h2>
  * <p>服务端在激活 zstd 后会扣住登录期的大帧（例如 LoginSuccess 的压缩帧），等本端确认
@@ -24,11 +24,10 @@ import java.util.List;
  * 是已经解码的 {@code Packet} 对象，{@code decode} 根本不会被调用；更糟的是那个位置
  * 已经过 {@code zstd_decoder}，裸的询问包会被当成 zstd 帧解析错乱。</p>
  *
- * <p>协议 v7 起 {@code zstd_decoder} 与 {@code decompress} <b>并存</b>（我们不再替换原版），
- * 所以锚点顺序是 {@code zstd_decoder} → {@code decompress} → {@code compression-decoder}：
- * 必须排在<b>我们的解码器上游</b>。询问属于原版控制帧，不是连续 Zstd 流的一部分；
- * 若先交给我们的解码器，会因流格式不符而关闭连接。
- * 锚点都不在时安装方只记 debug 等下一次触发，不做兜底位置。</p>
+ * <p>{@code zstd_decoder} 只在此嗅探器确认切换时才插入。嗅探器位于Minecraft帧解码之后、
+ * 任一packet decoder之前；SetCompression尚未装入时可暂时锚定packet decoder，后续原版解压器
+ * 插入其前方时仍保持位于压缩解码路径上游。只有当前帧被确认是 {@code zstd:switch} 后，
+ * 本处理器才会同步安装连续流解码器并回发确认。</p>
  *
  * <h2>为什么继承 {@code MessageToMessageDecoder}</h2>
  * <p>⚠️ 不能用 {@code ByteToMessageDecoder} + {@code out.add(in.retain())}：那个基类要求
@@ -43,7 +42,7 @@ public final class ZstdSwitchSniffer extends MessageToMessageDecoder<ByteBuf> {
      * 单帧上限：询问包是 {@code [0][0x04][varint txId][len]["zstd:switch"][magic]} ≈ 23B，
      * 超过这个尺寸的帧一律不可能是它。
      *
-     * <p>嗅探器在询问到达前保持在位，识别到 switch 后自行移除，
+     * <p>嗅探器在 switch 到达并同步装好连续解码器后由激活流程移除，
      * 因此这个上限限制切换前要走询问识别的入站帧数量：调大意味着更多帧要走
      * {@link ZstdStepFrames#asBarePacket} 的解析（其中"被压缩过的帧"还要尝试一次 zlib 解压）。</p>
      */
@@ -61,9 +60,8 @@ public final class ZstdSwitchSniffer extends MessageToMessageDecoder<ByteBuf> {
             return;
         }
 
-        // 命中：消费该帧（这不是原版协议里的包），先切换、后回确认
-        ctx.pipeline().remove(this);
-        LOGGER.debug("[Zstd] switch request received (txId={}) — activating and confirming", txId);
+        // 命中：在同一event loop内同步安装解码器，并先于确认处理后续同read数据帧。
+        LOGGER.debug("[Zstd] switch request received (txId={}) — installing downstream decoder", txId);
         ZstdClientActivation.activateAndConfirm(ctx.channel(), txId);
     }
 }

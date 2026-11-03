@@ -15,15 +15,16 @@ import org.slf4j.LoggerFactory;
  * <pre>
  *   encoder → compress → prepender → encrypt → socket
  * </pre>
- * <p>本模组只安装下行解码器与切换嗅探器，不替换原版压缩处理器：</p>
+ * <p>切换前只监听原版帧；切换确认时的管线变更同步发生在 event loop：</p>
  * <pre>
- *   socket → decrypt → splitter → zstd_switch_sniffer → zstd_decoder → decompress → decoder
+ *   switch 前：socket → decrypt → splitter → zstd_switch_sniffer → decompress → decoder
+ *   switch 后：socket → decrypt → splitter → zstd_decoder → decompress → decoder
  * </pre>
  * <p>zstd_decoder 从原版 decompress 的 context 向后交付已解出的包，跳过重复解压。
  * 原版及 Krypton 的上行压缩、长度前缀、加密与 flush 处理保持原样。</p>
  *
- * <p>SetCompression 的两个 TAIL 触发点负责安装与位置复核；negotiate 应答写出后再补一次尝试，
- * 覆盖压缩设置早于协商到达的情况。收到 zstd:switch 后必须先确认下行处理器已安装，
+ * <p>SetCompression 的两个 TAIL 触发点只准备原版阶段的 switch 嗅探器；negotiate 应答写出后再补一次，
+ * 覆盖压缩设置早于协商到达的情况。收到 zstd:switch 后在同一 event loop 内安装连续解码器，
  * 再通过原版上行管线发送确认，服务端据此放行下行登录包。</p>
  */
 public final class ZstdClientActivation {
@@ -35,15 +36,16 @@ public final class ZstdClientActivation {
             io.netty.util.AttributeKey.valueOf("zstd:client-activated");
 
     private static final String[] DECODER_ANCHORS = {"decompress", "compression-decoder"};
-    private static final String[] SNIFFER_ANCHORS = {"zstd_decoder", "decompress", "compression-decoder"};
+    private static final String[] SNIFFER_ANCHORS = {
+            "zstd_decoder", "decompress", "compression-decoder", "decoder"
+    };
 
     private ZstdClientActivation() {
     }
 
-    /** 从任意线程请求激活；管线修改在 event loop 执行。 */
+    /** 从任意线程准备切换监听；Zstd 解码只在收到 switch 后启用。 */
     public static void activate(Channel channel) {
-        if (channel == null) return;
-        channel.eventLoop().execute(() -> activateInEventLoop(channel, false));
+        prepareForSwitch(channel);
     }
 
     /** 初始阈值关闭仍用原版；已推进的连续流关闭连接，不丢半包后另装解码器。 */
@@ -65,9 +67,11 @@ public final class ZstdClientActivation {
         var handler = channel.pipeline().get("zstd_decoder");
         boolean started = handler instanceof ZstdBatchDecoder decoder
                 ? decoder.hasStartedStream() : Boolean.TRUE.equals(channel.attr(ACTIVATED).get());
-        if (started) {
+        boolean zstdCommitted = channel.attr(ZstdChannelManager.ZSTD_STATE).get()
+                == ZstdChannelManager.TransportState.ZSTD_ACTIVE;
+        if (started || zstdCommitted) {
             channel.attr(ACTIVATED).set(Boolean.FALSE);
-            LOGGER.warn("[Zstd] closing continuous stream — compression disabled after stream input");
+            LOGGER.warn("[Zstd] closing connection — compression disabled after Zstd switch");
             channel.close();
             return;
         }
@@ -80,7 +84,7 @@ public final class ZstdClientActivation {
         }
     }
 
-    /** 在 SetCompression 回调内立即安装，避免后续 switch 帧先于排队任务到达。 */
+    /** 在 SetCompression 回调内立即准备切换监听，不提前启用连续流解码。 */
     public static void prepareForSwitch(Channel channel) {
         if (channel == null) return;
         if (channel.eventLoop().inEventLoop()) {
@@ -91,27 +95,58 @@ public final class ZstdClientActivation {
     }
 
     private static void prepareNow(Channel channel) {
-        activateInEventLoop(channel, false);
-        if (Boolean.TRUE.equals(channel.attr(ACTIVATED).get())) {
-            installSwitchSniffer(channel.pipeline());
+        if (!channel.isActive()) return;
+        if (deactivateIfStale(channel)) return;
+        ZstdChannelManager.TransportState state = channel.attr(ZstdChannelManager.ZSTD_STATE).get();
+        if (state == ZstdChannelManager.TransportState.ZSTD_ACTIVE
+                && Boolean.TRUE.equals(channel.attr(ACTIVATED).get())) {
+            // switch 已完成后，重复 SetCompression 只能复核现有管线，不能重插嗅探器。
+            if (!handlersPositionedCorrectly(channel.pipeline())) {
+                channel.attr(ACTIVATED).set(Boolean.FALSE);
+                LOGGER.warn("[Zstd] closing continuous stream — downstream handlers missing or misplaced; pipeline={}",
+                        channel.pipeline().names());
+                channel.close();
+            }
+            return;
+        }
+        if (state != ZstdChannelManager.TransportState.NEGOTIATING) return;
+        // SetCompression 只建立原版解压锚点；在 switch 到达前不能安装 zstd_decoder，
+        // 否则中继的缓冲/分段可能让仍属原版阶段的帧先进入连续流解码器。
+        installSwitchSniffer(channel.pipeline());
+    }
+
+    /** negotiate 应答写出后的兜底：只准备 switch 嗅探器，不提前切换下行解码。 */
+    public static void activateAfterQueryResponseSent(Channel channel) {
+        if (channel == null) return;
+        if (channel.eventLoop().inEventLoop()) {
+            prepareNow(channel);
+        } else {
+            channel.eventLoop().execute(() -> prepareNow(channel));
         }
     }
 
-    /** negotiate 应答写出后的兜底；此时尚无压缩锚点属于正常登录时序。 */
-    public static void activateAfterQueryResponseSent(Channel channel) {
-        if (channel == null) return;
-        channel.eventLoop().execute(() -> activateInEventLoop(channel, true));
-    }
-
-    /** 先安装并复核下行解码器，再确认；服务端收到确认后才放行 zstd 登录包。 */
+    /** 在 switch 帧被消费的同一 event loop 内安装下行解码器，再发送确认。 */
     public static void activateAndConfirm(Channel channel, int txId) {
         if (channel == null) return;
-        channel.eventLoop().execute(() -> {
-            activateInEventLoop(channel, false);
-            boolean ready = Boolean.TRUE.equals(channel.attr(ACTIVATED).get())
-                    && handlersPositionedCorrectly(channel.pipeline());
-            sendSwitchConfirm(channel, txId, ready);
-        });
+        if (channel.eventLoop().inEventLoop()) {
+            activateAndConfirmInEventLoop(channel, txId);
+        } else {
+            channel.eventLoop().execute(() -> activateAndConfirmInEventLoop(channel, txId));
+        }
+    }
+
+    private static void activateAndConfirmInEventLoop(Channel channel, int txId) {
+        // switch 嗅探器尚在当前decode回调内；先同步插入decoder并提交状态，再移除嗅探器、发确认。
+        boolean ready = activateInEventLoop(channel);
+        if (!ready) {
+            // 服务端收到 false 仍会按“已提交 zstd”放行，不能在本端未就绪时发送假回落。
+            channel.close();
+            return;
+        }
+        if (channel.pipeline().get("zstd_switch_sniffer") != null) {
+            channel.pipeline().remove("zstd_switch_sniffer");
+        }
+        sendSwitchConfirm(channel, txId, true);
     }
 
     /** 本轮协商回落原版时，清理上一轮可能残留的下行处理器。 */
@@ -175,37 +210,28 @@ public final class ZstdClientActivation {
         }
     }
 
-    private static void activateInEventLoop(Channel channel, boolean quiet) {
-        if (!channel.isActive()) return;
+    private static boolean activateInEventLoop(Channel channel) {
+        if (!channel.isActive() || deactivateIfStale(channel)) return false;
         ChannelPipeline p = channel.pipeline();
-        if (deactivateIfStale(channel)) return;
-
         if (Boolean.TRUE.equals(channel.attr(ACTIVATED).get())) {
-            if (handlersPositionedCorrectly(p)) return;
+            if (handlersPositionedCorrectly(p)) return true;
             // 旧解码器可能持有半包；重建会丢失边界，持续流也没有可重新同步的帧头。
             channel.attr(ACTIVATED).set(Boolean.FALSE);
             LOGGER.warn("[Zstd] closing continuous stream — downstream handlers missing or misplaced; pipeline={}",
                     p.names());
             channel.close();
-            return;
+            return false;
         }
 
         ZstdChannelManager.TransportState state = channel.attr(ZstdChannelManager.ZSTD_STATE).get();
-        // 原版重建 decompress 后，已协商连接也必须允许位置复核与重装。
-        if (state != ZstdChannelManager.TransportState.NEGOTIATING
-                && state != ZstdChannelManager.TransportState.ZSTD_ACTIVE) {
-            LOGGER.debug("[Zstd] client activation deferred: state={} (negotiate not received yet)",
-                    state == null ? "NONE" : state);
-            return;
+        if (state != ZstdChannelManager.TransportState.NEGOTIATING) {
+            LOGGER.warn("[Zstd] switch received outside a negotiated state: {}", state);
+            return false;
         }
-
         if (firstPresent(p, DECODER_ANCHORS) == null) {
-            if (quiet) {
-                LOGGER.debug("[Zstd] activation deferred — downstream compression handler not installed yet");
-            } else {
-                LOGGER.error("[Zstd] activation aborted — downstream anchor missing; pipeline={}", p.names());
-            }
-            return;
+            LOGGER.error("[Zstd] switch received before downstream compression handler was installed; pipeline={}",
+                    p.names());
+            return false;
         }
 
         ZstdChannelManager manager = channel.attr(ZstdChannelManager.KEY).get();
@@ -215,21 +241,19 @@ public final class ZstdClientActivation {
             final ZstdChannelManager toClose = manager;
             channel.closeFuture().addListener(f -> toClose.close());
         }
-
         if (!installDecoder(p)) {
             LOGGER.error("[Zstd] activation aborted — downstream decoder insert failed; pipeline={}", p.names());
-            return;
+            return false;
         }
-        // switch 询问绕过服务端 zstd 流，必须先由嗅探器截获。
-        installSwitchSniffer(p);
-        if (p.get("zstd_switch_sniffer") == null || !handlersPositionedCorrectly(p)) {
-            LOGGER.warn("[Zstd] 下行激活校验失败——解码器或切换嗅探器缺失/错位; pipeline={}", p.names());
-            return;
+        if (!handlersPositionedCorrectly(p)) {
+            LOGGER.warn("[Zstd] 下行激活校验失败——解码器缺失或错位; pipeline={}", p.names());
+            return false;
         }
 
         channel.attr(ZstdChannelManager.ZSTD_STATE).set(ZstdChannelManager.TransportState.ZSTD_ACTIVE);
         channel.attr(ACTIVATED).set(Boolean.TRUE);
         LOGGER.info("[Zstd] Client downstream zstd activated; upstream remains vanilla; pipeline={}", p.names());
+        return true;
     }
 
     /** switch 必须先于 zstd_decoder 截获，否则原版控制帧会被误作 Zstd 流。 */
