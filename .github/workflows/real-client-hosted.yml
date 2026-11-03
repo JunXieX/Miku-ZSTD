@@ -1,0 +1,175 @@
+name: Real Client (Hosted)
+
+# 默认 GitHub 托管 runner 上的真实客户端冒烟：启动真正的 Minecraft 26.2 客户端
+# （Fabric + Krypton + 被测 Miku-ZSTD），经开启压缩的 FRP 连到隔离 Paper 并持续 PLAY。
+# 不依赖自托管 runner、仓库私有变量或任何账号会话；客户端使用固定用户名与离线 UUID。
+on:
+  workflow_dispatch:
+    inputs:
+      duration_seconds:
+        description: PLAY observation window after join
+        required: false
+        default: "120"
+        type: string
+      compression_threshold:
+        description: Paper network-compression-threshold
+        required: false
+        default: "256"
+        type: string
+  push:
+    branches: ["ci/hosted-real-client"]
+    paths:
+      - ".github/workflows/real-client-hosted.yml"
+      - "scripts/ci/**"
+      - "miku-zstd-fabric/**"
+      - "miku-zstd-paper/**"
+      - "miku-zstd-protocol/**"
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: miku-zstd-real-client-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  hosted-smoke:
+    name: Hosted smoke (real client)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CI: "true"
+      MZSTD_MC_VERSION: "26.2"
+      MZSTD_KRYPTON_URL: https://cdn.modrinth.com/data/fQEb0iXm/versions/5WeL0Nkz/krypton-0.3.1.jar
+      MZSTD_KRYPTON_SHA512: b8d9af34cd0050493afb8a6232cb8f785daa9d8887b7045f6e6a53c6bb9b5ffc4318fd9b0347a940eacfeba4773f10cb80ae0be1e79ce4c1888f96eda21e564e
+      MZSTD_FRP_VERSION: "0.71.1"
+      MZSTD_NIC: lo
+      MZSTD_COMPRESSION_THRESHOLD: ${{ inputs.compression_threshold || '256' }}
+      MZSTD_STARTUP_TIMEOUT_SECONDS: "900"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "25"
+      - uses: gradle/actions/setup-gradle@v5
+        with:
+          gradle-version: "9.6.0"
+      - name: Install virtual display and software OpenGL
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xvfb libgl1 libgl1-mesa-dri libglx-mesa0 libxi6 libxrandr2 \
+            libxcursor1 libxinerama1 libxxf86vm1 libasound2t64
+          xvfb-run --help >/dev/null
+      - name: Build tested JARs from this commit
+        run: |
+          set -euo pipefail
+          (cd miku-zstd-fabric && gradle jar --no-daemon --stacktrace)
+          (cd miku-zstd-paper && gradle shadowJar --no-daemon --stacktrace)
+          mkdir -p dist
+          cp miku-zstd-fabric/build/libs/Miku-ZSTD-*-Fabric.jar dist/
+          cp miku-zstd-paper/build/libs/Miku-ZSTD-*-Paper.jar dist/
+          ls -l dist
+      - name: Fetch pinned Krypton and FRP
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/mzstd-lab/deps"
+          curl -fsSL "$MZSTD_KRYPTON_URL" -o "$RUNNER_TEMP/mzstd-lab/deps/krypton.jar"
+          python3 - <<'PY'
+          import hashlib, os, pathlib
+          jar = pathlib.Path(os.environ["RUNNER_TEMP"]) / "mzstd-lab/deps/krypton.jar"
+          digest = hashlib.sha512(jar.read_bytes()).hexdigest()
+          assert digest == os.environ["MZSTD_KRYPTON_SHA512"], digest
+          print("krypton sha512 verified", digest[:16])
+          PY
+          base="https://github.com/fatedier/frp/releases/download/v$MZSTD_FRP_VERSION"
+          archive="frp_${MZSTD_FRP_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL "$base/$archive" -o "$RUNNER_TEMP/frp.tar.gz"
+          curl -fsSL "$base/frp_sha256_checksums.txt" -o "$RUNNER_TEMP/frp.sha256"
+          grep -F "  $archive" "$RUNNER_TEMP/frp.sha256" \
+            | sed "s#  $archive#  $RUNNER_TEMP/frp.tar.gz#" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/frp"
+          tar -xzf "$RUNNER_TEMP/frp.tar.gz" -C "$RUNNER_TEMP/frp" --strip-components=1
+          echo "$RUNNER_TEMP/frp" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/frp/frps" --version
+      - name: Prepare isolated evidence and harness configuration
+        id: lab
+        run: |
+          set -euo pipefail
+          umask 077
+          evidence=$(mktemp -d "$RUNNER_TEMP/miku-zstd-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-XXXXXXXX")
+          lab="$RUNNER_TEMP/mzstd-lab"
+          mkdir -p "$evidence/sanitized" "$lab/work" "$lab/bin"
+          cat > "$lab/bin/run-game-scenario" <<'SH'
+          #!/bin/sh
+          exec python3 "$GITHUB_WORKSPACE/scripts/ci/run_game_scenario.py" "$@"
+          SH
+          cat > "$lab/bin/cleanup-game-scenario" <<'SH'
+          #!/bin/sh
+          exec python3 "$GITHUB_WORKSPACE/scripts/ci/cleanup_game_scenario.py" "$@"
+          SH
+          chmod 700 "$lab/bin/run-game-scenario" "$lab/bin/cleanup-game-scenario"
+          python3 - <<'PY'
+          import json, os, pathlib
+          temp = pathlib.Path(os.environ["RUNNER_TEMP"])
+          lab = temp / "mzstd-lab"
+          config = {
+              "schema_version": 1,
+              "scenario_command": [str(lab / "bin/run-game-scenario")],
+              "cleanup_command": [str(lab / "bin/cleanup-game-scenario")],
+              "work_dir": str(lab / "work"),
+              "startup_timeout_seconds": 900,
+              "cleanup_timeout_seconds": 120,
+              "terminate_grace_seconds": 10,
+          }
+          path = lab / "config.json"
+          path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+          path.chmod(0o600)
+          print("config written", path)
+          PY
+          {
+            echo "EVIDENCE_DIR=$evidence"
+            echo "RESULT_DIR=$evidence/scenario"
+            echo "MZSTD_SMOKE_CONFIG=$lab/config.json"
+            echo "MZSTD_MC_CACHE=$RUNNER_TEMP/mzstd-mc-cache"
+            echo "MZSTD_KRYPTON_JAR=$lab/deps/krypton.jar"
+            echo "MZSTD_RUN_NONCE=$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+          } >> "$GITHUB_ENV"
+      - name: Cache Minecraft client runtime
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.MZSTD_MC_CACHE }}
+          key: mzstd-mc-${{ env.MZSTD_MC_VERSION }}-a35ecceffb8b3443b5d2fb88ca6f93f9b1fbcbf9
+      - name: Check hosted runner prerequisites (not a game test)
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/hosted_preflight.py \
+            --report-json "$EVIDENCE_DIR/sanitized/runner-preflight.json"
+      - name: Run the real Fabric + Krypton client through compressed FRP
+        env:
+          SMOKE_SECONDS: ${{ inputs.duration_seconds || '120' }}
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/lab_harness.py smoke --config "$MZSTD_SMOKE_CONFIG" \
+            --fabric-jar "$GITHUB_WORKSPACE"/dist/Miku-ZSTD-*-Fabric.jar \
+            --paper-jar "$GITHUB_WORKSPACE"/dist/Miku-ZSTD-*-Paper.jar \
+            --frp-compression true --duration-seconds "$SMOKE_SECONDS" \
+            --candidate-sha "$GITHUB_SHA" --result-dir "$RESULT_DIR" \
+            --event-log "$EVIDENCE_DIR/sanitized/lifecycle.jsonl"
+          python3 scripts/ci/validate_real_client_result.py smoke "$RESULT_DIR/summary.json" \
+            --expected-clients 1 --expected-sha "$GITHUB_SHA" \
+            --min-duration-seconds "$SMOKE_SECONDS" --expected-nonce "$MZSTD_RUN_NONCE" \
+            --expected-fabric-jar "$GITHUB_WORKSPACE"/dist/Miku-ZSTD-*-Fabric.jar \
+            --expected-paper-jar "$GITHUB_WORKSPACE"/dist/Miku-ZSTD-*-Paper.jar \
+            --sanitized-output "$EVIDENCE_DIR/sanitized/summary.json"
+      - if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: real-client-hosted-${{ github.run_id }}
+          path: |
+            ${{ env.EVIDENCE_DIR }}/sanitized/summary.json
+            ${{ env.EVIDENCE_DIR }}/sanitized/runner-preflight.json
+            ${{ env.EVIDENCE_DIR }}/sanitized/lifecycle.jsonl
+          if-no-files-found: warn
+          retention-days: 14
