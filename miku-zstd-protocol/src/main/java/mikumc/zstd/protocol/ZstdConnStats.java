@@ -59,6 +59,45 @@ public final class ZstdConnStats {
         return frames.sum() > 0;
     }
 
+    /** 所有真正走过 zstd 的连接累计原始字节合计（精确值，供机器读取）。 */
+    public static long totalRawBytes() {
+        long total = 0;
+        for (ZstdConnStats stats : ACTIVE) {
+            if (stats.carriesZstd()) total += stats.rawBytes.sum();
+        }
+        return total;
+    }
+
+    /** 所有真正走过 zstd 的连接累计线路字节合计（精确值，供机器读取）。 */
+    public static long totalWireBytes() {
+        long total = 0;
+        for (ZstdConnStats stats : ACTIVE) {
+            if (stats.carriesZstd()) total += stats.wireBytes.sum();
+        }
+        return total;
+    }
+
+    /** 真正走过 zstd 的连接条数（与 top 的筛选口径一致）。 */
+    public static int activeConnections() {
+        int count = 0;
+        for (ZstdConnStats stats : ACTIVE) {
+            if (stats.carriesZstd()) count++;
+        }
+        return count;
+    }
+
+    /**
+     * 一行精确计数：{@code traffic: raw=<long> wire=<long> connections=<int>}。
+     *
+     * <p>为什么还要这一行：面向人的 top 输出按十进制单位格式化（{@code 1.2MB}），
+     * 在 MB 量级上的分辨率是 0.1MB = 100,000 字节，比短窗口 A/B 的真实差值还大。
+     * 机器读取必须走这里的整数累计值。</p>
+     */
+    public static String exactTrafficLine() {
+        return String.format("traffic: raw=%d wire=%d connections=%d",
+                totalRawBytes(), totalWireBytes(), activeConnections());
+    }
+
     /** 按「原始字节」降序取前 n 条摘要，供命令输出。 */
     public static List<String> top(int n) {
         List<ZstdConnStats> list = new ArrayList<>(ACTIVE);

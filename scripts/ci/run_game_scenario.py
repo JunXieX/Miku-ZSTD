@@ -274,6 +274,7 @@ class Scenario:
         self.ports: dict[str, int] = {}
         self.paper_log = LogFile(self.artifacts / "paper.log")
         self.last_active_connections = 0
+        self.traffic_source = "unknown"
 
     # -- process bookkeeping -------------------------------------------------
 
@@ -411,10 +412,27 @@ class Scenario:
         return fields
 
     def traffic_snapshot(self) -> tuple[int, int]:
-        """Read the production plugin's cumulative (raw, wire) totals."""
+        """Read the production plugin's cumulative (raw, wire) totals.
+
+        The exact integer line is preferred: the human-facing formatting has a
+        100 KB step in the MB range, which is coarser than the deltas an A/B run
+        is trying to resolve. Plugins without the exact line fall back to parsing
+        the formatted summary, and the report records which source was used.
+        """
         since = len(self.paper_log.text())
         stream = self.processes["paper"].stdin
         require(stream is not None, "Paper console is not writable")
+        stream.write(b"mikuzstd traffic\n")
+        stream.flush()
+        exact = self.paper_log.wait_for(r"traffic: raw=\d+ wire=\d+ connections=\d+",
+                                        time.monotonic() + 10.0, since=since)
+        if exact is not None:
+            match = re.search(r"traffic: raw=(\d+) wire=(\d+) connections=(\d+)", exact)
+            self.last_active_connections = int(match.group(3))
+            self.traffic_source = "exact"
+            return int(match.group(1)), int(match.group(2))
+        self.traffic_source = "formatted"
+        since = len(self.paper_log.text())
         stream.write(b"mikuzstd top\n")
         stream.flush()
         deadline = time.monotonic() + 30.0
@@ -891,7 +909,8 @@ class Scenario:
                 "interface": os.environ.get("MZSTD_NIC", "lo"),
                 "traffic_source": ("production plugin counters read through /mikuzstd top before "
                                    "and after the window; delta only"),
-                "traffic_granularity_bytes": 50000,
+                "traffic_granularity_bytes": 0 if self.traffic_source == "exact" else 50000,
+                "traffic_counter_source": self.traffic_source,
                 "rtt_source": ("game client sends /mikuzstd ping <token> on its own monotonic clock "
                                "and stops the timer when the pong system chat arrives; this includes "
                                "server command handling, not raw TCP RTT"),
