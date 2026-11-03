@@ -71,6 +71,7 @@ Build 里的 Python 协议客户端只验证 Paper/Velocity 的线协议状态�
 - **NIC**：游戏流量全程走 127.0.0.1（客户端 ↔ frps ↔ frpc ↔ Paper），因此默认统计 `lo`；接入真实网卡时用 `NIC` 指定。
 - **分段耗时（pool_queue_wait / event_loop_wait 等）**：来自插件 `/mikuzstd latency` 的四段直方图——排队（提交→worker 开始）、执行（worker 压缩本身）、回调（worker 结束→event loop 回调执行）、写出（首帧写出→全部真实 write promise 完成）。驱动在测量窗口开始前先 `/mikuzstd latency reset`，所以分位点只覆盖本次窗口；桶宽约为下界的 12.5%，分位点取桶上界（只会偏保守）。
 - **RTT**：游戏客户端自己发 `/mikuzstd ping <token>`，服务端只回一行 `pong <token>`，客户端用自己的单调时钟结算。它包含服务端命令处理时间，**不是** TCP 往返，也不是玩家列表里服务端算出的延迟；样本带 wall 毫秒戳，驱动按测量窗口筛选后用最近秩法取分位。
+- 采样速率受服务端节流约束：每条聊天/命令按 +20 计数、每 tick −1，持续速率超过约 1 条/秒会在十几秒后被 `Kicked for spamming`。因此往返采样固定 0.5 条/秒（60 秒窗口约 30 个样本）。提高速率必须同时改服务端 `commands.spam-exclusions`，否则客户端会被踢，冒烟会如实失败。
 - **CPU / RSS**：Paper 进程 `utime+stime` 窗口差值，与进程 `VmHWM` 峰值；不含客户端与 FRP 的开销。
 - **active_seconds**：观测模组单调时钟累计的 PLAY 时长；期间采样间隔 250 ms。
 - 缺 PLAY、缺 zstd 激活（客户端未打印下行接管日志）、加载的 Miku-ZSTD 摘要与被测成品不一致、窗口内进程退出或掉线，一律判失败，不补零、不缩窗口、不改人数。

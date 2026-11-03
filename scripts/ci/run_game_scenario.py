@@ -458,8 +458,11 @@ class Scenario:
                     "-Dfabric.addMods=" + os.pathsep.join(str(path) for path in mods),
                     "-Dmiku.zstd.ci.evidence=" + str(evidence),
                     "-Dmiku.zstd.ci.interval-ms=250",
+                    # 服务端的聊天/命令节流按"每条约 +20、每 tick −1"计，
+                    # 持续速率超过约 1 条/秒就会在十几秒内被判 Kicked for spamming。
+                    # 0.5 条/秒既留足余量，又能在 60 秒窗口里拿到约 30 个真实往返样本。
                     "-Dmiku.zstd.ci.rtt=true",
-                    "-Dmiku.zstd.ci.rtt-interval-ms=500",
+                    "-Dmiku.zstd.ci.rtt-interval-ms=2000",
                     "-Dfile.encoding=UTF-8"]
         program_args = mc_runtime.build_game_args(runtime, game_dir, username,
                                                  server_address=address, width=1280, height=720)
@@ -616,8 +619,11 @@ class Scenario:
                 process = self.processes["client-%d" % client["index"]]
                 require(process.poll() is None,
                         "client %d exited during the measured interval" % client["index"])
-                require((client["username"] + " lost connection") not in self.paper_log.text(),
-                        "client %d disconnected during the measured interval" % client["index"])
+                lost = re.search(re.escape(client["username"]) + r" lost connection: (.+)",
+                                 self.paper_log.text())
+                if lost is not None:
+                    raise ScenarioError("client %d was disconnected during the measured interval: %s"
+                                        % (client["index"], lost.group(1).strip()))
             time.sleep(1.0)
         elapsed = time.monotonic() - started
         wall_finished_ms = int(time.time() * 1000)
