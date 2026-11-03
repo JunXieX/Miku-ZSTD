@@ -23,7 +23,8 @@ import mikumc.zstd.protocol.ZstdCompressPool;
 public final class ZstdPaperCommand implements BasicCommand {
 
     /** 子命令表：执行分发与 TAB 补全<b>共用</b>同一份，保证两者永不脱节。 */
-    private static final List<String> SUBCOMMANDS = List.of("bar", "status", "top", "ping", "latency");
+    private static final List<String> SUBCOMMANDS =
+            List.of("bar", "status", "top", "ping", "latency", "traffic");
 
     /** ping 回包里的令牌上限与允许字符（只用于标识一次往返，不做任何解释）。 */
     private static final int PING_TOKEN_LIMIT = 32;
@@ -32,6 +33,11 @@ public final class ZstdPaperCommand implements BasicCommand {
     public void execute(CommandSourceStack source, String[] args) {
         CommandSender sender = source.getSender();
 
+        if (args.length > 0 && "traffic".equalsIgnoreCase(args[0])) {
+            // 精确字节计数：给需要机器读取的场景用，不做单位格式化。
+            sender.sendMessage("§7" + mikumc.zstd.protocol.ZstdConnStats.exactTrafficLine());
+            return;
+        }
         if (args.length > 0 && "latency".equalsIgnoreCase(args[0])) {
             // 分位点是累计直方图算出来的：要看"某个测量窗口内"的分布，先 reset 再采样。
             if (args.length > 1 && "reset".equalsIgnoreCase(args[1])) {

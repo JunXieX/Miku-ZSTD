@@ -273,6 +273,8 @@ class Scenario:
         self.state_path = self.artifacts / "state.json"
         self.ports: dict[str, int] = {}
         self.paper_log = LogFile(self.artifacts / "paper.log")
+        self.last_active_connections = 0
+        self.traffic_source = "unknown"
 
     # -- process bookkeeping -------------------------------------------------
 
@@ -410,21 +412,36 @@ class Scenario:
         return fields
 
     def traffic_snapshot(self) -> tuple[int, int]:
-        """Read the production plugin's cumulative (raw, wire) totals."""
+        """Read the production plugin's cumulative (raw, wire) totals.
+
+        The exact integer line is preferred: the human-facing formatting has a
+        100 KB step in the MB range, which is coarser than the deltas an A/B run
+        is trying to resolve. Plugins without the exact line fall back to parsing
+        the formatted summary, and the report records which source was used.
+        """
         since = len(self.paper_log.text())
         stream = self.processes["paper"].stdin
         require(stream is not None, "Paper console is not writable")
+        stream.write(b"mikuzstd traffic\n")
+        stream.flush()
+        exact = self.paper_log.wait_for(r"traffic: raw=\d+ wire=\d+ connections=\d+",
+                                        time.monotonic() + 10.0, since=since)
+        if exact is not None:
+            match = re.search(r"traffic: raw=(\d+) wire=(\d+) connections=(\d+)", exact)
+            self.last_active_connections = int(match.group(3))
+            self.traffic_source = "exact"
+            return int(match.group(1)), int(match.group(2))
+        self.traffic_source = "formatted"
+        since = len(self.paper_log.text())
         stream.write(b"mikuzstd top\n")
         stream.flush()
         deadline = time.monotonic() + 30.0
         summary = self.paper_log.wait_for(r"合计原始 \S+ → \S+ \(", deadline, since=since)
-        if summary is None:
-            self.paper_log.wait_for(r"没有走 zstd 的连接", time.monotonic() + 5.0, since=since)
-            require(summary is not None, "plugin did not report any zstd connection")
-            return 0, 0
-        match = re.search(r"合计原始 (\S+) → (\S+) \(", summary)
+        require(summary is not None, "plugin did not report its traffic summary")
+        match = re.search(r"活跃 (\d+) 条 \| 合计原始 (\S+) → (\S+) \(", summary)
         require(match is not None, "unexpected traffic summary: " + summary)
-        return parse_bytes(match.group(1)), parse_bytes(match.group(2))
+        self.last_active_connections = int(match.group(1))
+        return parse_bytes(match.group(2)), parse_bytes(match.group(3))
 
     # -- FRP -----------------------------------------------------------------
 
@@ -691,9 +708,20 @@ class Scenario:
     def measure(self, clients: list[dict]) -> dict:
         interface = os.environ.get("MZSTD_NIC", "lo")
         paper_pid = self.processes["paper"].pid
+        # 预热期可能发生掉线/重连：进入测量前必须重新确认所有客户端仍在 PLAY，
+        # 否则会拿"没有 zstd 连接"的空快照去算出一组零字节，掩盖真正的原因。
+        for client in clients:
+            state = self.play_state(client)
+            require(state["playing"],
+                    "client %s left PLAY before the measured interval%s"
+                    % (client["index"], self.disconnect_reason(client)))
         # 先清零分段直方图，再开始计时：这样分位点覆盖的就是本次测量窗口。
         self.latency_snapshot(reset=True)
         raw_before, wire_before = self.traffic_snapshot()
+        require(self.last_active_connections >= len(clients),
+                "plugin reports %d zstd connection(s) but %d client(s) were requested%s"
+                % (self.last_active_connections, len(clients),
+                   self.disconnect_reason(clients[0])))
         rx_before, tx_before = read_netdev(interface)
         cpu_before = read_cpu_seconds(paper_pid)
         observer_before = sum(self.play_state(client)["inbound_bytes"] for client in clients)
@@ -751,6 +779,12 @@ class Scenario:
             "capacity": capacity,
             "states": states,
         }
+
+    def disconnect_reason(self, client: dict) -> str:
+        """Best-effort reason string from the server log, for actionable failures."""
+        lost = re.search(re.escape(client["username"]) + r" lost connection: (.+)",
+                         self.paper_log.text())
+        return (" (server said: %s)" % lost.group(1).strip()) if lost else ""
 
     def capacity_block(self, clients: list[dict], cpu_before: dict, rss_peak: dict,
                        elapsed: float, lag_before: int,
@@ -820,7 +854,7 @@ class Scenario:
                 "id": "client-%d" % client["index"],
                 "joined": client["joined_at"] is not None,
                 "play_traffic_received": bool(state["playing"] and state["inbound_messages"] > 0),
-                "disconnected": False,
+                "disconnected": not state["playing"],
                 "active_seconds": round(min(duration, state["play_ms"] / 1000.0), 3),
             })
         boot_mods = {mod["id"]: mod.get("version") for mod in boots[0].get("mods", [])}
@@ -875,7 +909,8 @@ class Scenario:
                 "interface": os.environ.get("MZSTD_NIC", "lo"),
                 "traffic_source": ("production plugin counters read through /mikuzstd top before "
                                    "and after the window; delta only"),
-                "traffic_granularity_bytes": 50000,
+                "traffic_granularity_bytes": 0 if self.traffic_source == "exact" else 50000,
+                "traffic_counter_source": self.traffic_source,
                 "rtt_source": ("game client sends /mikuzstd ping <token> on its own monotonic clock "
                                "and stops the timer when the pong system chat arrives; this includes "
                                "server command handling, not raw TCP RTT"),

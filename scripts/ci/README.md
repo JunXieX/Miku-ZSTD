@@ -67,7 +67,8 @@ Build 里的 Python 协议客户端只验证 Paper/Velocity 的线协议状态�
 
 ## 指标口径与已知限制
 
-- **raw / wire**：取插件 `/mikuzstd top` 在测量窗口前后的累计值差值。该输出是十进制格式化文本（`1.2 MB`），分辨率约 0.05 MB，**不是逐字节精确**；基准档需要阶段采样，见 [DEVELOPMENT.md](../DEVELOPMENT.md) 的优化候选。
+- **raw / wire**：优先取插件 `/mikuzstd traffic` 的整数累计值（`traffic: raw=<long> wire=<long> connections=<int>`）在窗口前后的差值，**逐字节精确**。旧服务端没有该子命令时回退到 `/mikuzstd top` 的格式化输出（`1.2 MB` 精度 100,000 字节），报告会用 `traffic_counter_source` 与 `traffic_granularity_bytes` 说明本次用的是哪种口径——两种口径的数值不能混着比较。
+- 为什么必须精确：实测 1 分钟窗口的 raw 增量约 0.3 MB，而格式化输出在 MB 量级的步长就是 0.1 MB，量化误差比变异本身还大。
 - **observed_client_inbound_bytes**：CI 观测模组在 Netty 入站管线最前端挂了只读计数器，按字节累计服务端→客户端方向，不 retain/release、不改写消息。它与插件计数互为交叉校验，不混入报告的基础指标。
 - **NIC**：游戏流量全程走 127.0.0.1（客户端 ↔ frps ↔ frpc ↔ Paper），因此默认统计 `lo`；接入真实网卡时用 `NIC` 指定。
 - **分段耗时（pool_queue_wait / event_loop_wait 等）**：来自插件 `/mikuzstd latency` 的四段直方图——排队（提交→worker 开始）、执行（worker 压缩本身）、回调（worker 结束→event loop 回调执行）、写出（首帧写出→全部真实 write promise 完成）。驱动在测量窗口开始前先 `/mikuzstd latency reset`，所以分位点只覆盖本次窗口；桶宽约为下界的 12.5%，分位点取桶上界（只会偏保守）。
@@ -103,6 +104,18 @@ Build 里的 Python 协议客户端只验证 Paper/Velocity 的线协议状态�
 **为什么必须看 fps**：加客户端时 CPU 总量会被摊薄，每个客户端自己分到的核越来越少——实测 4 vCPU 托管机上 1 个客户端用 161.7 CPU 秒，5 个客户端合计 216.0 CPU 秒但平摊到每个只有约 40 秒。只看总 CPU 或"进程还活着"会把这判成通过，只有客户端自己的帧率能说明它还剩多少可用性。
 
 判定为 `insufficient` 时报告仍会落盘（状态 `capacity_exceeded`，数字可在 "Report measured metrics" 步骤里看到），但编排器与校验器都会拒收。**不会因为换更少的人或换成协议机器人而放行。**
+
+## 配对 A/B 的现状
+
+`Performance Benchmark` 的 `github-hosted` 模式在**同一台 runner** 上现场构建 baseline 与 candidate 两个提交的成品，按轮交错、随机首轮顺序、每变体预热后测量，再做配对汇总。
+
+它当前的用途是**量噪声**：两侧生产源码相同时，任何差异都只是运行间波动，由此得到后续优化对比的判读门槛。实测（2 轮 × 1 分钟 / 变体）显示：
+
+- `compressed_wire_bytes` 同源变异约 6.7–15.7 KB（约 5–11%）；
+- `rtt_p50` 同源变异 3.4–9.0 ms，`rtt_p99` 可达 11.6 ms；
+- `server_cpu_seconds` 同源变异 0.7–2.4 s。
+
+因此短窗口、少轮次只适合发现**两位数百分比**的差异；尾延迟与 CPU 级的小改动需要 5–7 轮 × 5–10 分钟，且两侧必须使用同一种字节计数口径。托管机只有 1 个可玩客户端（见容量曲线），这里的 A/B 不能替代 10/50 人档的结论。
 
 ## 自托管模式（保留）
 
