@@ -15,7 +15,8 @@ Build 里的 Python 协议客户端只验证 Paper/Velocity 的线协议状态�
 
 ## 托管冒烟怎么跑
 
-1. Actions → Real Client (Hosted) → Run workflow。可选输入：`duration_seconds`（30–600，默认 120）、`compression_threshold`（默认 256）。
+1. Actions → Real Client (Hosted) → Run workflow。可选输入：`duration_seconds`（30–600，默认 120）、`compression_threshold`（默认 256）、`clients`（同一服务器上的真实客户端数，默认 1）。
+   并发组按 `clients` 区分，所以 1/2/5 三次调度可以并行跑在不同 runner 上，互不排队。
 2. 工作流自己完成：构建本提交的 Fabric/Paper 成品 → 拉取固定版本 Krypton（sha512 校验）与 FRP（sha256 校验）→ 准备客户端运行时（首次下载约 600 MB，之后命中 Actions 缓存）→ 跑公共编排器与校验器。
 3. 产物只有三个白名单文件：`sanitized/summary.json`、`sanitized/runner-preflight.json`、`sanitized/lifecycle.jsonl`。其中 summary 额外带一个受限的原始样本块 `samples.rtt_ms`（纯数值、条数与 `rtt_sample_count` 一致、最多 5000 条），用于事后重算分位点。
 
@@ -76,6 +77,17 @@ Build 里的 Python 协议客户端只验证 Paper/Velocity 的线协议状态�
 - **CPU / RSS**：Paper 进程 `utime+stime` 窗口差值，与进程 `VmHWM` 峰值；不含客户端与 FRP 的开销。
 - **active_seconds**：观测模组单调时钟累计的 PLAY 时长；期间采样间隔 250 ms。
 - 缺 PLAY、缺 zstd 激活（客户端未打印下行接管日志）、加载的 Miku-ZSTD 摘要与被测成品不一致、窗口内进程退出或掉线，一律判失败，不补零、不缩窗口、不改人数。
+
+## 容量探针（clients）
+
+`clients` 用于找托管 runner 的真实容量边界，而不是猜：每个客户端都是一整棵进程树（xvfb-run + Xvfb + 游戏 JVM），驱动按进程树统计每个实例的 CPU 秒数与 RSS 峰值，并在报告里给出 `capacity` 段：
+
+- `clients[]`：每实例 `cpu_seconds`、`rss_peak_bytes`；
+- `total_client_cpu_seconds`、`total_client_rss_bytes`、`client_cpu_utilisation`、`paper_rss_bytes`；
+- `server_tick_lag_warnings`：测量窗口内 Paper 的 `Can't keep up` 次数；
+- `verdict`：`sufficient` 或 `insufficient`，后者附 `reasons`。
+
+判定为 `insufficient` 时报告仍会落盘（状态 `capacity_exceeded`，数字可在 "Report measured metrics" 步骤里看到），但编排器与校验器都会拒收。**不会因为换更少的人或换成协议机器人而放行。**
 
 ## 自托管模式（保留）
 

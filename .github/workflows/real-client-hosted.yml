@@ -21,11 +21,16 @@ on:
         required: false
         default: "900"
         type: string
+      clients:
+        description: Number of real clients on one server (capacity probe)
+        required: false
+        default: "1"
+        type: string
 permissions:
   contents: read
   actions: read
 concurrency:
-  group: miku-zstd-real-client-${{ github.ref }}
+  group: miku-zstd-real-client-${{ github.ref }}-${{ inputs.clients || 1 }}
   cancel-in-progress: false
 
 jobs:
@@ -152,16 +157,18 @@ jobs:
       - name: Run the real Fabric + Krypton client through compressed FRP
         env:
           SMOKE_SECONDS: ${{ inputs.duration_seconds || '120' }}
+          SMOKE_CLIENTS: ${{ inputs.clients || '1' }}
         run: |
           set -euo pipefail
           python3 scripts/ci/lab_harness.py smoke --config "$MZSTD_SMOKE_CONFIG" \
+            --clients "$SMOKE_CLIENTS" \
             --fabric-jar "$GITHUB_WORKSPACE"/dist/Miku-ZSTD-*-Fabric.jar \
             --paper-jar "$GITHUB_WORKSPACE"/dist/Miku-ZSTD-*-Paper.jar \
             --frp-compression true --duration-seconds "$SMOKE_SECONDS" \
             --candidate-sha "$GITHUB_SHA" --result-dir "$RESULT_DIR" \
             --event-log "$EVIDENCE_DIR/sanitized/lifecycle.jsonl"
           python3 scripts/ci/validate_real_client_result.py smoke "$RESULT_DIR/summary.json" \
-            --expected-clients 1 --expected-sha "$GITHUB_SHA" \
+            --expected-clients "$SMOKE_CLIENTS" --expected-sha "$GITHUB_SHA" \
             --min-duration-seconds "$SMOKE_SECONDS" --expected-nonce "$MZSTD_RUN_NONCE" \
             --expected-fabric-jar "$GITHUB_WORKSPACE"/dist/Miku-ZSTD-*-Fabric.jar \
             --expected-paper-jar "$GITHUB_WORKSPACE"/dist/Miku-ZSTD-*-Paper.jar \
@@ -177,6 +184,7 @@ jobs:
           import json, sys
           data = json.load(open(sys.argv[1], encoding="utf-8"))
           print(json.dumps({"metrics": data.get("metrics", {}),
+                            "capacity": data.get("capacity", {}),
                             "measurement": data.get("measurement", {})},
                            indent=2, sort_keys=True))
           PY

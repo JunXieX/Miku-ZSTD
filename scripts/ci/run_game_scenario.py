@@ -148,6 +148,70 @@ def read_cpu_seconds(pid: int) -> float:
     return (int(fields[11]) + int(fields[12])) / float(ticks)
 
 
+def status_bytes(pid: int, field: str) -> int:
+    """One Vm* field from /proc/<pid>/status, in bytes."""
+    for line in Path("/proc/%d/status" % pid).read_text(encoding="ascii").splitlines():
+        if line.startswith(field + ":"):
+            return int(line.split()[1]) * 1024
+    return 0
+
+
+def process_tree(root_pid: int) -> list[int]:
+    """root_pid plus every descendant, resolved from /proc.
+
+    A client instance is not one process: xvfb-run spawns Xvfb and the game JVM.
+    Per-instance capacity numbers must therefore cover the whole tree, otherwise
+    the display server's memory is silently left out.
+    """
+    children: dict[int, list[int]] = {}
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            fields = (entry / "stat").read_text(encoding="ascii").rsplit(")", 1)[1].split()
+            parent = int(fields[1])
+        except (OSError, IndexError, ValueError):
+            continue
+        children.setdefault(parent, []).append(int(entry.name))
+    tree = [root_pid]
+    stack = [root_pid]
+    while stack:
+        pid = stack.pop()
+        for child in children.get(pid, ()):
+            tree.append(child)
+            stack.append(child)
+    return tree
+
+
+def tree_cpu_seconds(root_pid: int) -> float:
+    ticks = os.sysconf("SC_CLK_TCK")
+    total = 0.0
+    for pid in process_tree(root_pid):
+        try:
+            fields = Path("/proc/%d/stat" % pid).read_text(encoding="ascii").rsplit(")", 1)[1].split()
+            total += (int(fields[11]) + int(fields[12])) / float(ticks)
+        except (OSError, IndexError, ValueError):
+            continue
+    return total
+
+
+def tree_rss_bytes(root_pid: int) -> int:
+    total = 0
+    for pid in process_tree(root_pid):
+        try:
+            total += status_bytes(pid, "VmRSS")
+        except OSError:
+            continue
+    return total
+
+
+def total_memory_bytes() -> int:
+    for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
+        if line.startswith("MemTotal:"):
+            return int(line.split()[1]) * 1024
+    return 0
+
+
 def read_peak_rss(pid: int) -> int:
     for line in Path("/proc/%d/status" % pid).read_text(encoding="ascii").splitlines():
         if line.startswith("VmHWM:"):
@@ -612,6 +676,10 @@ class Scenario:
         rx_before, tx_before = read_netdev(interface)
         cpu_before = read_cpu_seconds(paper_pid)
         observer_before = sum(self.play_state(client)["inbound_bytes"] for client in clients)
+        client_cpu_before = {client["index"]: tree_cpu_seconds(self.processes["client-%d" % client["index"]].pid)
+                             for client in clients}
+        client_rss_peak = {client["index"]: 0 for client in clients}
+        lag_before = self.paper_log.text().count("Can't keep up")
         wall_started_ms = int(time.time() * 1000)
         started = time.monotonic()
         while time.monotonic() - started < self.duration:
@@ -624,6 +692,9 @@ class Scenario:
                 if lost is not None:
                     raise ScenarioError("client %d was disconnected during the measured interval: %s"
                                         % (client["index"], lost.group(1).strip()))
+                client_rss_peak[client["index"]] = max(
+                    client_rss_peak[client["index"]],
+                    tree_rss_bytes(process.pid))
             time.sleep(1.0)
         elapsed = time.monotonic() - started
         wall_finished_ms = int(time.time() * 1000)
@@ -634,6 +705,8 @@ class Scenario:
         cpu_after = read_cpu_seconds(paper_pid)
         states = [self.play_state(client) for client in clients]
         observer_after = sum(state["inbound_bytes"] for state in states)
+        capacity = self.capacity_block(clients, client_cpu_before, client_rss_peak,
+                                       elapsed, lag_before)
         return {
             "duration_seconds": round(elapsed, 3),
             "raw_bytes": max(0, raw_after - raw_before),
@@ -654,7 +727,50 @@ class Scenario:
             "rtt_p999_ms": round(percentile(round_trips, 0.999), 3),
             "rtt_samples_ms": [round(value, 3) for value in round_trips[:2000]],
             "observed_client_inbound_bytes": max(0, observer_after - observer_before),
+            "capacity": capacity,
             "states": states,
+        }
+
+    def capacity_block(self, clients: list[dict], cpu_before: dict, rss_peak: dict,
+                       elapsed: float, lag_before: int) -> dict:
+        """Per-instance resource use on this runner, plus an explicit verdict.
+
+        The point of T6 is to find the real capacity boundary instead of guessing:
+        each client is a full game JVM (plus its Xvfb), so the numbers include the
+        whole process tree. A run that cannot hold the requested instances must say
+        so — silently passing a starved run would be worse than failing.
+        """
+        rows = []
+        for client in clients:
+            index = client["index"]
+            after = tree_cpu_seconds(self.processes["client-%d" % index].pid)
+            rows.append({
+                "id": "client-%d" % index,
+                "cpu_seconds": round(max(0.0, after - cpu_before[index]), 3),
+                "rss_peak_bytes": rss_peak[index],
+            })
+        cores = os.cpu_count() or 1
+        total_cpu = sum(row["cpu_seconds"] for row in rows)
+        total_rss = sum(row["rss_peak_bytes"] for row in rows)
+        utilisation = total_cpu / (elapsed * cores) if elapsed > 0 else 0.0
+        lag_events = self.paper_log.text().count("Can't keep up") - lag_before
+        reasons = []
+        if lag_events > 0:
+            reasons.append("server logged %d tick-lag warnings during the window" % lag_events)
+        if utilisation > 0.9:
+            reasons.append("client JVMs consumed %.0f%% of the %d available cores"
+                           % (utilisation * 100, cores))
+        return {
+            "runner_cpu_count": cores,
+            "runner_memory_bytes": total_memory_bytes(),
+            "clients": rows,
+            "total_client_cpu_seconds": round(total_cpu, 3),
+            "total_client_rss_bytes": total_rss,
+            "client_cpu_utilisation": round(utilisation, 3),
+            "paper_rss_bytes": read_peak_rss(self.processes["paper"].pid),
+            "server_tick_lag_warnings": lag_events,
+            "verdict": "insufficient" if reasons else "sufficient",
+            "reasons": reasons,
         }
 
     # -- report --------------------------------------------------------------
@@ -709,8 +825,9 @@ class Scenario:
                     "entry_port": self.ports["frp_remote"],
                     "entry": "127.0.0.1:%d" % self.ports["frp_remote"]},
             "metrics": {key: value for key, value in measurement.items()
-                        if key not in ("states", "rtt_samples_ms")},
+                        if key not in ("states", "rtt_samples_ms", "capacity")},
             "samples": {"rtt_ms": measurement.get("rtt_samples_ms", [])},
+            "capacity": measurement.get("capacity", {}),
             "measurement": {
                 "minecraft_version": DEFAULT_VERSION,
                 "loader_version": DEFAULT_LOADER,
@@ -783,6 +900,15 @@ class Scenario:
             boots = [self.boot_record(client) for client in clients]
             measurement = self.measure(clients)
             report = self.build_report(clients, measurement, boots)
+            capacity = report.get("capacity", {})
+            if capacity.get("verdict") != "sufficient":
+                # 容量不足时仍然落盘，这样数字（每实例 CPU/RSS）能被诊断步骤读到；
+                # 但状态不是 passed，编排器与校验器都会拒收，不会冒充通过。
+                report["status"] = "capacity_exceeded"
+                self.write_report(report)
+                raise ScenarioError(
+                    "runner cannot hold %d real client(s): %s"
+                    % (len(clients), "; ".join(capacity.get("reasons", [])) or "unknown"))
             self.write_report(report)
             print(json.dumps({"status": "report_written",
                               "duration_seconds": report["metrics"]["duration_seconds"],
