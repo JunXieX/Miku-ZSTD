@@ -166,6 +166,21 @@ jobs:
             --expected-fabric-jar "$GITHUB_WORKSPACE"/dist/Miku-ZSTD-*-Fabric.jar \
             --expected-paper-jar "$GITHUB_WORKSPACE"/dist/Miku-ZSTD-*-Paper.jar \
             --sanitized-output "$EVIDENCE_DIR/sanitized/summary.json"
+      - name: Report measured metrics
+        if: always()
+        run: |
+          set -uo pipefail
+          shopt -s nullglob
+          # 只打印数值与口径说明，便于在 step 日志里核对分位点；不打印路径与客户端日志。
+          for report in "$RUNNER_TEMP"/mzstd-lab/work/.mzstd-private-*/*/report.json; do
+            python3 - "$report" <<'PY'
+          import json, sys
+          data = json.load(open(sys.argv[1], encoding="utf-8"))
+          print(json.dumps({"metrics": data.get("metrics", {}),
+                            "measurement": data.get("measurement", {})},
+                           indent=2, sort_keys=True))
+          PY
+          done
       - name: Show scenario diagnostics
         if: failure()
         run: |
