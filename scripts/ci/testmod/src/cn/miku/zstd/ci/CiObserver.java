@@ -72,6 +72,7 @@ public final class CiObserver implements ClientModInitializer {
     /** 往返采样：token → 发出时刻（nanoTime）。 */
     private final Map<String, Long> pendingPings = new ConcurrentHashMap<>();
     private final AtomicLong pingSeq = new AtomicLong();
+    private final AtomicLong pingsSent = new AtomicLong();
     private boolean rttEnabled;
     private long rttIntervalNanos = 500_000_000L;
     private long lastPingNanos;
@@ -249,6 +250,7 @@ public final class CiObserver implements ClientModInitializer {
         lastPingNanos = now;
         String token = "p" + Long.toHexString(pingSeq.incrementAndGet());
         pendingPings.put(token, now);
+        pingsSent.incrementAndGet();
         if (pendingPings.size() > 64) {
             pendingPings.clear(); // 回包丢失时不无限增长；只影响这一小段样本
         }
@@ -290,6 +292,8 @@ public final class CiObserver implements ClientModInitializer {
         json.append(",\"inbound_bytes\":").append(inboundBytes.sum());
         json.append(",\"inbound_messages\":").append(inboundMessages.sum());
         json.append(",\"play_ms\":").append(playNanos / 1_000_000L);
+        json.append(",\"pings_sent\":").append(pingsSent.get());
+        json.append(",\"pings_unmatched\":").append(pendingPings.size());
         json.append('}');
         write(json.toString());
         BufferedWriter stream = writer;
