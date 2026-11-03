@@ -63,7 +63,7 @@ public class ZstdVelocityConfig {
         this.windowLog = clamp(getInt(c, "window_log", 20), 10, 27);
         this.compressThreads = clamp(getInt(c, "threads", 0), 0, 256);
         this.batchWindowMs = clamp(getInt(c, "batch_window_ms", 50), 0, 1000);
-        this.batchMaxPackets = clamp(getInt(c, "batch_max_packets", 64), 1, 4096);
+        this.batchMaxPackets = clamp(getInt(c, "batch_max_packets", 256), 1, 4096);
 
         Map<String, Object> l = getMap(map, "logging");
         this.debug = getBool(l, "debug", false);
@@ -164,7 +164,7 @@ public class ZstdVelocityConfig {
                       batch_window_ms: 50
 
                       # 每批最多合并的包数，范围 1-4096；不是传输帧内的包数上限。
-                      batch_max_packets: 64
+                      batch_max_packets: 256
 
                     bossbar:
                       # ── BossBar 实时监控文本（/mikuzstd bar 开关）──

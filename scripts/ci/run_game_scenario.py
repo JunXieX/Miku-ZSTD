@@ -892,23 +892,59 @@ class Scenario:
             "states": states,
         }
 
+    def write_console(self, command: str) -> None:
+        """Fire-and-forget console write, for loads that must not self-throttle."""
+        stream = self.processes["paper"].stdin
+        require(stream is not None, "Paper console is not writable")
+        with self.console_lock:
+            stream.write((command + "\n").encode("utf-8"))
+            stream.flush()
+
     def start_load(self, clients: list[dict]) -> None:
         """Drive a deterministic amount of traffic for the measured interval.
 
         A frozen world with a motionless client has almost nothing to compress, so
-        the byte metrics stop carrying a signal. The 'drive' profile teleports the
-        client a fixed distance along one axis on a fixed cadence: chunk streaming
-        then happens continuously and reproducibly instead of depending on when the
-        join burst happened to overlap the window.
+        byte metrics lose their signal. Two profiles exist:
+
+        - 'drive' teleports the client a fixed distance along one axis on a fixed
+          cadence, so chunk streaming happens continuously instead of depending on
+          when the join burst happened to overlap the window.
+        - 'chatty' pushes many small server->client chat packets at a fixed rate.
+          Chunk data compresses ~80:1, which hides level/window differences; small
+          packets are where batching and level actually show up.
         """
-        # 默认 idle：冒烟只做登录/管线验证，不需要额外负载；基准档显式传 drive。
+        # 默认 idle：冒烟只做登录/管线验证，不需要额外负载；基准档显式传档位。
         self.load_profile = (os.environ.get("MZSTD_LOAD_PROFILE") or "idle").strip().lower()
         if self.load_profile == "idle":
             print("[lab] load profile: idle", flush=True)
             return
+        self.load_stop = threading.Event()
+
+        if self.load_profile == "chatty":
+            interval = max(5, env_int("LOAD_CHAT_MS", 50)) / 1000.0
+
+            def chat_loop() -> None:
+                seq = 0
+                while not self.load_stop.wait(interval):
+                    for client in clients:
+                        if self.load_stop.is_set():
+                            return
+                        seq += 1
+                        try:
+                            # 不等待回显：20 条/秒逐条等确认会把节奏限制在日志轮询上。
+                            self.write_console('tellraw %s {"text":"mz %d"}'
+                                               % (client["username"], seq))
+                        except (ScenarioError, OSError) as failure:
+                            self.load_error = failure
+                            return
+
+            self.load_thread = threading.Thread(target=chat_loop, name="mikuzstd-load", daemon=True)
+            self.load_thread.start()
+            print("[lab] load profile: chatty 1 packet / %d ms" % int(interval * 1000), flush=True)
+            return
+
         interval = max(200, env_int("LOAD_STEP_MS", 1000)) / 1000.0
         blocks = max(1, env_int("LOAD_STEP_BLOCKS", 16))
-        self.load_stop = threading.Event()
 
         def loop() -> None:
             while not self.load_stop.wait(interval):
