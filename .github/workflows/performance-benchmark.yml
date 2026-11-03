@@ -1,0 +1,153 @@
+name: Performance Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      baseline_build_run_id:
+        description: Successful Build run for the baseline commit
+        required: true
+        type: string
+      candidate_build_run_id:
+        description: Successful Build run for this exact workflow commit
+        required: true
+        type: string
+      client_count:
+        description: Actual Fabric + Krypton clients
+        required: true
+        default: "10"
+        type: choice
+        options: ["10", "50"]
+      duration_minutes:
+        description: Measured interval per variant per round after warm-up
+        required: true
+        default: "5"
+        type: choice
+        options: ["5", "10"]
+      rounds:
+        description: Interleaved paired rounds
+        required: true
+        default: "5"
+        type: choice
+        options: ["5", "7"]
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: miku-zstd-performance
+  cancel-in-progress: false
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      run_allowed: ${{ steps.check.outputs.run_allowed }}
+      baseline_sha: ${{ steps.check.outputs.baseline_sha }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASELINE_RUN_ID: ${{ inputs.baseline_build_run_id }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_build_run_id }}
+          EXPECTED_CANDIDATE_SHA: ${{ github.sha }}
+          RUNNER_READY: ${{ vars.MZSTD_PERFORMANCE_RUNNER_READY }}
+          LAB_HARNESS: ${{ vars.MZSTD_LAB_HARNESS }}
+          BENCH_CONFIG: ${{ vars.MZSTD_BENCH_CONFIG }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]] || [[ "$RUNNER_READY" != "true" ]] || [[ -z "$LAB_HARNESS" ]] || [[ -z "$BENCH_CONFIG" ]]; then
+            echo "run_allowed=false" >> "$GITHUB_OUTPUT"
+            echo "baseline_sha=unavailable" >> "$GITHUB_OUTPUT"
+            echo "::notice::Benchmark requires trusted main and an enabled fixed lab; skipped, not passed."
+            exit 0
+          fi
+          baseline=$(gh run view "$BASELINE_RUN_ID" --repo "$GITHUB_REPOSITORY" --json workflowName,headBranch,headSha,status,conclusion)
+          candidate=$(gh run view "$CANDIDATE_RUN_ID" --repo "$GITHUB_REPOSITORY" --json workflowName,headBranch,headSha,status,conclusion)
+          python3 -c 'import json,os,sys; b,c=map(json.loads,sys.argv[1:]); good=lambda r:r["workflowName"]=="Build" and r["headBranch"]=="main" and r["status"]=="completed" and r["conclusion"]=="success"; assert good(b) and good(c), (b,c); assert c["headSha"]==os.environ["EXPECTED_CANDIDATE_SHA"], c; assert b["headSha"] != c["headSha"], "baseline and candidate SHA must differ"; print(b["headSha"])' "$baseline" "$candidate" > baseline.sha
+          echo "baseline_sha=$(cat baseline.sha)" >> "$GITHUB_OUTPUT"
+          echo "run_allowed=true" >> "$GITHUB_OUTPUT"
+      - if: steps.check.outputs.run_allowed != 'true'
+        run: echo 'Performance run skipped; fixed runner not configured, no measurement produced.' >> "$GITHUB_STEP_SUMMARY"
+  benchmark:
+    needs: preflight
+    if: needs.preflight.outputs.run_allowed == 'true'
+    runs-on: [self-hosted, linux, x64, miku-zstd-performance]
+    timeout-minutes: 180
+    env:
+      HARNESS: ${{ vars.MZSTD_LAB_HARNESS }}
+      CONFIG: ${{ vars.MZSTD_BENCH_CONFIG }}
+      CLIENTS: ${{ inputs.client_count }}
+      DURATION: ${{ inputs.duration_minutes }}
+      ROUNDS: ${{ inputs.rounds }}
+      BASELINE_SHA: ${{ needs.preflight.outputs.baseline_sha }}
+      CANDIDATE_SHA: ${{ github.sha }}
+      BASELINE_RUN_ID: ${{ inputs.baseline_build_run_id }}
+      CANDIDATE_RUN_ID: ${{ inputs.candidate_build_run_id }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: Miku-ZSTD-Fabric
+          run-id: ${{ inputs.baseline_build_run_id }}
+          github-token: ${{ github.token }}
+          path: dist/baseline
+      - uses: actions/download-artifact@v4
+        with:
+          name: Miku-ZSTD-Paper
+          run-id: ${{ inputs.baseline_build_run_id }}
+          github-token: ${{ github.token }}
+          path: dist/baseline
+      - uses: actions/download-artifact@v4
+        with:
+          name: Miku-ZSTD-Fabric
+          run-id: ${{ inputs.candidate_build_run_id }}
+          github-token: ${{ github.token }}
+          path: dist/candidate
+      - uses: actions/download-artifact@v4
+        with:
+          name: Miku-ZSTD-Paper
+          run-id: ${{ inputs.candidate_build_run_id }}
+          github-token: ${{ github.token }}
+          path: dist/candidate
+      - name: Check runner and artifacts
+        run: |
+          set -euo pipefail
+          test -x "$HARNESS"
+          test -r "$CONFIG"
+          test -s dist/baseline/Miku-ZSTD-*-Fabric.jar
+          test -s dist/baseline/Miku-ZSTD-*-Paper.jar
+          test -s dist/candidate/Miku-ZSTD-*-Fabric.jar
+          test -s dist/candidate/Miku-ZSTD-*-Paper.jar
+      - name: Run randomized interleaved real-client A/B
+        run: |
+          set -euo pipefail
+          result="$RUNNER_TEMP/miku-zstd-performance"
+          mkdir -p "$result"
+          "$HARNESS" benchmark-pair --config "$CONFIG" \
+            --baseline-fabric-jar "$GITHUB_WORKSPACE"/dist/baseline/Miku-ZSTD-*-Fabric.jar \
+            --baseline-paper-jar "$GITHUB_WORKSPACE"/dist/baseline/Miku-ZSTD-*-Paper.jar \
+            --baseline-sha "$BASELINE_SHA" \
+            --candidate-fabric-jar "$GITHUB_WORKSPACE"/dist/candidate/Miku-ZSTD-*-Fabric.jar \
+            --candidate-paper-jar "$GITHUB_WORKSPACE"/dist/candidate/Miku-ZSTD-*-Paper.jar \
+            --candidate-sha "$CANDIDATE_SHA" --frp-compression true --clients "$CLIENTS" \
+            --duration-minutes "$DURATION" --rounds "$ROUNDS" --warmup-minutes 2 \
+            --randomize-order --result-dir "$result"
+          python3 scripts/ci/validate_real_client_result.py benchmark-pair "$result/summary.json" \
+            --expected-clients "$CLIENTS" --expected-sha "$CANDIDATE_SHA" \
+            --expected-baseline-sha "$BASELINE_SHA" \
+            --min-duration-seconds "$((DURATION * ROUNDS * 120))" --required-rounds "$ROUNDS"
+      - if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: performance-paired-${{ inputs.client_count }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/miku-zstd-performance
+          if-no-files-found: warn
+          retention-days: 30
+
+# Fixed dedicated Linux x64 runner only. Record CPU/quota, kernel, RAM and NIC;
+# never share with PR builds. The installed trusted HARNESS must launch actual
+# Minecraft Fabric+Krypton clients, deterministic play workload, Paper+FRP and
+# collect client RTT/raw-wire-NIC/CPU/RSS/direct/native/pool metrics. Interleave
+# >=5 paired rounds on identical topology. No protocol socket client is accepted.
+# Set repo vars MZSTD_PERFORMANCE_RUNNER_READY, MZSTD_LAB_HARNESS and
+# MZSTD_BENCH_CONFIG after provisioning. Keep game sessions and endpoints local.
