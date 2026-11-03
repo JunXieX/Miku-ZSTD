@@ -256,8 +256,11 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
         }
         final Result ready = result;
         final Throwable cause = failure;
+        // worker 完成时刻与回调真正开始执行时刻之间，可能还排着别的 event loop 任务；
+        // 这段等待属于"回调延迟"，既不是压缩耗时，也不是网络延迟。
+        final long finishedNanos = System.nanoTime();
         try {
-            ctx.executor().execute(() -> finishBatch(ctx, batch, ready, cause));
+            ctx.executor().execute(() -> finishBatch(ctx, batch, ready, cause, finishedNanos));
         } catch (Throwable rejected) {
             releaseResult(ready);
             synchronized (stateLock) {
@@ -312,7 +315,9 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
         } while (true);
     }
 
-    private void finishBatch(ChannelHandlerContext ctx, Batch batch, Result result, Throwable failure) {
+    private void finishBatch(ChannelHandlerContext ctx, Batch batch, Result result, Throwable failure,
+                             long finishedNanos) {
+        ZstdLatencyStats.record(ZstdLatencyStats.Stage.EVENT_LOOP, System.nanoTime() - finishedNanos);
         synchronized (stateLock) {
             try {
                 if (removed || failed || !ctx.channel().isActive()) {
@@ -342,8 +347,11 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
     private void writeFrames(ChannelHandlerContext ctx, Batch batch, Result result) {
         ChannelHandlerContext target = downstream(ctx);
         if (target == null) throw new IllegalStateException("original compression context disappeared");
+        long writeStartedNanos = System.nanoTime();
         ChannelPromise completed = ctx.newPromise();
         completed.addListener(future -> {
+            // 这一时刻只说明 Netty 的写 promise 完成，不证明对端已经收到或确认。
+            ZstdLatencyStats.record(ZstdLatencyStats.Stage.WRITE, System.nanoTime() - writeStartedNanos);
             if (future.isSuccess()) {
                 for (ChannelPromise promise : batch.promises()) promise.trySuccess();
             } else {

@@ -315,6 +315,26 @@ class Scenario:
         stream.flush()
         return self.paper_log.wait_for(pattern, time.monotonic() + timeout, since=since)
 
+    def latency_snapshot(self, reset: bool = False) -> dict:
+        """Read the plugin's per-stage latency histograms (percentiles over the window).
+
+        The histograms are cumulative, so the driver clears them once before the
+        measured interval: otherwise the report would silently mix startup traffic
+        with the steady-state window.
+        """
+        since = len(self.paper_log.text())
+        stream = self.processes["paper"].stdin
+        require(stream is not None, "Paper console is not writable")
+        command = "mikuzstd latency reset" if reset else "mikuzstd latency"
+        stream.write((command + "\n").encode("utf-8"))
+        stream.flush()
+        line = self.paper_log.wait_for(r"lat: queue_p50=", time.monotonic() + 30.0, since=since)
+        require(line is not None, "plugin did not report latency histograms")
+        fields = {}
+        for key, value in re.findall(r"([a-z0-9_]+)=([0-9.]+)", line):
+            fields[key] = float(value)
+        return fields
+
     def traffic_snapshot(self) -> tuple[int, int]:
         """Read the production plugin's cumulative (raw, wire) totals."""
         since = len(self.paper_log.text())
@@ -543,6 +563,8 @@ class Scenario:
     def measure(self, clients: list[dict]) -> dict:
         interface = os.environ.get("MZSTD_NIC", "lo")
         paper_pid = self.processes["paper"].pid
+        # 先清零分段直方图，再开始计时：这样分位点覆盖的就是本次测量窗口。
+        self.latency_snapshot(reset=True)
         raw_before, wire_before = self.traffic_snapshot()
         rx_before, tx_before = read_netdev(interface)
         cpu_before = read_cpu_seconds(paper_pid)
@@ -557,6 +579,7 @@ class Scenario:
                         "client %d disconnected during the measured interval" % client["index"])
             time.sleep(1.0)
         elapsed = time.monotonic() - started
+        latency = self.latency_snapshot()
         raw_after, wire_after = self.traffic_snapshot()
         rx_after, tx_after = read_netdev(interface)
         cpu_after = read_cpu_seconds(paper_pid)
@@ -570,6 +593,11 @@ class Scenario:
             "nic_tx_bytes": max(0, tx_after - tx_before),
             "server_cpu_seconds": round(max(0.0, cpu_after - cpu_before), 3),
             "server_rss_bytes": read_peak_rss(paper_pid),
+            "pool_queue_wait_p99_ms": round(latency.get("queue_p99", 0.0), 3),
+            "pool_service_p99_ms": round(latency.get("service_p99", 0.0), 3),
+            "event_loop_wait_p99_ms": round(latency.get("eventloop_p99", 0.0), 3),
+            "write_p99_ms": round(latency.get("write_p99", 0.0), 3),
+            "latency_sample_count": int(latency.get("samples", 0.0)),
             "observed_client_inbound_bytes": max(0, observer_after - observer_before),
             "states": states,
         }
@@ -639,6 +667,14 @@ class Scenario:
                 "traffic_source": ("production plugin counters read through /mikuzstd top before "
                                    "and after the window; delta only"),
                 "traffic_granularity_bytes": 50000,
+                "latency_scope": ("plugin histograms cleared once before the measured interval, "
+                                  "so percentiles describe this window only"),
+                "latency_stage_semantics": {
+                    "queue": "batch submitted -> worker thread started",
+                    "service": "worker compression itself",
+                    "eventloop": "worker finished -> event-loop callback ran",
+                    "write": "first frame write -> all real write promises resolved",
+                },
                 "rss_statistic": "peak VmHWM of the Paper JVM process",
                 "client_inbound_bytes_source": ("CI observation mod Netty inbound counter; "
                                                 "reported separately from plugin counters"),

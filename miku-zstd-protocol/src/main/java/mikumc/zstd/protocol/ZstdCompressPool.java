@@ -85,13 +85,19 @@ public final class ZstdCompressPool {
         }
         // ACTIVE 只统计"正在执行"，排队中的任务不计入 —— 否则 summary() 的"活跃"会把
         // 队列长度也算进去，与"CPU 是否打满"的判读混淆。
+        //
+        // QUEUE 段必须在这里取时间戳：提交点的单调时钟与 worker 里读到的时间差，
+        // 才是"任务在队列里等了多久"。放在池外面取会漏掉 Executor 内部排队时间。
+        long submittedNanos = System.nanoTime();
         p.execute(() -> {
+            long startedNanos = System.nanoTime();
+            ZstdLatencyStats.record(ZstdLatencyStats.Stage.QUEUE, startedNanos - submittedNanos);
             ACTIVE.incrementAndGet();
-            long t0 = System.nanoTime();
             try {
                 task.run();
             } finally {
-                long dt = System.nanoTime() - t0;
+                long dt = System.nanoTime() - startedNanos;
+                ZstdLatencyStats.record(ZstdLatencyStats.Stage.SERVICE, dt);
                 TOTAL_NANOS.add(dt);
                 TOTAL_TASKS.increment();
                 MAX_NANOS.accumulateAndGet(dt, Math::max);
@@ -153,6 +159,16 @@ public final class ZstdCompressPool {
                 threads, ACTIVE.get(), queueDepth(), total,
                 avgNs / 1_000_000.0, MAX_NANOS.get() / 1_000_000.0,
                 slowThresholdMs, SLOW_TASKS.get());
+    }
+
+    /**
+     * 一行机器可读的分段耗时摘要（排队/执行/回调/写出四个阶段的分位点）。
+     *
+     * <p>命令层直接输出该行；它只描述<b>压缩链路内部</b>的耗时，不含 TCP 往返，
+     * 因此不能当作玩家感受到的端到端延迟。</p>
+     */
+    public static String latencyLine() {
+        return ZstdLatencyStats.machineLine();
     }
 
     /** 队列积压是否值得提醒（命令层可据此给出调整建议）。 */

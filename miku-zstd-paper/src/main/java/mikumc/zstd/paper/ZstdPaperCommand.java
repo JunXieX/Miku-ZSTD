@@ -23,12 +23,31 @@ import mikumc.zstd.protocol.ZstdCompressPool;
 public final class ZstdPaperCommand implements BasicCommand {
 
     /** 子命令表：执行分发与 TAB 补全<b>共用</b>同一份，保证两者永不脱节。 */
-    private static final List<String> SUBCOMMANDS = List.of("bar", "status", "top");
+    private static final List<String> SUBCOMMANDS = List.of("bar", "status", "top", "ping", "latency");
+
+    /** ping 回包里的令牌上限与允许字符（只用于标识一次往返，不做任何解释）。 */
+    private static final int PING_TOKEN_LIMIT = 32;
 
     @Override
     public void execute(CommandSourceStack source, String[] args) {
         CommandSender sender = source.getSender();
 
+        if (args.length > 0 && "latency".equalsIgnoreCase(args[0])) {
+            // 分位点是累计直方图算出来的：要看"某个测量窗口内"的分布，先 reset 再采样。
+            if (args.length > 1 && "reset".equalsIgnoreCase(args[1])) {
+                mikumc.zstd.protocol.ZstdLatencyStats.reset();
+                sender.sendMessage("§b[Miku-ZSTD]§r 分段耗时样本已清零");
+            }
+            sender.sendMessage("§7" + ZstdCompressPool.latencyLine());
+            return;
+        }
+        if (args.length > 0 && "ping".equalsIgnoreCase(args[0])) {
+            // 只回一行"pong <令牌>"：让调用方用客户端自己的单调时钟量出真实往返，
+            // 而不是拿服务端处理耗时或玩家列表里的 ping 冒充。
+            String token = args.length > 1 ? sanitizeToken(args[1]) : "-";
+            sender.sendMessage("§b[Miku-ZSTD]§r pong " + token);
+            return;
+        }
         if (args.length > 0 && "top".equalsIgnoreCase(args[0])) {
             sender.sendMessage("§6═══ 各连接下行压缩统计 ═══");
             sender.sendMessage("§7  " + mikumc.zstd.protocol.ZstdConnStats.totalSummary());
@@ -75,6 +94,7 @@ public final class ZstdPaperCommand implements BasicCommand {
 
         sender.sendMessage("§7  在线玩家：" + org.bukkit.Bukkit.getOnlinePlayers().size());
         sender.sendMessage("§7  线程池：" + ZstdCompressPool.summary());
+        sender.sendMessage("§7  分段耗时：" + ZstdCompressPool.latencyLine());
         if (ZstdCompressPool.backlogged()) {
             sender.sendMessage("§c  队列积压：压缩跟不上流量，请优先降低压缩等级，其次增加线程数");
         }
@@ -82,6 +102,19 @@ public final class ZstdPaperCommand implements BasicCommand {
         sender.sendMessage("§e── 跨帧历史 ──");
         sender.sendMessage("§7  连续流历史：§a自动§7（同一连接持续压缩，批次随 flush 输出）"
                 + " §8无需字典配置或下发");
+    }
+
+    /** 把令牌限制成短小的标识符：它只用于匹配一次往返，不需要也没有理由接受任意文本。 */
+    private static String sanitizeToken(String raw) {
+        StringBuilder out = new StringBuilder(Math.min(raw.length(), PING_TOKEN_LIMIT));
+        for (int index = 0; index < raw.length() && out.length() < PING_TOKEN_LIMIT; index++) {
+            char c = raw.charAt(index);
+            if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                    || c == '_' || c == '-') {
+                out.append(c);
+            }
+        }
+        return out.length() == 0 ? "-" : out.toString();
     }
 
     /**
