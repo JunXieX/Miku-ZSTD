@@ -32,6 +32,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -168,8 +169,37 @@ def _asset_objects(version: dict, assets_dir: Path) -> tuple[str, dict]:
     return index["id"], json.loads(index_path.read_text(encoding="utf-8")).get("objects", {})
 
 
+def loader_libraries(loader_jar: Path, cache_dir: Path, groups: tuple[str, ...] = ("common",),
+                     log=None) -> list[Path]:
+    """Resolve the loader's own libraries exactly as the Fabric installer would.
+
+    Fabric Loader ships a fabric-installer.json describing the jars a launcher must
+    put on the classpath (ASM, sponge-mixin, ...). Without them Loader aborts with
+    "ASM not detected on the classpath", so this list is part of the launch
+    contract, not an optional extra.
+    """
+    log = log or (lambda message: print(message, flush=True))
+    loader_jar = Path(loader_jar)
+    with zipfile.ZipFile(loader_jar) as archive:
+        descriptor = json.loads(archive.read("fabric-installer.json").decode("utf-8"))
+    resolved = []
+    for group in groups:
+        for entry in descriptor.get("libraries", {}).get(group, []):
+            coordinate = entry["name"]
+            repository = (entry.get("url") or "https://maven.fabricmc.net/").rstrip("/")
+            group_id, artifact_id, version = coordinate.split(":")
+            relative = "%s/%s/%s/%s-%s.jar" % (group_id.replace(".", "/"), artifact_id,
+                                               version, artifact_id, version)
+            target = cache_dir / "libraries" / relative
+            download(repository + "/" + relative, target)
+            resolved.append(target)
+    log("[mc] %d loader libraries for %s" % (len(resolved), ",".join(groups)))
+    return resolved
+
+
 def prepare(version_id: str, cache_dir: Path, extra_classpath: list[Path] | None = None,
-            features: dict | None = None, workers: int = 16, log=None) -> dict:
+            features: dict | None = None, workers: int = 16, log=None,
+            loader_jar: Path | None = None) -> dict:
     """Download everything required to launch the client and return a launch plan."""
     log = log or (lambda message: print(message, flush=True))
     cache_dir = Path(cache_dir)
@@ -229,6 +259,9 @@ def prepare(version_id: str, cache_dir: Path, extra_classpath: list[Path] | None
         (natives_dir / sub).mkdir(parents=True, exist_ok=True)
 
     classpath = [client_path, *library_paths]
+    if loader_jar is not None:
+        classpath.append(Path(loader_jar))
+        classpath.extend(loader_libraries(Path(loader_jar), cache_dir, log=log))
     classpath.extend(Path(extra) for extra in (extra_classpath or []))
     return {
         "version_id": version_id,

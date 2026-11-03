@@ -74,7 +74,12 @@ public final class CiObserver implements ClientModInitializer {
             System.err.println("[miku-zstd-ci] cannot open evidence file: " + failure);
             return;
         }
-        write(describeEnvironment());
+        try {
+            write(describeEnvironment());
+        } catch (Throwable unavailable) {
+            // 观测失败绝不能拖垮被测客户端: 记录一行最小信息后继续。
+            write("{\"type\":\"boot_error\",\"error\":\"" + escape(String.valueOf(unavailable)) + "\"}");
+        }
         Runtime.getRuntime().addShutdownHook(new Thread(this::writeFinal, "miku-zstd-ci-final"));
         Thread sampler = new Thread(this::sampleLoop, "miku-zstd-ci-sampler");
         sampler.setDaemon(true);

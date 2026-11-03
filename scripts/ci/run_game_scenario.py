@@ -382,7 +382,7 @@ class Scenario:
                                              headers={"User-Agent": mc_runtime.USER_AGENT})
             expected = urllib.request.urlopen(request, timeout=60).read().decode("ascii").split()[0]
             mc_runtime.download(url, loader, expected)
-        runtime = mc_runtime.prepare(DEFAULT_VERSION, cache, extra_classpath=[loader],
+        runtime = mc_runtime.prepare(DEFAULT_VERSION, cache, loader_jar=loader,
                                      log=lambda message: print(message, flush=True))
         (self.artifacts / "runtime.json").write_text(json.dumps(runtime, indent=2), encoding="utf-8")
         return runtime
