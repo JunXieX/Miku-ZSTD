@@ -112,7 +112,7 @@ Build 里的 Python 协议客户端只验证 Paper/Velocity 的线协议状态�
 | 项 | 做法 |
 |---|---|
 | 世界演进 | `difficulty peaceful`、`time set 6000`、`weather clear` |
-| 区块 | `forceload add -64 -64 64 64`（该命令单次上限 256 区块）预先装载可见半径，避免测量期间边生成边发送 |
+| 区块 | `forceload add -64 -64 64 64`（单次上限 256 区块；成功回显是 `Marked N chunks ... to be force loaded`）预先装载可见半径，避免测量期间边生成边发送 |
 | 实体 | `kill @e[type=!player]`，清掉世界里已有的实体 |
 | 玩家姿态 | 加入后 `execute at <玩家> run tp <玩家> ~ ~ ~ 90 0`，把位置留在确定性出生点、朝向钉死 |
 
