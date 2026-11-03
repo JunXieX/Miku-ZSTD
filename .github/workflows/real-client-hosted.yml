@@ -21,14 +21,6 @@ on:
         required: false
         default: "900"
         type: string
-  push:
-    branches: ["ci/hosted-real-client"]
-    paths:
-      - ".github/workflows/real-client-hosted.yml"
-      - "scripts/ci/**"
-      - "miku-zstd-fabric/**"
-      - "miku-zstd-paper/**"
-      - "miku-zstd-protocol/**"
 permissions:
   contents: read
   actions: read

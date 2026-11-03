@@ -37,8 +37,8 @@ from pathlib import Path
 import build_testmod
 import mc_runtime
 
-DEFAULT_VERSION = "26.2"
-DEFAULT_LOADER = "0.19.5"
+DEFAULT_VERSION = os.environ.get("MZSTD_MC_VERSION", "26.2")
+DEFAULT_LOADER = os.environ.get("MZSTD_LOADER_VERSION", "0.19.5")
 # 被测模组声明 depends fabric-api，Loader 会强制校验，所以必须同时装入这一份固定版本。
 FABRIC_API_VERSION = "0.160.0+26.2"
 FABRIC_API_URL = ("https://maven.fabricmc.net/net/fabricmc/fabric-api/fabric-api/"
@@ -627,6 +627,8 @@ class Scenario:
                     "entry": "127.0.0.1:%d" % self.ports["frp_remote"]},
             "metrics": {key: value for key, value in measurement.items() if key != "states"},
             "measurement": {
+                "minecraft_version": DEFAULT_VERSION,
+                "loader_version": DEFAULT_LOADER,
                 "compression_threshold": self.threshold,
                 "paper_server_build": PAPER_SERVER_BUILD,
                 "paper_server_sha256": PAPER_SERVER_SHA256,
