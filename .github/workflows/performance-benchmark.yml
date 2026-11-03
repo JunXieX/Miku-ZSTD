@@ -244,9 +244,14 @@ jobs:
         run: |
           set -uo pipefail
           shopt -s nullglob
-          for log in "$RUNNER_TEMP"/mzstd-lab/work/.mzstd-private-*/*/scenario.log; do
-            echo "===== $log (tail 200) ====="
-            tail -n 200 "$log" || true
+          for log in "$RUNNER_TEMP"/mzstd-lab/work/.mzstd-private-*/*/scenario.log \
+                     "$RUNNER_TEMP"/mzstd-lab/work/.mzstd-private-*/*/driver/paper.log; do
+            echo "===== $log (tail 120) ====="
+            tail -n 120 "$log" || true
+          done
+          for log in "$RUNNER_TEMP"/mzstd-lab/work/.mzstd-private-*/*/driver/client-*/logs/latest.log; do
+            echo "===== $log (tail 120) ====="
+            tail -n 120 "$log" || true
           done
       - if: ${{ always() }}
         uses: actions/upload-artifact@v7
