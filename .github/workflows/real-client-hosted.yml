@@ -42,6 +42,17 @@ on:
         required: false
         default: "60"
         type: string
+      sweep_file:
+        description: Sweep matrix to run when sweep=true
+        required: false
+        default: scripts/ci/sweep.json
+        type: string
+      load_profile:
+        description: Deterministic load used by the sweep
+        required: false
+        default: drive
+        type: choice
+        options: ["drive", "chatty", "idle"]
 permissions:
   contents: read
   actions: read
@@ -195,14 +206,16 @@ jobs:
         env:
           SWEEP_SECONDS: ${{ inputs.sweep_seconds }}
           SWEEP_WARMUP: ${{ inputs.sweep_warmup_seconds }}
-          MZSTD_LOAD_PROFILE: drive
+          MZSTD_LOAD_PROFILE: ${{ inputs.load_profile || 'drive' }}
           MZSTD_LOAD_STEP_MS: "1000"
           MZSTD_LOAD_STEP_BLOCKS: "16"
+          MZSTD_LOAD_CHAT_MS: "50"
+          SWEEP_FILE: ${{ inputs.sweep_file || 'scripts/ci/sweep.json' }}
         run: |
           set -euo pipefail
           # 每个配置单独一次真实客户端场景：配置只在新建压缩上下文时生效，
           # 所以必须每次重启服务端并让客户端重新连接，不能在同一进程里换配置。
-          python3 - "$GITHUB_WORKSPACE/scripts/ci/sweep.json" <<'PY' > sweep.tsv
+          python3 - "$GITHUB_WORKSPACE/$SWEEP_FILE" <<'PY' > sweep.tsv
           import json, sys
           data = json.load(open(sys.argv[1], encoding="utf-8"))
           for item in data:

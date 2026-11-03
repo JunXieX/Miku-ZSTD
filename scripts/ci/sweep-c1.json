@@ -1,0 +1,35 @@
+[
+  {
+    "label": "bytes-off",
+    "config": {
+      "compression.level": 3,
+      "compression.window_log": 20,
+      "compression.threads": 0,
+      "compression.batch_max_packets": 256,
+      "compression.batch_window_ms": 50,
+      "compression.batch_max_bytes": 0
+    }
+  },
+  {
+    "label": "bytes-256k",
+    "config": {
+      "compression.level": 3,
+      "compression.window_log": 20,
+      "compression.threads": 0,
+      "compression.batch_max_packets": 256,
+      "compression.batch_window_ms": 50,
+      "compression.batch_max_bytes": 262144
+    }
+  },
+  {
+    "label": "bytes-1m",
+    "config": {
+      "compression.level": 3,
+      "compression.window_log": 20,
+      "compression.threads": 0,
+      "compression.batch_max_packets": 256,
+      "compression.batch_window_ms": 50,
+      "compression.batch_max_bytes": 1048576
+    }
+  }
+]

@@ -70,7 +70,8 @@ compression:
   window_log: 20
   threads: 0
   batch_window_ms: 50
-  batch_max_packets: 64
+  batch_max_packets: 256
+  batch_max_bytes: 0
 
 bossbar:
   format: "&a%players% &7人在用 &8| &f%raw% &7→ &a%wire% &8| 压缩率 &e%ratio%"
@@ -85,7 +86,8 @@ logging:
 | `compression.window_log` | `20` | 压缩窗口指数，范围 10–27；调大同时增加每连接内存开销 |
 | `compression.threads` | `0` | 压缩池线程数；0 为可用核心数减 1，至少 1 个线程 |
 | `compression.batch_window_ms` | `50` | 上游只写不 flush 时的兜底时间，单位毫秒；正常批次随上游 flush 发出 |
-| `compression.batch_max_packets` | `64` | 每个压缩批次最多合并的包数；批次输出可能跨多个传输帧 |
+| `compression.batch_max_packets` | `256` | 每个压缩批次最多合并的包数；批次输出可能跨多个传输帧 |
+| `compression.batch_max_bytes` | `0` | 每个压缩批次的原始字节预算，范围 0–16777216；`0` 为不启用。用于大小差异极大的流量：包数上限对聊天小包与区块大包代表的字节量差两个数量级 |
 | `bossbar.format` | 示例所示 | 当前实例监控文本，支持 `&` 颜色代码 |
 | `logging.debug` | `false` | 排查协商、安装与连接问题时开启；Velocity 同时据此启停每 60 秒一次的带宽剖析 |
 

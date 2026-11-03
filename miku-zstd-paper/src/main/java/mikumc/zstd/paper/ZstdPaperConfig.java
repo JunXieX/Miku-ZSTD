@@ -31,6 +31,9 @@ public class ZstdPaperConfig {
     public final int compressThreads;
     public final int batchWindowMs;
     public final int batchMaxPackets;
+
+    /** 每批原始字节预算；0 = 只按包数上限收批（保持旧行为）。 */
+    public final int batchMaxBytes;
     public final boolean debug;
 
     /** BossBar 文本模板（支持 & 颜色代码与 %players%/%raw%/%wire%/%ratio% 占位符）。 */
@@ -49,7 +52,8 @@ public class ZstdPaperConfig {
         this.windowLog = clamp(getInt(c, "window_log", 20), 10, 27);
         this.compressThreads = clamp(getInt(c, "threads", 0), 0, 256);
         this.batchWindowMs = clamp(getInt(c, "batch_window_ms", 50), 0, 1000);
-        this.batchMaxPackets = clamp(getInt(c, "batch_max_packets", 64), 1, 4096);
+        this.batchMaxPackets = clamp(getInt(c, "batch_max_packets", 256), 1, 4096);
+        this.batchMaxBytes = clamp(getInt(c, "batch_max_bytes", 0), 0, 16 * 1024 * 1024);
 
         Map<String, Object> l = section(map, "logging");
         this.debug = getBool(l, "debug", false);
@@ -134,7 +138,11 @@ public class ZstdPaperConfig {
                       batch_window_ms: 50
 
                       # 每批最多合并的包数，范围 1-4096；不是传输帧内的包数上限。
-                      batch_max_packets: 64
+                      batch_max_packets: 256
+
+                      # 每批的原始字节预算，范围 0-16777216；0 = 不启用（只按包数收批）。
+                      # 包数上限对大小差异极大的流量不成立：64 个聊天包几 KB、64 个区块包可能上兆。
+                      batch_max_bytes: 0
 
                     bossbar:
                       # ── BossBar 实时监控文本（/mikuzstd bar 开关）──

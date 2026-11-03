@@ -36,7 +36,7 @@ on:
         required: true
         default: drive
         type: choice
-        options: ["drive", "idle"]
+        options: ["drive", "chatty", "idle"]
       warmup_minutes:
         description: Warm-up per variant per round (excluded from measurement)
         required: true
