@@ -85,7 +85,12 @@ Build 里的 Python 协议客户端只验证 Paper/Velocity 的线协议状态�
 - `clients[]`：每实例 `cpu_seconds`、`rss_peak_bytes`；
 - `total_client_cpu_seconds`、`total_client_rss_bytes`、`client_cpu_utilisation`、`paper_rss_bytes`；
 - `server_tick_lag_warnings`：测量窗口内 Paper 的 `Can't keep up` 次数；
+- `clients[].fps_p50` / `fps_p05`：客户端自己报告的渲染帧率（观测模组从 `Minecraft.getFps()` 采样）；
 - `verdict`：`sufficient` 或 `insufficient`，后者附 `reasons`。
+
+判定为 `insufficient` 的条件（任一命中）：测量窗口内 Paper 出现 `Can't keep up`；客户端 JVM 合计占用超过 90% 可用核；任一客户端的 `fps_p50` 低于 `MZSTD_MIN_CLIENT_FPS`（默认 20）。
+
+**为什么必须看 fps**：加客户端时 CPU 总量会被摊薄，每个客户端自己分到的核越来越少——实测 4 vCPU 托管机上 1 个客户端用 161.7 CPU 秒，5 个客户端合计 216.0 CPU 秒但平摊到每个只有约 40 秒。只看总 CPU 或"进程还活着"会把这判成通过，只有客户端自己的帧率能说明它还剩多少可用性。
 
 判定为 `insufficient` 时报告仍会落盘（状态 `capacity_exceeded`，数字可在 "Report measured metrics" 步骤里看到），但编排器与校验器都会拒收。**不会因为换更少的人或换成协议机器人而放行。**
 

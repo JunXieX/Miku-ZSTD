@@ -608,6 +608,27 @@ class Scenario:
             state["play_ms"] = max(state["play_ms"], record.get("play_ms", 0))
         return state
 
+    def fps_samples(self, client: dict, wall_from_ms: int, wall_to_ms: int) -> list[float]:
+        """Client-reported frame rate inside the measured window."""
+        samples = []
+        evidence = client["evidence"]
+        if not evidence.is_file():
+            return samples
+        for line in evidence.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if record.get("type") != "sample" or not record.get("playing"):
+                continue
+            wall = record.get("wall_ms")
+            fps = record.get("fps")
+            if not isinstance(wall, int) or not isinstance(fps, (int, float)):
+                continue
+            if wall_from_ms <= wall <= wall_to_ms and fps >= 0:
+                samples.append(float(fps))
+        return samples
+
     def rtt_samples(self, clients: list[dict], wall_from_ms: int, wall_to_ms: int) -> list[float]:
         """Client-measured round trips that completed inside the measured window.
 
@@ -706,7 +727,7 @@ class Scenario:
         states = [self.play_state(client) for client in clients]
         observer_after = sum(state["inbound_bytes"] for state in states)
         capacity = self.capacity_block(clients, client_cpu_before, client_rss_peak,
-                                       elapsed, lag_before)
+                                       elapsed, lag_before, wall_started_ms, wall_finished_ms)
         return {
             "duration_seconds": round(elapsed, 3),
             "raw_bytes": max(0, raw_after - raw_before),
@@ -732,7 +753,8 @@ class Scenario:
         }
 
     def capacity_block(self, clients: list[dict], cpu_before: dict, rss_peak: dict,
-                       elapsed: float, lag_before: int) -> dict:
+                       elapsed: float, lag_before: int,
+                       wall_from_ms: int, wall_to_ms: int) -> dict:
         """Per-instance resource use on this runner, plus an explicit verdict.
 
         The point of T6 is to find the real capacity boundary instead of guessing:
@@ -740,15 +762,26 @@ class Scenario:
         whole process tree. A run that cannot hold the requested instances must say
         so — silently passing a starved run would be worse than failing.
         """
+        min_fps = float(os.environ.get("MZSTD_MIN_CLIENT_FPS", "20"))
         rows = []
+        starved = []
         for client in clients:
             index = client["index"]
             after = tree_cpu_seconds(self.processes["client-%d" % index].pid)
+            frames = self.fps_samples(client, wall_from_ms, wall_to_ms)
+            fps_p50 = percentile(frames, 0.50)
+            fps_p05 = percentile(frames, 0.05)
             rows.append({
                 "id": "client-%d" % index,
                 "cpu_seconds": round(max(0.0, after - cpu_before[index]), 3),
                 "rss_peak_bytes": rss_peak[index],
+                "fps_p50": round(fps_p50, 1),
+                "fps_p05": round(fps_p05, 1),
+                "fps_samples": len(frames),
             })
+            if frames and fps_p50 < min_fps:
+                starved.append("client-%d median %.0f fps below the %.0f fps floor"
+                               % (index, fps_p50, min_fps))
         cores = os.cpu_count() or 1
         total_cpu = sum(row["cpu_seconds"] for row in rows)
         total_rss = sum(row["rss_peak_bytes"] for row in rows)
@@ -760,6 +793,7 @@ class Scenario:
         if utilisation > 0.9:
             reasons.append("client JVMs consumed %.0f%% of the %d available cores"
                            % (utilisation * 100, cores))
+        reasons.extend(starved)
         return {
             "runner_cpu_count": cores,
             "runner_memory_bytes": total_memory_bytes(),
@@ -769,6 +803,7 @@ class Scenario:
             "client_cpu_utilisation": round(utilisation, 3),
             "paper_rss_bytes": read_peak_rss(self.processes["paper"].pid),
             "server_tick_lag_warnings": lag_events,
+            "min_client_fps": min_fps,
             "verdict": "insufficient" if reasons else "sufficient",
             "reasons": reasons,
         }

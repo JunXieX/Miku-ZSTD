@@ -204,14 +204,17 @@ public final class CiObserver implements ClientModInitializer {
             maybeSendPing(client, now);
         }
         int ticks = playing ? client.player.tickCount : -1;
+        // 每秒渲染帧数是"这台机器还带得动几个客户端"最直接的用户侧信号：
+        // 加人后 CPU 总量被摊薄时，fps 会先掉下来。
+        int fps = playing ? client.getFps() : -1;
         double x = playing ? client.player.getX() : Double.NaN;
         double y = playing ? client.player.getY() : Double.NaN;
         double z = playing ? client.player.getZ() : Double.NaN;
-        write(sampleRecord(listener != null, playing, ticks, x, y, z));
+        write(sampleRecord(listener != null, playing, ticks, x, y, z, fps));
     }
 
     private String sampleRecord(boolean connected, boolean playing, int ticks,
-                                double x, double y, double z) {
+                                double x, double y, double z, int fps) {
         StringBuilder json = new StringBuilder();
         json.append("{\"type\":\"sample\"");
         json.append(",\"mono_ms\":").append(elapsedMillis());
@@ -222,6 +225,7 @@ public final class CiObserver implements ClientModInitializer {
         json.append(",\"inbound_messages\":").append(inboundMessages.sum());
         json.append(",\"play_ms\":").append(playNanos / 1_000_000L);
         if (playing) {
+            json.append(",\"fps\":").append(fps);
             json.append(",\"ticks\":").append(ticks);
             json.append(",\"x\":").append(format(x));
             json.append(",\"y\":").append(format(y));
