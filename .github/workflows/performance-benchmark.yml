@@ -1,42 +1,267 @@
 name: Performance Benchmark
 
+# 两种模式：
+#   github-hosted（默认）：在临时托管 runner 上现场构建 baseline/candidate 两个提交的成品，
+#                          用 1 个真实客户端做交错配对 A/B。托管机容量实测只够 1 个客户端
+#                          （见 scripts/ci/README.md 的容量曲线），因此这里不做 10/50。
+#   self-hosted         ：原有固定实验室路径，需要 MZSTD_PERFORMANCE_RUNNER_READY 与专用 runner。
 on:
   workflow_dispatch:
     inputs:
-      baseline_build_run_id:
-        description: Successful Build run for the baseline commit
+      runner_mode:
+        description: Where to run the paired A/B
         required: true
-        type: string
-      candidate_build_run_id:
-        description: Successful Build run for this exact workflow commit
-        required: true
-        type: string
-      client_count:
-        description: Actual Fabric + Krypton clients
-        required: true
-        default: "10"
+        default: github-hosted
         type: choice
-        options: ["10", "50"]
-      duration_minutes:
-        description: Measured interval per variant per round after warm-up
-        required: true
-        default: "5"
-        type: choice
-        options: ["5", "10"]
+        options: ["github-hosted", "self-hosted"]
+      baseline_sha:
+        description: Baseline commit SHA to build and compare against (github-hosted)
+        required: false
+        default: ""
+        type: string
       rounds:
         description: Interleaved paired rounds
         required: true
-        default: "5"
+        default: "2"
         type: choice
-        options: ["5", "7"]
+        options: ["2", "3", "5", "7"]
+      duration_minutes:
+        description: Measured interval per variant per round after warm-up
+        required: true
+        default: "2"
+        type: choice
+        options: ["1", "2", "3", "5", "10"]
+      warmup_minutes:
+        description: Warm-up per variant per round (excluded from measurement)
+        required: true
+        default: "1"
+        type: choice
+        options: ["0.5", "1", "2"]
+      baseline_build_run_id:
+        description: Only for self-hosted - successful Build run for the baseline commit
+        required: false
+        default: ""
+        type: string
+      candidate_build_run_id:
+        description: Only for self-hosted - successful Build run for this exact commit
+        required: false
+        default: ""
+        type: string
+      client_count:
+        description: Only for self-hosted - actual Fabric + Krypton clients
+        required: false
+        default: "10"
+        type: choice
+        options: ["10", "50"]
 permissions:
   contents: read
   actions: read
 concurrency:
-  group: miku-zstd-private-lab
+  group: miku-zstd-benchmark-${{ inputs.runner_mode }}-${{ github.ref }}
   cancel-in-progress: false
+
 jobs:
+  hosted-pair:
+    name: Hosted paired A/B (1 real client)
+    if: ${{ inputs.runner_mode == 'github-hosted' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CI: "true"
+      MZSTD_MC_VERSION: "26.2"
+      MZSTD_KRYPTON_URL: https://cdn.modrinth.com/data/fQEb0iXm/versions/5WeL0Nkz/krypton-0.3.1.jar
+      MZSTD_KRYPTON_SHA512: b8d9af34cd0050493afb8a6232cb8f785daa9d8887b7045f6e6a53c6bb9b5ffc4318fd9b0347a940eacfeba4773f10cb80ae0be1e79ce4c1888f96eda21e564e
+      MZSTD_FRP_VERSION: "0.71.1"
+      MZSTD_NIC: lo
+      MZSTD_COMPRESSION_THRESHOLD: "256"
+      MZSTD_MIN_CLIENT_FPS: "20"
+      MZSTD_STARTUP_TIMEOUT_SECONDS: "600"
+      SHARED_CLIENTS: "1"
+      ROUNDS: ${{ inputs.rounds }}
+      DURATION_MINUTES: ${{ inputs.duration_minutes }}
+      WARMUP_MINUTES: ${{ inputs.warmup_minutes }}
+      BASELINE_SHA: ${{ inputs.baseline_sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+      - name: Check inputs
+        run: |
+          set -euo pipefail
+          if ! [[ "$BASELINE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "baseline_sha must be a full 40-character commit SHA" >&2
+            exit 1
+          fi
+          if [[ "$BASELINE_SHA" == "$GITHUB_SHA" ]]; then
+            echo "baseline_sha must differ from the candidate commit" >&2
+            exit 1
+          fi
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.baseline_sha }}
+          path: baseline
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "25"
+      - uses: gradle/actions/setup-gradle@v5
+        with:
+          gradle-version: "9.6.0"
+      - name: Install virtual display and software OpenGL
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xvfb xauth libgl1 libgl1-mesa-dri libglx-mesa0 libxi6 libxrandr2 \
+            libxcursor1 libxinerama1 libxxf86vm1 libasound2t64 mesa-utils
+      - name: Build both variants from source
+        run: |
+          set -euo pipefail
+          # 现场构建两侧成品：既不依赖 1 天过期的 Build 工件，也能保证两侧 JAR 都来自各自提交。
+          for variant in baseline candidate; do
+            root="$GITHUB_WORKSPACE"
+            if [[ "$variant" == "baseline" ]]; then root="$GITHUB_WORKSPACE/baseline"; fi
+            (cd "$root/miku-zstd-fabric" && gradle jar --no-daemon --stacktrace)
+            (cd "$root/miku-zstd-paper" && gradle shadowJar --no-daemon --stacktrace)
+            mkdir -p "$GITHUB_WORKSPACE/dist/$variant"
+            cp "$root"/miku-zstd-fabric/build/libs/Miku-ZSTD-*-Fabric.jar "$GITHUB_WORKSPACE/dist/$variant/"
+            cp "$root"/miku-zstd-paper/build/libs/Miku-ZSTD-*-Paper.jar "$GITHUB_WORKSPACE/dist/$variant/"
+          done
+          ls -l dist/baseline dist/candidate
+      - name: Fetch pinned Krypton, Paper server and FRP
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/mzstd-lab/deps"
+          curl -fsSL "$MZSTD_KRYPTON_URL" -o "$RUNNER_TEMP/mzstd-lab/deps/krypton.jar"
+          python3 - <<'PY'
+          import hashlib, os, pathlib
+          jar = pathlib.Path(os.environ["RUNNER_TEMP"]) / "mzstd-lab/deps/krypton.jar"
+          assert hashlib.sha512(jar.read_bytes()).hexdigest() == os.environ["MZSTD_KRYPTON_SHA512"]
+          print("krypton sha512 verified")
+          PY
+          paper_url="https://fill-data.papermc.io/v1/objects/ef3dbc68b013deafdbbee3bebf1ba351671ebcda94a8f136809b7532d5ba2fe1/paper-26.2-135.jar"
+          curl -fsSL "$paper_url" -o "$RUNNER_TEMP/mzstd-lab/deps/paper-26.2-135.jar"
+          echo "ef3dbc68b013deafdbbee3bebf1ba351671ebcda94a8f136809b7532d5ba2fe1  $RUNNER_TEMP/mzstd-lab/deps/paper-26.2-135.jar" | sha256sum -c -
+          base="https://github.com/fatedier/frp/releases/download/v$MZSTD_FRP_VERSION"
+          archive="frp_${MZSTD_FRP_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL "$base/$archive" -o "$RUNNER_TEMP/frp.tar.gz"
+          curl -fsSL "$base/frp_sha256_checksums.txt" -o "$RUNNER_TEMP/frp.sha256"
+          grep -F "  $archive" "$RUNNER_TEMP/frp.sha256" | sed "s#  $archive#  $RUNNER_TEMP/frp.tar.gz#" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/frp"
+          tar -xzf "$RUNNER_TEMP/frp.tar.gz" -C "$RUNNER_TEMP/frp" --strip-components=1
+          echo "$RUNNER_TEMP/frp" >> "$GITHUB_PATH"
+      - name: Prepare isolated evidence and harness configuration
+        id: lab
+        run: |
+          set -euo pipefail
+          umask 077
+          evidence=$(mktemp -d "$RUNNER_TEMP/miku-zstd-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-XXXXXXXX")
+          lab="$RUNNER_TEMP/mzstd-lab"
+          mkdir -p "$evidence/sanitized" "$lab/work" "$lab/bin"
+          cat > "$lab/bin/run-game-scenario" <<'SH'
+          #!/bin/sh
+          exec python3 "$GITHUB_WORKSPACE/scripts/ci/run_game_scenario.py" "$@"
+          SH
+          cat > "$lab/bin/cleanup-game-scenario" <<'SH'
+          #!/bin/sh
+          exec python3 "$GITHUB_WORKSPACE/scripts/ci/cleanup_game_scenario.py" "$@"
+          SH
+          chmod 700 "$lab/bin/run-game-scenario" "$lab/bin/cleanup-game-scenario"
+          python3 - <<'PY'
+          import json, os, pathlib
+          lab = pathlib.Path(os.environ["RUNNER_TEMP"]) / "mzstd-lab"
+          config = {
+              "schema_version": 1,
+              "scenario_command": [str(lab / "bin/run-game-scenario")],
+              "cleanup_command": [str(lab / "bin/cleanup-game-scenario")],
+              "work_dir": str(lab / "work"),
+              "startup_timeout_seconds": 1200,
+              "cleanup_timeout_seconds": 120,
+              "terminate_grace_seconds": 10,
+          }
+          path = lab / "config.json"
+          path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+          path.chmod(0o600)
+          PY
+          {
+            echo "EVIDENCE_DIR=$evidence"
+            echo "RESULT_DIR=$evidence/scenario"
+            echo "MZSTD_SMOKE_CONFIG=$lab/config.json"
+            echo "MZSTD_MC_CACHE=$RUNNER_TEMP/mzstd-mc-cache"
+            echo "MZSTD_KRYPTON_JAR=$lab/deps/krypton.jar"
+            echo "MZSTD_PAPER_SERVER_JAR=$lab/deps/paper-26.2-135.jar"
+            echo "MZSTD_RUN_NONCE=$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+          } >> "$GITHUB_ENV"
+      - name: Cache Minecraft client runtime
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.MZSTD_MC_CACHE }}
+          key: mzstd-mc-${{ env.MZSTD_MC_VERSION }}-a35ecceffb8b3443b5d2fb88ca6f93f9b1fbcbf9
+      - name: Check hosted runner prerequisites (not a game test)
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/hosted_preflight.py --report-json "$EVIDENCE_DIR/sanitized/runner-preflight.json"
+      - name: Run randomized interleaved real-client A/B
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/lab_harness.py benchmark-pair --config "$MZSTD_SMOKE_CONFIG" \
+            --baseline-fabric-jar "$GITHUB_WORKSPACE"/dist/baseline/Miku-ZSTD-*-Fabric.jar \
+            --baseline-paper-jar "$GITHUB_WORKSPACE"/dist/baseline/Miku-ZSTD-*-Paper.jar \
+            --baseline-sha "$BASELINE_SHA" \
+            --candidate-fabric-jar "$GITHUB_WORKSPACE"/dist/candidate/Miku-ZSTD-*-Fabric.jar \
+            --candidate-paper-jar "$GITHUB_WORKSPACE"/dist/candidate/Miku-ZSTD-*-Paper.jar \
+            --candidate-sha "$GITHUB_SHA" --frp-compression true --clients "$SHARED_CLIENTS" \
+            --duration-minutes "$DURATION_MINUTES" --rounds "$ROUNDS" \
+            --warmup-minutes "$WARMUP_MINUTES" --randomize-order --result-dir "$RESULT_DIR" \
+            --event-log "$EVIDENCE_DIR/sanitized/lifecycle.jsonl"
+          python3 scripts/ci/validate_real_client_result.py benchmark-pair "$RESULT_DIR/summary.json" \
+            --expected-clients "$SHARED_CLIENTS" --expected-sha "$GITHUB_SHA" \
+            --expected-baseline-sha "$BASELINE_SHA" \
+            --min-duration-seconds "$(python3 -c "print(int(float('$DURATION_MINUTES') * int('$ROUNDS') * 120))")" \
+            --required-rounds "$ROUNDS" --expected-nonce "$MZSTD_RUN_NONCE" \
+            --expected-fabric-jar "$GITHUB_WORKSPACE"/dist/candidate/Miku-ZSTD-*-Fabric.jar \
+            --expected-paper-jar "$GITHUB_WORKSPACE"/dist/candidate/Miku-ZSTD-*-Paper.jar \
+            --expected-baseline-fabric-jar "$GITHUB_WORKSPACE"/dist/baseline/Miku-ZSTD-*-Fabric.jar \
+            --expected-baseline-paper-jar "$GITHUB_WORKSPACE"/dist/baseline/Miku-ZSTD-*-Paper.jar \
+            --sanitized-output "$EVIDENCE_DIR/sanitized/summary.json"
+      - name: Report paired metrics
+        if: always()
+        run: |
+          set -uo pipefail
+          shopt -s nullglob
+          for report in "$RUNNER_TEMP"/mzstd-lab/work/.mzstd-private-*/*/report.json; do
+            python3 - "$report" <<'PY'
+          import json, sys
+          data = json.load(open(sys.argv[1], encoding="utf-8"))
+          keep = {k: data.get(k) for k in ("commit_sha", "status")}
+          keep["metrics"] = data.get("metrics", {})
+          keep["capacity"] = data.get("capacity", {})
+          print(json.dumps(keep, indent=2, sort_keys=True))
+          PY
+          done
+      - name: Show scenario diagnostics
+        if: failure()
+        run: |
+          set -uo pipefail
+          shopt -s nullglob
+          for log in "$RUNNER_TEMP"/mzstd-lab/work/.mzstd-private-*/*/scenario.log; do
+            echo "===== $log (tail 200) ====="
+            tail -n 200 "$log" || true
+          done
+      - if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: performance-hosted-${{ github.run_id }}
+          path: |
+            ${{ env.EVIDENCE_DIR }}/sanitized/summary.json
+            ${{ env.EVIDENCE_DIR }}/sanitized/runner-preflight.json
+            ${{ env.EVIDENCE_DIR }}/sanitized/lifecycle.jsonl
+          if-no-files-found: warn
+          retention-days: 30
+
   preflight:
+    name: Self-hosted lab preflight
+    if: ${{ inputs.runner_mode == 'self-hosted' }}
     runs-on: ubuntu-latest
     outputs:
       run_allowed: ${{ steps.check.outputs.run_allowed }}
@@ -66,8 +291,9 @@ jobs:
       - if: ${{ steps.check.outputs.run_allowed != 'true' }}
         run: echo 'Performance run skipped; fixed runner not configured, no measurement produced.' >> "$GITHUB_STEP_SUMMARY"
   benchmark:
+    name: Self-hosted fixed lab A/B
     needs: preflight
-    if: ${{ needs.preflight.outputs.run_allowed == 'true' }}
+    if: ${{ inputs.runner_mode == 'self-hosted' && needs.preflight.outputs.run_allowed == 'true' }}
     runs-on: [self-hosted, linux, x64, miku-zstd-performance]
     timeout-minutes: 240
     env:
@@ -166,7 +392,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-# Dedicated fixed private lab only. Warm-up applies to each variant in each round.
-# The 240-minute job budget includes 168 minutes of measured/warm-up intervals
-# at the largest input; scenario setup/cleanup must also fit the remaining budget.
-# See scripts/ci/README.md. No protocol-only client is accepted as a real client.
+# Hosted mode builds both commits in-job, so it does not depend on the 1-day Build
+# artifact retention and cannot silently compare the wrong JARs. Warm-up applies to
+# each variant in each round and is excluded from the measured interval.
+# See scripts/ci/README.md for the capacity curve (1 real client on hosted runners).
