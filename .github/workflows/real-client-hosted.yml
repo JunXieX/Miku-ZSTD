@@ -64,8 +64,8 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            xvfb libgl1 libgl1-mesa-dri libglx-mesa0 libxi6 libxrandr2 \
-            libxcursor1 libxinerama1 libxxf86vm1 libasound2t64
+            xvfb xauth libgl1 libgl1-mesa-dri libglx-mesa0 libxi6 libxrandr2 \
+            libxcursor1 libxinerama1 libxxf86vm1 libasound2t64 mesa-utils
           xvfb-run --help >/dev/null
       - name: Build tested JARs from this commit
         run: |
@@ -94,6 +94,9 @@ jobs:
           curl -fsSL "$base/frp_sha256_checksums.txt" -o "$RUNNER_TEMP/frp.sha256"
           grep -F "  $archive" "$RUNNER_TEMP/frp.sha256" \
             | sed "s#  $archive#  $RUNNER_TEMP/frp.tar.gz#" | sha256sum -c -
+          paper_url="https://fill-data.papermc.io/v1/objects/ef3dbc68b013deafdbbee3bebf1ba351671ebcda94a8f136809b7532d5ba2fe1/paper-26.2-135.jar"
+          curl -fsSL "$paper_url" -o "$RUNNER_TEMP/mzstd-lab/deps/paper-26.2-135.jar"
+          echo "ef3dbc68b013deafdbbee3bebf1ba351671ebcda94a8f136809b7532d5ba2fe1  $RUNNER_TEMP/mzstd-lab/deps/paper-26.2-135.jar" | sha256sum -c -
           mkdir -p "$RUNNER_TEMP/frp"
           tar -xzf "$RUNNER_TEMP/frp.tar.gz" -C "$RUNNER_TEMP/frp" --strip-components=1
           echo "$RUNNER_TEMP/frp" >> "$GITHUB_PATH"
@@ -141,6 +144,7 @@ jobs:
             echo "MZSTD_SMOKE_CONFIG=$lab/config.json"
             echo "MZSTD_MC_CACHE=$RUNNER_TEMP/mzstd-mc-cache"
             echo "MZSTD_KRYPTON_JAR=$lab/deps/krypton.jar"
+            echo "MZSTD_PAPER_SERVER_JAR=$lab/deps/paper-26.2-135.jar"
             echo "MZSTD_RUN_NONCE=$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
           } >> "$GITHUB_ENV"
       - name: Cache Minecraft client runtime
@@ -175,8 +179,8 @@ jobs:
         run: |
           set -uo pipefail
           shopt -s nullglob
-          for log in "$RUNNER_TEMP"/mzstd-lab/work/.mzstd-private-*/scenario.log \
-                     "$RUNNER_TEMP"/mzstd-lab/work/.mzstd-private-*/cleanup.log; do
+          for log in "$RUNNER_TEMP"/mzstd-lab/work/.mzstd-private-*/*/scenario.log \
+                     "$RUNNER_TEMP"/mzstd-lab/work/.mzstd-private-*/*/cleanup.log; do
             echo "===== $log (tail 200) ====="
             tail -n 200 "$log" || true
           done

@@ -38,6 +38,9 @@ from pathlib import Path
 VERSION_MANIFEST = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
 ASSET_BASE = "https://resources.download.minecraft.net"
 KNOT_MAIN_CLASS = "net.fabricmc.loader.impl.launch.knot.KnotClient"
+# Paper 的下载端会拒绝没有 User-Agent 的请求 (HTTP 403)，
+# 这里统一带上固定标识，避免部署脚本与 CI 行为不一致。
+USER_AGENT = "Miku-ZSTD-CI/1.0 (+https://github.com/JunXieX/Miku-ZSTD)"
 
 
 class RuntimeFetchError(Exception):
@@ -60,9 +63,11 @@ def download(url: str, dest: Path, sha1: str | None = None, attempts: int = 4,
     dest.parent.mkdir(parents=True, exist_ok=True)
     temporary = dest.with_name(dest.name + ".part")
     last_error = None
+    request_headers = {"User-Agent": USER_AGENT}
     for attempt in range(attempts):
         try:
-            with urllib.request.urlopen(url, timeout=timeout) as response, \
+            request = urllib.request.Request(url, headers=request_headers)
+            with urllib.request.urlopen(request, timeout=timeout) as response, \
                     temporary.open("wb") as output:
                 shutil.copyfileobj(response, output, 1 << 20)
             if sha1 is not None:

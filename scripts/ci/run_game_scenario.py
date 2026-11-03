@@ -250,6 +250,13 @@ class Scenario:
     # -- Paper ---------------------------------------------------------------
 
     def paper_server_jar(self) -> Path:
+        configured = os.environ.get("MZSTD_PAPER_SERVER_JAR")
+        if configured:
+            candidate = Path(configured).resolve()
+            require(candidate.is_file(), "pre-fetched Paper server JAR is missing")
+            require(sha256_file(candidate) == PAPER_SERVER_SHA256,
+                    "pre-fetched Paper server JAR does not match the pinned sha256")
+            return candidate
         cache = Path(os.environ.get("MZSTD_MC_CACHE", str(self.artifacts))).resolve()
         target = cache / ("paper-26.2-%d.jar" % PAPER_SERVER_BUILD)
         if not (target.is_file() and sha256_file(target) == PAPER_SERVER_SHA256):
@@ -371,7 +378,9 @@ class Scenario:
         if not loader.is_file():
             url = ("https://maven.fabricmc.net/net/fabricmc/fabric-loader/%s/"
                    "fabric-loader-%s.jar" % (DEFAULT_LOADER, DEFAULT_LOADER))
-            expected = urllib.request.urlopen(url + ".sha1", timeout=60).read().decode("ascii").split()[0]
+            request = urllib.request.Request(url + ".sha1",
+                                             headers={"User-Agent": mc_runtime.USER_AGENT})
+            expected = urllib.request.urlopen(request, timeout=60).read().decode("ascii").split()[0]
             mc_runtime.download(url, loader, expected)
         runtime = mc_runtime.prepare(DEFAULT_VERSION, cache, extra_classpath=[loader],
                                      log=lambda message: print(message, flush=True))
@@ -684,7 +693,9 @@ def main() -> int:
     except ScenarioError as failure:
         print("scenario failed: " + str(failure), file=sys.stderr)
         return 1
-    except (OSError, ValueError, KeyError) as failure:
+    except BaseException as failure:
+        # 任何未预期异常都必须带上类型与信息: 编排器只会转述"命令失败",
+        # 真正的定位线索只有这一行 (驱动日志)。
         print("scenario error: " + type(failure).__name__ + ": " + str(failure), file=sys.stderr)
         return 1
 
