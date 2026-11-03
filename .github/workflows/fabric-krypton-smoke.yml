@@ -17,7 +17,7 @@ permissions:
   contents: read
   actions: read
 concurrency:
-  group: miku-zstd-real-client-smoke
+  group: miku-zstd-private-lab
   cancel-in-progress: false
 jobs:
   preflight:
@@ -31,12 +31,11 @@ jobs:
           BUILD_RUN_ID: ${{ inputs.build_run_id }}
           EXPECTED_SHA: ${{ github.sha }}
           RUNNER_READY: ${{ vars.MZSTD_REAL_CLIENT_RUNNER_READY }}
-          LAB_HARNESS: ${{ vars.MZSTD_LAB_HARNESS }}
           SMOKE_CONFIG: ${{ vars.MZSTD_SMOKE_CONFIG }}
           SMOKE_SECONDS: ${{ inputs.duration_seconds }}
         run: |
           set -euo pipefail
-          if [[ "$GITHUB_REF" != "refs/heads/main" ]] || [[ "$RUNNER_READY" != "true" ]] || [[ -z "$LAB_HARNESS" ]] || [[ -z "$SMOKE_CONFIG" ]]; then
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]] || [[ "$RUNNER_READY" != "true" ]] || [[ -z "$SMOKE_CONFIG" ]]; then
             echo "run_allowed=false" >> "$GITHUB_OUTPUT"
             echo "::notice::Smoke requires trusted main and an enabled lab runner; skipped, not passed."
             exit 0
@@ -57,7 +56,6 @@ jobs:
     runs-on: [self-hosted, linux, x64, miku-zstd-real-client]
     timeout-minutes: 30
     env:
-      MZSTD_LAB_HARNESS: ${{ vars.MZSTD_LAB_HARNESS }}
       MZSTD_SMOKE_CONFIG: ${{ vars.MZSTD_SMOKE_CONFIG }}
       SMOKE_SECONDS: ${{ inputs.duration_seconds }}
     steps:
@@ -71,38 +69,42 @@ jobs:
           pattern: Miku-ZSTD-*
           path: dist
           merge-multiple: true
+      - name: Allocate invocation-specific private evidence directory
+        id: evidence
+        run: |
+          set -euo pipefail
+          umask 077
+          result=$(mktemp -d "$RUNNER_TEMP/miku-zstd-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-XXXXXXXX")
+          echo "dir=$result" >> "$GITHUB_OUTPUT"
+          echo "RESULT_DIR=$result" >> "$GITHUB_ENV"
+          echo "MZSTD_RUN_NONCE=$(python3 -c 'import secrets; print(secrets.token_hex(32))')" >> "$GITHUB_ENV"
       - name: Check private harness contract
         run: |
           set -euo pipefail
-          test -x "$MZSTD_LAB_HARNESS"
           test -r "$MZSTD_SMOKE_CONFIG"
           test -s dist/Miku-ZSTD-*-Fabric.jar
           test -s dist/Miku-ZSTD-*-Paper.jar
       - name: Run actual Fabric + Krypton client through compressed FRP
         run: |
           set -euo pipefail
-          result="$RUNNER_TEMP/miku-zstd-real-client-smoke"
-          mkdir -p "$result"
-          "$MZSTD_LAB_HARNESS" smoke --config "$MZSTD_SMOKE_CONFIG" \
+          result="$RESULT_DIR"
+          python3 scripts/ci/lab_harness.py smoke --config "$MZSTD_SMOKE_CONFIG" \
             --fabric-jar "$GITHUB_WORKSPACE"/dist/Miku-ZSTD-*-Fabric.jar \
             --paper-jar "$GITHUB_WORKSPACE"/dist/Miku-ZSTD-*-Paper.jar \
-            --frp-compression true --duration-seconds "$SMOKE_SECONDS" --result-dir "$result"
+            --frp-compression true --duration-seconds "$SMOKE_SECONDS" --candidate-sha "$GITHUB_SHA" --result-dir "$result"
           python3 scripts/ci/validate_real_client_result.py smoke "$result/summary.json" \
             --expected-clients 1 --expected-sha "$GITHUB_SHA" \
-            --min-duration-seconds "$SMOKE_SECONDS"
-      - if: always()
+            --min-duration-seconds "$SMOKE_SECONDS" --expected-nonce "$MZSTD_RUN_NONCE" \
+            --expected-fabric-jar "$GITHUB_WORKSPACE"/dist/Miku-ZSTD-*-Fabric.jar \
+            --expected-paper-jar "$GITHUB_WORKSPACE"/dist/Miku-ZSTD-*-Paper.jar \
+            --sanitized-output "$result/sanitized/summary.json"
+      - if: ${{ always() && steps.evidence.outputs.dir != '' }}
         uses: actions/upload-artifact@v7
         with:
           name: real-client-smoke-${{ github.run_id }}
-          path: ${{ runner.temp }}/miku-zstd-real-client-smoke
+          path: ${{ steps.evidence.outputs.dir }}/sanitized/summary.json
           if-no-files-found: warn
           retention-days: 14
 
-# Requires a dedicated isolated self-hosted Linux x64 runner labeled
-# miku-zstd-real-client with Java 25, an authenticated/licensed MC 26.2 Fabric
-# profile (Loader 0.19.5), pinned Krypton, and xvfb/Mesa if required.
-# MZSTD_LAB_HARNESS is runner-installed; MZSTD_SMOKE_CONFIG is runner-local and
-# describes the Paper+FRP topology/profile. Keep auth/session material outside
-# checkout. Set repository vars MZSTD_REAL_CLIENT_RUNNER_READY=true,
-# MZSTD_LAB_HARNESS, MZSTD_SMOKE_CONFIG only after provisioning. Never run
-# untrusted PR code on this runner.
+# Dedicated private Linux x64 lab only. See scripts/ci/README.md for provisioning,
+# scenario-driver contract, evidence fields and the difference between skip/pass.
