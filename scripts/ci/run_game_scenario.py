@@ -423,6 +423,16 @@ class Scenario:
                     continue
                 if (client["username"] + " joined the game") in self.paper_log.text():
                     client["joined_at"] = time.monotonic()
+                    continue
+                if (client["username"] + " lost connection") in self.paper_log.text():
+                    raise ScenarioError("client %d was disconnected by the server:\n%s"
+                                        % (client["index"], client["log"].tail(30)))
+                body = client["client_log"].text()
+                for marker in ("Disconnected", "Connection refused", "Failed to connect",
+                               "Internal Exception", "Failed to check session lock"):
+                    if marker in body:
+                        raise ScenarioError("client %d reported %r while joining:\n%s"
+                                            % (client["index"], marker, client["log"].tail(30)))
             if all(client["joined_at"] is not None for client in clients):
                 return
             time.sleep(0.5)

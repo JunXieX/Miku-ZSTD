@@ -16,6 +16,11 @@ on:
         required: false
         default: "256"
         type: string
+      startup_timeout_seconds:
+        description: Client/server startup budget in seconds
+        required: false
+        default: "900"
+        type: string
   push:
     branches: ["ci/hosted-real-client"]
     paths:
@@ -44,7 +49,7 @@ jobs:
       MZSTD_FRP_VERSION: "0.71.1"
       MZSTD_NIC: lo
       MZSTD_COMPRESSION_THRESHOLD: ${{ inputs.compression_threshold || '256' }}
-      MZSTD_STARTUP_TIMEOUT_SECONDS: "900"
+      MZSTD_STARTUP_TIMEOUT_SECONDS: ${{ inputs.startup_timeout_seconds || '900' }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-java@v6
@@ -119,7 +124,9 @@ jobs:
               "scenario_command": [str(lab / "bin/run-game-scenario")],
               "cleanup_command": [str(lab / "bin/cleanup-game-scenario")],
               "work_dir": str(lab / "work"),
-              "startup_timeout_seconds": 900,
+              # 编排层容忍"下载客户端运行时 + 启动 + 观测"的总时长；
+              # 驱动自己的启动/入服上限由 MZSTD_STARTUP_TIMEOUT_SECONDS 控制，通常更短。
+              "startup_timeout_seconds": 1200,
               "cleanup_timeout_seconds": 120,
               "terminate_grace_seconds": 10,
           }
@@ -163,6 +170,40 @@ jobs:
             --expected-fabric-jar "$GITHUB_WORKSPACE"/dist/Miku-ZSTD-*-Fabric.jar \
             --expected-paper-jar "$GITHUB_WORKSPACE"/dist/Miku-ZSTD-*-Paper.jar \
             --sanitized-output "$EVIDENCE_DIR/sanitized/summary.json"
+      - name: Show scenario diagnostics
+        if: failure()
+        run: |
+          set -uo pipefail
+          shopt -s nullglob
+          for log in "$RUNNER_TEMP"/mzstd-lab/work/.mzstd-private-*/scenario.log \
+                     "$RUNNER_TEMP"/mzstd-lab/work/.mzstd-private-*/cleanup.log; do
+            echo "===== $log (tail 200) ====="
+            tail -n 200 "$log" || true
+          done
+          for log in "$RUNNER_TEMP"/mzstd-lab/work/.mzstd-private-*/*/driver/*.log; do
+            case "$log" in
+              */client-*/logs/latest.log) continue ;;
+            esac
+            echo "===== $log (tail 120) ====="
+            tail -n 120 "$log" || true
+          done
+          for log in "$RUNNER_TEMP"/mzstd-lab/work/.mzstd-private-*/*/driver/client-*/logs/latest.log; do
+            echo "===== $log (tail 160) ====="
+            tail -n 160 "$log" || true
+          done
+          for log in "$RUNNER_TEMP"/mzstd-lab/work/.mzstd-private-*/*/driver/client-*/crash-reports/*.txt; do
+            echo "===== $log (tail 120) ====="
+            tail -n 120 "$log" || true
+          done
+      - name: Upload failure diagnostics (temporary runner only)
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: real-client-diagnostics-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/mzstd-lab/work/.mzstd-private-*/**
+          if-no-files-found: ignore
+          retention-days: 3
       - if: ${{ always() }}
         uses: actions/upload-artifact@v7
         with:
