@@ -31,6 +31,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -275,6 +276,11 @@ class Scenario:
         self.paper_log = LogFile(self.artifacts / "paper.log")
         self.last_active_connections = 0
         self.traffic_source = "unknown"
+        self.console_lock = threading.Lock()
+        self.load_profile = "idle"
+        self.load_stop = None
+        self.load_thread = None
+        self.load_error = None
 
     # -- process bookkeeping -------------------------------------------------
 
@@ -425,13 +431,19 @@ class Scenario:
         raise ScenarioError("Paper did not finish startup:\n" + self.paper_log.tail())
 
     def console(self, command: str, pattern: str, timeout: float = 30.0) -> str | None:
-        """Send one console line and return the first matching output line."""
+        """Send one console line and return the first matching output line.
+
+        Serialised with a lock: the load generator runs on its own thread while the
+        measurement thread also issues console commands, and interleaved writes
+        would make 'the next matching line' ambiguous for both of them.
+        """
         stream = self.processes["paper"].stdin
         require(stream is not None, "Paper console is not writable")
-        since = len(self.paper_log.text())
-        stream.write((command + "\n").encode("utf-8"))
-        stream.flush()
-        return self.paper_log.wait_for(pattern, time.monotonic() + timeout, since=since)
+        with self.console_lock:
+            since = len(self.paper_log.text())
+            stream.write((command + "\n").encode("utf-8"))
+            stream.flush()
+            return self.paper_log.wait_for(pattern, time.monotonic() + timeout, since=since)
 
     def latency_snapshot(self, reset: bool = False) -> dict:
         """Read the plugin's per-stage latency histograms (percentiles over the window).
@@ -794,6 +806,7 @@ class Scenario:
         lag_before = self.paper_log.text().count("Can't keep up")
         wall_started_ms = int(time.time() * 1000)
         started = time.monotonic()
+        self.start_load(clients)
         while time.monotonic() - started < self.duration:
             for client in clients:
                 process = self.processes["client-%d" % client["index"]]
@@ -809,6 +822,7 @@ class Scenario:
                     tree_rss_bytes(process.pid))
             time.sleep(1.0)
         elapsed = time.monotonic() - started
+        self.stop_load()
         wall_finished_ms = int(time.time() * 1000)
         round_trips = self.rtt_samples(clients, wall_started_ms, wall_finished_ms)
         latency = self.latency_snapshot()
@@ -843,6 +857,55 @@ class Scenario:
             "capacity": capacity,
             "states": states,
         }
+
+    def start_load(self, clients: list[dict]) -> None:
+        """Drive a deterministic amount of traffic for the measured interval.
+
+        A frozen world with a motionless client has almost nothing to compress, so
+        the byte metrics stop carrying a signal. The 'drive' profile teleports the
+        client a fixed distance along one axis on a fixed cadence: chunk streaming
+        then happens continuously and reproducibly instead of depending on when the
+        join burst happened to overlap the window.
+        """
+        # 默认 idle：冒烟只做登录/管线验证，不需要额外负载；基准档显式传 drive。
+        self.load_profile = (os.environ.get("MZSTD_LOAD_PROFILE") or "idle").strip().lower()
+        if self.load_profile == "idle":
+            print("[lab] load profile: idle", flush=True)
+            return
+        interval = max(200, env_int("LOAD_STEP_MS", 1000)) / 1000.0
+        blocks = max(1, env_int("LOAD_STEP_BLOCKS", 16))
+        self.load_stop = threading.Event()
+
+        def loop() -> None:
+            while not self.load_stop.wait(interval):
+                for client in clients:
+                    if self.load_stop.is_set():
+                        return
+                    command = ("execute at %s run tp %s ~%d ~ ~ 90 0"
+                               % (client["username"], client["username"], blocks))
+                    try:
+                        line = self.console(command, r"(?i)teleported", timeout=10.0)
+                    except ScenarioError as failure:
+                        self.load_error = failure
+                        return
+                    if line is None:
+                        self.load_error = ScenarioError(
+                            "load step produced no confirmation: " + command)
+                        return
+
+        self.load_thread = threading.Thread(target=loop, name="mikuzstd-load", daemon=True)
+        self.load_thread.start()
+        print("[lab] load profile: drive %d blocks / %d ms" % (blocks, int(interval * 1000)),
+              flush=True)
+
+    def stop_load(self) -> None:
+        if self.load_stop is None:
+            return
+        self.load_stop.set()
+        if self.load_thread is not None:
+            self.load_thread.join(timeout=20)
+        if self.load_error is not None:
+            raise self.load_error
 
     def disconnect_reason(self, client: dict) -> str:
         """Best-effort reason string from the server log, for actionable failures."""
@@ -969,6 +1032,7 @@ class Scenario:
                 "paper_server_sha256": PAPER_SERVER_SHA256,
                 "fabric_api_version": FABRIC_API_VERSION,
                 "warmup_seconds": self.warmup,
+                "load_profile": self.load_profile,
                 "sampling_interval_ms": 250,
                 "interface": os.environ.get("MZSTD_NIC", "lo"),
                 "traffic_source": ("production plugin counters read through /mikuzstd top before "
