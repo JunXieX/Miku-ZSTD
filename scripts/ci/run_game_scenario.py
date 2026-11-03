@@ -44,6 +44,13 @@ FABRIC_API_VERSION = "0.160.0+26.2"
 FABRIC_API_URL = ("https://maven.fabricmc.net/net/fabricmc/fabric-api/fabric-api/"
                   "0.160.0%2B26.2/fabric-api-0.160.0%2B26.2.jar")
 FABRIC_API_SHA1 = "58e82722dee4a78235c4b5c06100ae433973f62e"
+# Paper 服务端与"被测插件"是两件不同的东西：报告里的 paper 摘要指的是插件成品，
+# 服务端本体固定到具体构建号与内容摘要，避免每次跑到不同构建。
+PAPER_SERVER_BUILD = 135
+PAPER_SERVER_URL = ("https://fill-data.papermc.io/v1/objects/"
+                    "ef3dbc68b013deafdbbee3bebf1ba351671ebcda94a8f136809b7532d5ba2fe1/"
+                    "paper-26.2-135.jar")
+PAPER_SERVER_SHA256 = "ef3dbc68b013deafdbbee3bebf1ba351671ebcda94a8f136809b7532d5ba2fe1"
 KRYPTON_PINNED_SHA512 = os.environ.get("MZSTD_KRYPTON_SHA512", "")
 
 
@@ -149,6 +156,10 @@ class LogFile:
             return ""
         return self.path.read_text(encoding="utf-8", errors="replace")
 
+    def find(self, pattern: str) -> bool:
+        compiled = re.compile(pattern)
+        return any(compiled.search(strip_colors(line)) for line in self.text().splitlines())
+
     def wait_for(self, pattern: str, deadline: float, since: int = 0) -> str | None:
         compiled = re.compile(pattern)
         while time.monotonic() < deadline:
@@ -238,6 +249,17 @@ class Scenario:
 
     # -- Paper ---------------------------------------------------------------
 
+    def paper_server_jar(self) -> Path:
+        cache = Path(os.environ.get("MZSTD_MC_CACHE", str(self.artifacts))).resolve()
+        target = cache / ("paper-26.2-%d.jar" % PAPER_SERVER_BUILD)
+        if not (target.is_file() and sha256_file(target) == PAPER_SERVER_SHA256):
+            print("[paper] fetching server build %d" % PAPER_SERVER_BUILD, flush=True)
+            mc_runtime.download(PAPER_SERVER_URL, target, None)
+        digest = sha256_file(target)
+        require(digest == PAPER_SERVER_SHA256,
+                "Paper server JAR does not match the pinned sha256")
+        return target
+
     def prepare_paper(self) -> Path:
         server = self.artifacts / "paper"
         server.mkdir(parents=True, exist_ok=True)
@@ -266,14 +288,15 @@ class Scenario:
         self.spawn("paper",
                    [self.java, "-Xms512M", "-Xmx1536M",
                     "-Dterminal.jline=false", "-Dterminal.ansi=false",
-                    "-jar", str(self.paper_jar), "--nogui"],
+                    "-jar", str(self.paper_server_jar()), "--nogui"],
                    cwd=server, log=self.paper_log.path, stdin=subprocess.PIPE)
         deadline = time.monotonic() + self.startup_timeout
-        line = self.paper_log.wait_for(r"Done \([0-9.]+s\)!", deadline)
-        if line is not None:
-            return
-        require(self.processes["paper"].poll() is None,
-                "Paper exited during startup:\n" + self.paper_log.tail())
+        while time.monotonic() < deadline:
+            if self.paper_log.find(r"Done \([0-9.]+s\)!"):
+                return
+            if self.processes["paper"].poll() is not None:
+                raise ScenarioError("Paper exited during startup:\n" + self.paper_log.tail())
+            time.sleep(0.5)
         raise ScenarioError("Paper did not finish startup:\n" + self.paper_log.tail())
 
     def console(self, command: str, pattern: str, timeout: float = 30.0) -> str | None:
@@ -596,6 +619,9 @@ class Scenario:
             "metrics": {key: value for key, value in measurement.items() if key != "states"},
             "measurement": {
                 "compression_threshold": self.threshold,
+                "paper_server_build": PAPER_SERVER_BUILD,
+                "paper_server_sha256": PAPER_SERVER_SHA256,
+                "fabric_api_version": FABRIC_API_VERSION,
                 "warmup_seconds": self.warmup,
                 "sampling_interval_ms": 250,
                 "interface": os.environ.get("MZSTD_NIC", "lo"),
