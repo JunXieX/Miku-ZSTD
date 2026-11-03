@@ -49,6 +49,127 @@ def require(condition, message):
         raise HarnessError(message)
 
 
+class NoopLifecycleLog:
+    """Disabled logging does not touch files or read the monotonic clock."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+    def emit(self, event, *, round_id=None, variant=None):
+        pass
+
+
+class LifecycleLog:
+    """Allowlisted orchestration phases, never game/mod-load or performance proof.
+
+    Elapsed milliseconds describe this orchestrator, not a measured game interval.
+    No exception, command, path, configuration or driver text enters this stream.
+    """
+
+    EVENTS = frozenset(("orchestration_started", "orchestration_finished",
+                        "orchestration_failed", "orchestration_cancelled",
+                        "lock_acquired", "variant_started", "report_received",
+                        "cleanup_started", "cleanup_finished", "cleanup_failed"))
+    MODES = frozenset(("smoke", "benchmark-pair"))
+    VARIANTS = frozenset(("baseline", "candidate"))
+
+    def __init__(self, path, result_dir, mode):
+        require(type(mode) is str and mode in self.MODES, "invalid lifecycle mode")
+        self.path = Path(path)
+        self.result_dir = Path(result_dir)
+        self.mode = mode
+        self.stream = None
+        self.seq = 0
+        self.elapsed = 0
+
+    def __enter__(self):
+        path = self.path
+        require(path.is_absolute() and path.name == "lifecycle.jsonl",
+                "invalid lifecycle path")
+        # Check lexical ancestors before resolve: resolving first hides symlinks.
+        require(all(not parent.is_symlink() for parent in (path.parent, *path.parent.parents))
+                and not path.is_symlink(), "lifecycle path must not use symlinks")
+        expected = (self.result_dir.parent / "sanitized").resolve(strict=True)
+        require(path.parent.is_dir() and path.parent.resolve(strict=True) == expected,
+                "lifecycle parent must be the existing sanitized directory")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        directory_fd = None
+        fd = None
+        try:
+            # Pin the checked directory on platforms supporting openat. O_EXCL
+            # also rejects existing regular files and dangling symlinks.
+            if os.open in os.supports_dir_fd:
+                directory_fd = os.open(str(path.parent), os.O_RDONLY
+                                       | getattr(os, "O_DIRECTORY", 0)
+                                       | getattr(os, "O_NOFOLLOW", 0))
+                fd = os.open(path.name, flags, 0o600, dir_fd=directory_fd)
+            else:
+                fd = os.open(str(path), flags, 0o600)
+            require(stat.S_ISREG(os.fstat(fd).st_mode), "lifecycle must be a regular file")
+            self.stream = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+            fd = None
+            self.started = time.monotonic()
+            self.emit("orchestration_started")
+        except BaseException:
+            if self.stream is not None:
+                self.stream.close()
+            raise
+        finally:
+            if fd is not None:
+                os.close(fd)
+            if directory_fd is not None:
+                os.close(directory_fd)
+        return self
+
+    def emit(self, event, *, round_id=None, variant=None):
+        # Explicit parameters only: no arbitrary dictionary or **extra payload.
+        require(type(event) is str and event in self.EVENTS, "invalid lifecycle event")
+        require(round_id is None or (type(round_id) is int and round_id > 0),
+                "invalid lifecycle round")
+        require(variant is None or (type(variant) is str and variant in self.VARIANTS),
+                "invalid lifecycle variant")
+        require(self.stream is not None and not self.stream.closed, "lifecycle is not open")
+        elapsed = max(self.elapsed, int(max(0, time.monotonic() - self.started) * 1000))
+        row = {"schema_version": 1, "type": "orchestration_event", "event": event,
+               "seq": self.seq + 1, "monotonic_elapsed_ms": elapsed, "mode": self.mode,
+               "measurement_produced": False}
+        if round_id is not None:
+            row["round_id"] = round_id
+        if variant is not None:
+            row["variant"] = variant
+        self.stream.write(json.dumps(row, allow_nan=False) + "\n")
+        self.stream.flush()
+        self.seq += 1
+        self.elapsed = elapsed
+
+    def __exit__(self, exc_type, exc, traceback):
+        if exc_type is None:
+            event = "orchestration_finished"
+        elif issubclass(exc_type, (Cancelled, KeyboardInterrupt)):
+            event = "orchestration_cancelled"
+        else:
+            event = "orchestration_failed"
+        try:
+            self.emit(event)
+        except Exception:
+            if exc_type is None:
+                raise
+        finally:
+            try:
+                self.stream.close()
+            except Exception:
+                if exc_type is None:
+                    raise
+        return False
+
+
+def lifecycle(path, result_dir, mode):
+    return NoopLifecycleLog() if path is None else LifecycleLog(path, result_dir, mode)
+
+
 def numeric(value, positive=False):
     return (isinstance(value, (int, float)) and not isinstance(value, bool)
             and math.isfinite(value) and (value > 0 if positive else value >= 0))
@@ -220,7 +341,8 @@ def read_report(path, started_ns, expected, clients, duration, benchmark):
     return data
 
 
-def scenario(config, private, mode, variant, round_id, jars, sha, nonce, args):
+def scenario(config, private, mode, variant, round_id, jars, sha, nonce, args, events=None):
+    events = events if events is not None else NoopLifecycleLog()
     session = secrets.token_hex(16)
     folder = private / (str(round_id) + "-" + variant + "-" + session)
     folder.mkdir(mode=0o700)
@@ -245,6 +367,7 @@ def scenario(config, private, mode, variant, round_id, jars, sha, nonce, args):
     started = time.time_ns()
     monotonic_start = time.monotonic()
     try:
+        events.emit("variant_started", round_id=round_id, variant=variant)
         run_process(config["scenario_command"], env, config["work_dir"],
                     folder / "scenario.log", timeout, config["terminate_grace_seconds"])
         require(time.monotonic() - monotonic_start >= args.duration_seconds + args.warmup_seconds,
@@ -252,15 +375,38 @@ def scenario(config, private, mode, variant, round_id, jars, sha, nonce, args):
         data = read_report(report_path, started, {"run_nonce": nonce, "commit_sha": sha,
                            "artifact_sha256": expected_hashes, "session_id": session},
                            args.clients, args.duration_seconds, mode == "benchmark-pair")
+        events.emit("report_received", round_id=round_id, variant=variant)
         for name, (path, digest) in jars.items():
             require(artifact(path)[1] == digest, "JAR changed during scenario")
         return data
     finally:
         # Runs for failed launch, malformed/missing evidence, timeout and INT/TERM.
         # A cleanup failure propagates and prevents summary publication.
-        run_process(config["cleanup_command"], env, config["work_dir"],
-                    folder / "cleanup.log", config["cleanup_timeout_seconds"],
-                    config["terminate_grace_seconds"])
+        active_failure = sys.exc_info()[0] is not None
+        try:
+            try:
+                events.emit("cleanup_started", round_id=round_id, variant=variant)
+            except Exception:
+                if not active_failure:
+                    raise
+        finally:
+            # Logging errors must not prevent the existing cleanup command.
+            try:
+                run_process(config["cleanup_command"], env, config["work_dir"],
+                            folder / "cleanup.log", config["cleanup_timeout_seconds"],
+                            config["terminate_grace_seconds"])
+            except BaseException:
+                try:
+                    events.emit("cleanup_failed", round_id=round_id, variant=variant)
+                except Exception:
+                    pass  # Preserve the original cleanup failure.
+                raise
+            else:
+                try:
+                    events.emit("cleanup_finished", round_id=round_id, variant=variant)
+                except Exception:
+                    if not active_failure:
+                        raise
 
 
 def summarize(args, rounds, nonce):
@@ -282,6 +428,11 @@ def summarize(args, rounds, nonce):
 
 
 def execute(args):
+    with lifecycle(getattr(args, "event_log", None), args.result_dir, args.mode) as events:
+        return _execute(args, events)
+
+
+def _execute(args, events):
     config = load_config(args.config, args.result_dir)
     variants = ("baseline", "candidate") if args.mode == "benchmark-pair" else ("candidate",)
     builds = {}
@@ -298,6 +449,7 @@ def execute(args):
     require(isinstance(nonce, str) and bool(nonce.strip()), "run nonce is empty")
     result_dir = Path(args.result_dir).resolve()
     with work_lock(config["work_dir"]), cancellation_signals():
+        events.emit("lock_acquired")
         result_dir.mkdir(parents=True, exist_ok=True)
         require(all(p.name == "summary.json" and not p.is_dir()
                     for p in result_dir.iterdir()), "result_dir must contain only summary.json")
@@ -314,7 +466,7 @@ def execute(args):
             for variant in order:
                 jars, sha = builds[variant]
                 data = scenario(config, private, args.mode, variant, round_id,
-                                jars, sha, nonce, args)
+                                jars, sha, nonce, args, events=events)
                 # Flat metric aliases retain compatibility with the current
                 # workflow validator, without dropping the original report.
                 entry = copy.deepcopy(data)
@@ -376,6 +528,8 @@ def parser():
         sub = modes.add_parser(mode)
         sub.add_argument("--config", required=True)
         sub.add_argument("--result-dir", required=True)
+        sub.add_argument("--event-log",
+                         help="new sanitized lifecycle.jsonl; orchestration only, not game/mod-load proof")
         sub.add_argument("--frp-compression", choices=("true",), required=True)
         sub.add_argument("--clients", type=positive_int, default=1 if mode == "smoke" else None,
                          required=mode == "benchmark-pair")
