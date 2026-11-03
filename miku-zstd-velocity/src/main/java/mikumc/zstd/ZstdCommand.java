@@ -101,6 +101,7 @@ public final class ZstdCommand {
         source.sendMessage(Component.text("  压缩等级：" + cfg.level + "  窗口指数：" + cfg.windowLog
                 + "  在线玩家：" + proxy.getPlayerCount(), NamedTextColor.GRAY));
         source.sendMessage(Component.text("  线程池：" + ZstdCompressPool.summary(), NamedTextColor.GRAY));
+        source.sendMessage(Component.text("  分段耗时：" + ZstdCompressPool.latencyLine(), NamedTextColor.GRAY));
         if (ZstdCompressPool.backlogged()) {
             source.sendMessage(Component.text(
                     "  队列积压：压缩跟不上流量，请优先降低压缩等级，其次增加线程数",

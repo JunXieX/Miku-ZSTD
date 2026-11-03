@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -104,6 +105,15 @@ def wait_port(host: str, port: int, deadline: float, label: str) -> None:
             return
         time.sleep(0.2)
     raise ScenarioError(label + " did not listen on port %d" % port)
+
+
+def percentile(samples: list[float], quantile: float) -> float:
+    """Nearest-rank 分位点；空样本返回 0。"""
+    if not samples:
+        return 0.0
+    ordered = sorted(samples)
+    rank = max(1, math.ceil(quantile * len(ordered)))
+    return ordered[min(rank, len(ordered)) - 1]
 
 
 def strip_colors(line: str) -> str:
@@ -315,6 +325,26 @@ class Scenario:
         stream.flush()
         return self.paper_log.wait_for(pattern, time.monotonic() + timeout, since=since)
 
+    def latency_snapshot(self, reset: bool = False) -> dict:
+        """Read the plugin's per-stage latency histograms (percentiles over the window).
+
+        The histograms are cumulative, so the driver clears them once before the
+        measured interval: otherwise the report would silently mix startup traffic
+        with the steady-state window.
+        """
+        since = len(self.paper_log.text())
+        stream = self.processes["paper"].stdin
+        require(stream is not None, "Paper console is not writable")
+        command = "mikuzstd latency reset" if reset else "mikuzstd latency"
+        stream.write((command + "\n").encode("utf-8"))
+        stream.flush()
+        line = self.paper_log.wait_for(r"lat: queue_p50=", time.monotonic() + 30.0, since=since)
+        require(line is not None, "plugin did not report latency histograms")
+        fields = {}
+        for key, value in re.findall(r"([a-z0-9_]+)=([0-9.]+)", line):
+            fields[key] = float(value)
+        return fields
+
     def traffic_snapshot(self) -> tuple[int, int]:
         """Read the production plugin's cumulative (raw, wire) totals."""
         since = len(self.paper_log.text())
@@ -399,8 +429,9 @@ class Scenario:
             digest = hashlib.sha512(krypton.read_bytes()).hexdigest()
             require(digest == KRYPTON_PINNED_SHA512, "Krypton JAR does not match the pinned sha512")
         mods.append(krypton)
-        testmod = build_testmod.build(runtime["classpath"],
-                                      self.artifacts / "testmod" / "Miku-ZSTD-CI-Observer.jar")
+        testmod = build_testmod.build(
+            runtime["classpath"], self.artifacts / "testmod" / "Miku-ZSTD-CI-Observer.jar",
+            extra_classpath=build_testmod.fabric_api_module_jars(fabric_api))
         mods.append(testmod)
         return mods
 
@@ -427,6 +458,11 @@ class Scenario:
                     "-Dfabric.addMods=" + os.pathsep.join(str(path) for path in mods),
                     "-Dmiku.zstd.ci.evidence=" + str(evidence),
                     "-Dmiku.zstd.ci.interval-ms=250",
+                    # 服务端的聊天/命令节流按"每条约 +20、每 tick −1"计，
+                    # 持续速率超过约 1 条/秒就会在十几秒内被判 Kicked for spamming。
+                    # 0.5 条/秒既留足余量，又能在 60 秒窗口里拿到约 30 个真实往返样本。
+                    "-Dmiku.zstd.ci.rtt=true",
+                    "-Dmiku.zstd.ci.rtt-interval-ms=2000",
                     "-Dfile.encoding=UTF-8"]
         program_args = mc_runtime.build_game_args(runtime, game_dir, username,
                                                  server_address=address, width=1280, height=720)
@@ -508,6 +544,33 @@ class Scenario:
             state["play_ms"] = max(state["play_ms"], record.get("play_ms", 0))
         return state
 
+    def rtt_samples(self, clients: list[dict], wall_from_ms: int, wall_to_ms: int) -> list[float]:
+        """Client-measured round trips that completed inside the measured window.
+
+        The client stamps each sample with wall-clock milliseconds as well as its
+        own monotonic clock, so the driver can scope samples to the measurement
+        window without relying on shared clock origins.
+        """
+        samples = []
+        for client in clients:
+            evidence = client["evidence"]
+            if not evidence.is_file():
+                continue
+            for line in evidence.read_text(encoding="utf-8", errors="replace").splitlines():
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if record.get("type") != "rtt":
+                    continue
+                wall = record.get("wall_ms")
+                nanos = record.get("rtt_ns")
+                if not isinstance(wall, int) or not isinstance(nanos, (int, float)):
+                    continue
+                if wall_from_ms <= wall <= wall_to_ms:
+                    samples.append(float(nanos) / 1_000_000.0)
+        return samples
+
     def boot_record(self, client: dict) -> dict:
         evidence = client["evidence"]
         require(evidence.is_file(), "client evidence file is missing")
@@ -543,20 +606,29 @@ class Scenario:
     def measure(self, clients: list[dict]) -> dict:
         interface = os.environ.get("MZSTD_NIC", "lo")
         paper_pid = self.processes["paper"].pid
+        # 先清零分段直方图，再开始计时：这样分位点覆盖的就是本次测量窗口。
+        self.latency_snapshot(reset=True)
         raw_before, wire_before = self.traffic_snapshot()
         rx_before, tx_before = read_netdev(interface)
         cpu_before = read_cpu_seconds(paper_pid)
         observer_before = sum(self.play_state(client)["inbound_bytes"] for client in clients)
+        wall_started_ms = int(time.time() * 1000)
         started = time.monotonic()
         while time.monotonic() - started < self.duration:
             for client in clients:
                 process = self.processes["client-%d" % client["index"]]
                 require(process.poll() is None,
                         "client %d exited during the measured interval" % client["index"])
-                require((client["username"] + " lost connection") not in self.paper_log.text(),
-                        "client %d disconnected during the measured interval" % client["index"])
+                lost = re.search(re.escape(client["username"]) + r" lost connection: (.+)",
+                                 self.paper_log.text())
+                if lost is not None:
+                    raise ScenarioError("client %d was disconnected during the measured interval: %s"
+                                        % (client["index"], lost.group(1).strip()))
             time.sleep(1.0)
         elapsed = time.monotonic() - started
+        wall_finished_ms = int(time.time() * 1000)
+        round_trips = self.rtt_samples(clients, wall_started_ms, wall_finished_ms)
+        latency = self.latency_snapshot()
         raw_after, wire_after = self.traffic_snapshot()
         rx_after, tx_after = read_netdev(interface)
         cpu_after = read_cpu_seconds(paper_pid)
@@ -570,6 +642,17 @@ class Scenario:
             "nic_tx_bytes": max(0, tx_after - tx_before),
             "server_cpu_seconds": round(max(0.0, cpu_after - cpu_before), 3),
             "server_rss_bytes": read_peak_rss(paper_pid),
+            "pool_queue_wait_p99_ms": round(latency.get("queue_p99", 0.0), 3),
+            "pool_service_p99_ms": round(latency.get("service_p99", 0.0), 3),
+            "event_loop_wait_p99_ms": round(latency.get("eventloop_p99", 0.0), 3),
+            "write_p99_ms": round(latency.get("write_p99", 0.0), 3),
+            "latency_sample_count": int(latency.get("samples", 0.0)),
+            "rtt_sample_count": len(round_trips),
+            "rtt_p50_ms": round(percentile(round_trips, 0.50), 3),
+            "rtt_p95_ms": round(percentile(round_trips, 0.95), 3),
+            "rtt_p99_ms": round(percentile(round_trips, 0.99), 3),
+            "rtt_p999_ms": round(percentile(round_trips, 0.999), 3),
+            "rtt_samples_ms": [round(value, 3) for value in round_trips[:2000]],
             "observed_client_inbound_bytes": max(0, observer_after - observer_before),
             "states": states,
         }
@@ -625,7 +708,9 @@ class Scenario:
             "frp": {"use_compression": True,
                     "entry_port": self.ports["frp_remote"],
                     "entry": "127.0.0.1:%d" % self.ports["frp_remote"]},
-            "metrics": {key: value for key, value in measurement.items() if key != "states"},
+            "metrics": {key: value for key, value in measurement.items()
+                        if key not in ("states", "rtt_samples_ms")},
+            "samples": {"rtt_ms": measurement.get("rtt_samples_ms", [])},
             "measurement": {
                 "minecraft_version": DEFAULT_VERSION,
                 "loader_version": DEFAULT_LOADER,
@@ -639,6 +724,24 @@ class Scenario:
                 "traffic_source": ("production plugin counters read through /mikuzstd top before "
                                    "and after the window; delta only"),
                 "traffic_granularity_bytes": 50000,
+                "rtt_source": ("game client sends /mikuzstd ping <token> on its own monotonic clock "
+                               "and stops the timer when the pong system chat arrives; this includes "
+                               "server command handling, not raw TCP RTT"),
+                "rtt_floor": ("the server executes commands on a 20 tick/s loop and the client handles "
+                              "the reply on its render thread, so the floor is one server tick plus one "
+                              "client frame; compare variants under the same settings only"),
+                "wire_vs_client_bytes": {
+                    "plugin_wire_bytes": measurement.get("compressed_wire_bytes", 0),
+                    "client_inbound_bytes": measurement.get("observed_client_inbound_bytes", 0),
+                },
+                "latency_scope": ("plugin histograms cleared once before the measured interval, "
+                                  "so percentiles describe this window only"),
+                "latency_stage_semantics": {
+                    "queue": "batch submitted -> worker thread started",
+                    "service": "worker compression itself",
+                    "eventloop": "worker finished -> event-loop callback ran",
+                    "write": "first frame write -> all real write promises resolved",
+                },
                 "rss_statistic": "peak VmHWM of the Paper JVM process",
                 "client_inbound_bytes_source": ("CI observation mod Netty inbound counter; "
                                                 "reported separately from plugin counters"),
