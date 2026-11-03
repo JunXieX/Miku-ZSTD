@@ -71,6 +71,8 @@ class RealClientResultTest(unittest.TestCase):
             "duration_seconds": 5,
             "rtt_sample_count": 10,
             "clients": RealClientResultTest.client(2)["clients"],
+            "client_runtime": "minecraft_client",
+            "client": RealClientResultTest.client(2),
         }
         result.update({
             "rtt_p50_ms": 10,
@@ -252,6 +254,25 @@ class RealClientResultTest(unittest.TestCase):
                              expected_nonce="current-invocation")
         self.assertEqual(clean["metrics"]["duration_seconds"], 20)
         self.assertEqual(len(clean["paired_rounds"]), 2)
+
+    def test_every_variant_requires_runtime_and_all_mod_flags(self):
+        for variant in ("baseline", "candidate"):
+            for field in ("actual_minecraft_client", "fabric_loaded", "krypton_loaded",
+                          "miku_zstd_loaded", "login_success"):
+                with self.subTest(variant=variant, field=field):
+                    data = self.pair()
+                    data["paired_rounds"][0][variant]["client"][field] = False
+                    self.write(data)
+                    with self.assertRaises(ValueError):
+                        self.call_validate("benchmark-pair", 2)
+
+    def test_every_variant_rejects_missing_runtime_evidence(self):
+        for field in ("client", "client_runtime"):
+            data = self.pair()
+            del data["paired_rounds"][0]["baseline"][field]
+            self.write(data)
+            with self.assertRaises(ValueError):
+                self.call_validate("benchmark-pair", 2)
 
 
 if __name__ == "__main__":

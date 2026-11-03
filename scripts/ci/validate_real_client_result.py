@@ -61,6 +61,19 @@ def check_clients(rows, count, duration):
     return clean
 
 
+def check_runtime(data, count, duration):
+    require(data.get("client_runtime") == "minecraft_client", "client_runtime must identify the real Minecraft client")
+    client = data.get("client", {})
+    require(isinstance(client, dict), "client evidence must be an object")
+    require(client.get("actual_minecraft_client") is True, "result does not certify actual Minecraft client processes")
+    require(all(client.get(flag) is True for flag in FLAGS), "client Fabric/Krypton/Miku/login evidence missing")
+    rows = data.get("clients", client.get("clients"))
+    clean = check_clients(rows, count, duration)
+    if "clients" in data and "clients" in client:
+        require(data["clients"] == client["clients"], "root and nested client evidence disagree")
+    return clean
+
+
 def check_metrics(metrics, minimum, benchmark, label):
     require(isinstance(metrics, dict), f"{label} must be an object")
     for key in COMMON + (BENCH if benchmark else ()):
@@ -96,17 +109,9 @@ def validate(mode, path, expected_clients, expected_sha, expected_baseline_sha, 
     if expected_nonce is not None:
         require(data.get("run_nonce") == expected_nonce, "result run_nonce differs from this invocation")
     require(data.get("frp", {}).get("use_compression") is True, "FRP transport.useCompression was not confirmed")
-    require(data.get("client_runtime") == "minecraft_client", "client_runtime must identify the real Minecraft client")
-    client = data.get("client", {})
-    require(isinstance(client, dict), "client evidence must be an object")
-    require(client.get("actual_minecraft_client") is True, "result does not certify actual Minecraft client processes")
-    require(all(client.get(flag) is True for flag in FLAGS), "client Fabric/Krypton/Miku/login evidence missing")
     interval = min_duration / (2 * required_rounds) if pair else min_duration
-    root_rows = data.get("clients", client.get("clients"))
-    if "clients" in data and "clients" in client:
-        require(data["clients"] == client["clients"], "root and nested client evidence disagree")
     metrics = check_metrics(data.get("metrics", {}), min_duration, benchmark, "metrics")
-    clean_clients = check_clients(root_rows, expected_clients, interval if pair else metrics["duration_seconds"])
+    clean_clients = check_runtime(data, expected_clients, interval if pair else metrics["duration_seconds"])
     clean = {"schema_version": 1, "test_type": mode, "status": "passed", "commit_sha": expected_sha,
              "client_runtime": "minecraft_client", "frp": {"use_compression": True}, "client": {**{flag: True for flag in FLAGS}, "clients": clean_clients},
              "metrics": metrics}
@@ -139,10 +144,11 @@ def validate(mode, path, expected_clients, expected_sha, expected_baseline_sha, 
                 if expected_nonce is not None:
                     require(vm.get("run_nonce") == expected_nonce, f"{variant} run_nonce mismatch")
                 cm = check_metrics(vm, interval, True, variant)
-                cc = check_clients(vm.get("clients"), expected_clients, cm["duration_seconds"])
+                cc = check_runtime(vm, expected_clients, cm["duration_seconds"])
                 total_duration += cm["duration_seconds"]
                 out[variant] = {**cm, "commit_sha": sha, "actual_clients": expected_clients,
-                                "frp_use_compression": True, "clients": cc}
+                                "frp_use_compression": True, "clients": cc, "client_runtime": "minecraft_client",
+                                "client": {**{flag: True for flag in FLAGS}, "clients": cc}}
                 if expected_nonce is not None:
                     out[variant]["run_nonce"] = expected_nonce
                 if expected_hashes:
