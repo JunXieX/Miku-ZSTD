@@ -69,6 +69,8 @@ Build 里的 Python 协议客户端只验证 Paper/Velocity 的线协议状态�
 - **raw / wire**：取插件 `/mikuzstd top` 在测量窗口前后的累计值差值。该输出是十进制格式化文本（`1.2 MB`），分辨率约 0.05 MB，**不是逐字节精确**；基准档需要阶段采样，见 [DEVELOPMENT.md](../DEVELOPMENT.md) 的优化候选。
 - **observed_client_inbound_bytes**：CI 观测模组在 Netty 入站管线最前端挂了只读计数器，按字节累计服务端→客户端方向，不 retain/release、不改写消息。它与插件计数互为交叉校验，不混入报告的基础指标。
 - **NIC**：游戏流量全程走 127.0.0.1（客户端 ↔ frps ↔ frpc ↔ Paper），因此默认统计 `lo`；接入真实网卡时用 `NIC` 指定。
+- **分段耗时（pool_queue_wait / event_loop_wait 等）**：来自插件 `/mikuzstd latency` 的四段直方图——排队（提交→worker 开始）、执行（worker 压缩本身）、回调（worker 结束→event loop 回调执行）、写出（首帧写出→全部真实 write promise 完成）。驱动在测量窗口开始前先 `/mikuzstd latency reset`，所以分位点只覆盖本次窗口；桶宽约为下界的 12.5%，分位点取桶上界（只会偏保守）。
+- **RTT**：游戏客户端自己发 `/mikuzstd ping <token>`，服务端只回一行 `pong <token>`，客户端用自己的单调时钟结算。它包含服务端命令处理时间，**不是** TCP 往返，也不是玩家列表里服务端算出的延迟；样本带 wall 毫秒戳，驱动按测量窗口筛选后用最近秩法取分位。
 - **CPU / RSS**：Paper 进程 `utime+stime` 窗口差值，与进程 `VmHWM` 峰值；不含客户端与 FRP 的开销。
 - **active_seconds**：观测模组单调时钟累计的 PLAY 时长；期间采样间隔 250 ms。
 - 缺 PLAY、缺 zstd 激活（客户端未打印下行接管日志）、加载的 Miku-ZSTD 摘要与被测成品不一致、窗口内进程退出或掉线，一律判失败，不补零、不缩窗口、不改人数。

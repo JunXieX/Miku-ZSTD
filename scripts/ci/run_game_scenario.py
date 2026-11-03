@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -104,6 +105,15 @@ def wait_port(host: str, port: int, deadline: float, label: str) -> None:
             return
         time.sleep(0.2)
     raise ScenarioError(label + " did not listen on port %d" % port)
+
+
+def percentile(samples: list[float], quantile: float) -> float:
+    """Nearest-rank 分位点；空样本返回 0。"""
+    if not samples:
+        return 0.0
+    ordered = sorted(samples)
+    rank = max(1, math.ceil(quantile * len(ordered)))
+    return ordered[min(rank, len(ordered)) - 1]
 
 
 def strip_colors(line: str) -> str:
@@ -419,8 +429,9 @@ class Scenario:
             digest = hashlib.sha512(krypton.read_bytes()).hexdigest()
             require(digest == KRYPTON_PINNED_SHA512, "Krypton JAR does not match the pinned sha512")
         mods.append(krypton)
-        testmod = build_testmod.build(runtime["classpath"],
-                                      self.artifacts / "testmod" / "Miku-ZSTD-CI-Observer.jar")
+        testmod = build_testmod.build(
+            runtime["classpath"], self.artifacts / "testmod" / "Miku-ZSTD-CI-Observer.jar",
+            extra_classpath=build_testmod.fabric_api_module_jars(fabric_api))
         mods.append(testmod)
         return mods
 
@@ -447,6 +458,8 @@ class Scenario:
                     "-Dfabric.addMods=" + os.pathsep.join(str(path) for path in mods),
                     "-Dmiku.zstd.ci.evidence=" + str(evidence),
                     "-Dmiku.zstd.ci.interval-ms=250",
+                    "-Dmiku.zstd.ci.rtt=true",
+                    "-Dmiku.zstd.ci.rtt-interval-ms=500",
                     "-Dfile.encoding=UTF-8"]
         program_args = mc_runtime.build_game_args(runtime, game_dir, username,
                                                  server_address=address, width=1280, height=720)
@@ -528,6 +541,33 @@ class Scenario:
             state["play_ms"] = max(state["play_ms"], record.get("play_ms", 0))
         return state
 
+    def rtt_samples(self, clients: list[dict], wall_from_ms: int, wall_to_ms: int) -> list[float]:
+        """Client-measured round trips that completed inside the measured window.
+
+        The client stamps each sample with wall-clock milliseconds as well as its
+        own monotonic clock, so the driver can scope samples to the measurement
+        window without relying on shared clock origins.
+        """
+        samples = []
+        for client in clients:
+            evidence = client["evidence"]
+            if not evidence.is_file():
+                continue
+            for line in evidence.read_text(encoding="utf-8", errors="replace").splitlines():
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if record.get("type") != "rtt":
+                    continue
+                wall = record.get("wall_ms")
+                nanos = record.get("rtt_ns")
+                if not isinstance(wall, int) or not isinstance(nanos, (int, float)):
+                    continue
+                if wall_from_ms <= wall <= wall_to_ms:
+                    samples.append(float(nanos) / 1_000_000.0)
+        return samples
+
     def boot_record(self, client: dict) -> dict:
         evidence = client["evidence"]
         require(evidence.is_file(), "client evidence file is missing")
@@ -569,6 +609,7 @@ class Scenario:
         rx_before, tx_before = read_netdev(interface)
         cpu_before = read_cpu_seconds(paper_pid)
         observer_before = sum(self.play_state(client)["inbound_bytes"] for client in clients)
+        wall_started_ms = int(time.time() * 1000)
         started = time.monotonic()
         while time.monotonic() - started < self.duration:
             for client in clients:
@@ -579,6 +620,8 @@ class Scenario:
                         "client %d disconnected during the measured interval" % client["index"])
             time.sleep(1.0)
         elapsed = time.monotonic() - started
+        wall_finished_ms = int(time.time() * 1000)
+        round_trips = self.rtt_samples(clients, wall_started_ms, wall_finished_ms)
         latency = self.latency_snapshot()
         raw_after, wire_after = self.traffic_snapshot()
         rx_after, tx_after = read_netdev(interface)
@@ -598,6 +641,11 @@ class Scenario:
             "event_loop_wait_p99_ms": round(latency.get("eventloop_p99", 0.0), 3),
             "write_p99_ms": round(latency.get("write_p99", 0.0), 3),
             "latency_sample_count": int(latency.get("samples", 0.0)),
+            "rtt_sample_count": len(round_trips),
+            "rtt_p50_ms": round(percentile(round_trips, 0.50), 3),
+            "rtt_p95_ms": round(percentile(round_trips, 0.95), 3),
+            "rtt_p99_ms": round(percentile(round_trips, 0.99), 3),
+            "rtt_p999_ms": round(percentile(round_trips, 0.999), 3),
             "observed_client_inbound_bytes": max(0, observer_after - observer_before),
             "states": states,
         }
@@ -667,6 +715,9 @@ class Scenario:
                 "traffic_source": ("production plugin counters read through /mikuzstd top before "
                                    "and after the window; delta only"),
                 "traffic_granularity_bytes": 50000,
+                "rtt_source": ("game client sends /mikuzstd ping <token> on its own monotonic clock "
+                               "and stops the timer when the pong system chat arrives; this includes "
+                               "server command handling, not raw TCP RTT"),
                 "latency_scope": ("plugin histograms cleared once before the measured interval, "
                                   "so percentiles describe this window only"),
                 "latency_stage_semantics": {

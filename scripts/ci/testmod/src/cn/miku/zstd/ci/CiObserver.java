@@ -10,6 +10,9 @@ import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 
 import io.netty.buffer.ByteBuf;
@@ -18,6 +21,7 @@ import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 
 import net.fabricmc.api.ClientModInitializer;
+import net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents;
 import net.fabricmc.loader.api.FabricLoader;
 import net.fabricmc.loader.api.ModContainer;
 import net.fabricmc.loader.api.metadata.ModOrigin;
@@ -48,6 +52,12 @@ public final class CiObserver implements ClientModInitializer {
     private static final String EVIDENCE_PROPERTY = "miku.zstd.ci.evidence";
     /** 采样间隔毫秒。 */
     private static final String INTERVAL_PROPERTY = "miku.zstd.ci.interval-ms";
+    /** 是否启用应用层往返采样。 */
+    private static final String RTT_PROPERTY = "miku.zstd.ci.rtt";
+    /** 往返采样间隔毫秒（默认 500ms，即每秒两次真实往返）。 */
+    private static final String RTT_INTERVAL_PROPERTY = "miku.zstd.ci.rtt-interval-ms";
+    /** 服务端回包里的固定标记：{@code pong <token>}。 */
+    private static final String PONG_MARKER = "pong ";
     /** 管线内计数器名。 */
     private static final String COUNTER_NAME = "miku_zstd_ci_inbound";
     /** 需要记录来源路径的重点模组（其余模组只记 id/版本）。 */
@@ -59,6 +69,12 @@ public final class CiObserver implements ClientModInitializer {
     private volatile BufferedWriter writer;
     private volatile Channel countedChannel;
     private volatile Field channelField;
+    /** 往返采样：token → 发出时刻（nanoTime）。 */
+    private final Map<String, Long> pendingPings = new ConcurrentHashMap<>();
+    private final AtomicLong pingSeq = new AtomicLong();
+    private boolean rttEnabled;
+    private long rttIntervalNanos = 500_000_000L;
+    private long lastPingNanos;
     private long playStartedNanos = -1L;
     private long lastPlayingNanos = -1L;
     private long playNanos = 0L;
@@ -79,6 +95,12 @@ public final class CiObserver implements ClientModInitializer {
         } catch (Throwable unavailable) {
             // 观测失败绝不能拖垮被测客户端: 记录一行最小信息后继续。
             write("{\"type\":\"boot_error\",\"error\":\"" + escape(String.valueOf(unavailable)) + "\"}");
+        }
+        if (Boolean.parseBoolean(System.getProperty(RTT_PROPERTY, "false"))) {
+            rttEnabled = true;
+            rttIntervalNanos = Long.getLong(RTT_INTERVAL_PROPERTY, 500L) * 1_000_000L;
+            // 服务端的 ping 回包是 system chat：走 GAME 事件，与玩家聊天区分开。
+            ClientReceiveMessageEvents.GAME.register((message, overlay) -> onGameMessage(message.getString()));
         }
         Runtime.getRuntime().addShutdownHook(new Thread(this::writeFinal, "miku-zstd-ci-final"));
         Thread sampler = new Thread(this::sampleLoop, "miku-zstd-ci-sampler");
@@ -178,6 +200,9 @@ public final class CiObserver implements ClientModInitializer {
             playNanos += Math.max(0L, now - lastPlayingNanos);
             lastPlayingNanos = -1L;
         }
+        if (rttEnabled && playing) {
+            maybeSendPing(client, now);
+        }
         int ticks = playing ? client.player.tickCount : -1;
         double x = playing ? client.player.getX() : Double.NaN;
         double y = playing ? client.player.getY() : Double.NaN;
@@ -204,6 +229,54 @@ public final class CiObserver implements ClientModInitializer {
         }
         json.append('}');
         return json.toString();
+    }
+
+    /**
+     * 发一次 {@code /mikuzstd ping <token>}：服务端只回一行 {@code pong <token>}，
+     * 因此客户端量到的就是"命令包出去 → 回包回来"的真实往返。
+     *
+     * <p>发出的时刻在<b>提交到客户端线程之前</b>取，回家后在 GAME 事件里相减；
+     * 这一段包含服务端的命令处理时间，属于应用层往返，不等同于 TCP RTT。</p>
+     */
+    private void maybeSendPing(Minecraft client, long now) {
+        if (now - lastPingNanos < rttIntervalNanos) {
+            return;
+        }
+        lastPingNanos = now;
+        String token = "p" + Long.toHexString(pingSeq.incrementAndGet());
+        pendingPings.put(token, now);
+        if (pendingPings.size() > 64) {
+            pendingPings.clear(); // 回包丢失时不无限增长；只影响这一小段样本
+        }
+        client.execute(() -> {
+            try {
+                ClientPacketListener listener = client.getConnection();
+                if (listener != null) {
+                    listener.sendCommand("mikuzstd ping " + token);
+                }
+            } catch (Throwable ignored) {
+                // 命令发送失败只丢一个样本。
+            }
+        });
+    }
+
+    /** 收到 system chat：匹配上的 token 才算一次往返样本。 */
+    private void onGameMessage(String text) {
+        int marker = text.indexOf(PONG_MARKER);
+        if (marker < 0) {
+            return;
+        }
+        String token = text.substring(marker + PONG_MARKER.length()).trim();
+        Long sentNanos = pendingPings.remove(token);
+        if (sentNanos == null) {
+            return;
+        }
+        long rttNanos = System.nanoTime() - sentNanos;
+        write("{\"type\":\"rtt\""
+                + ",\"mono_ms\":" + elapsedMillis()
+                + ",\"wall_ms\":" + System.currentTimeMillis()
+                + ",\"rtt_ns\":" + rttNanos
+                + ",\"token\":\"" + escape(token) + "\"}");
     }
 
     private void writeFinal() {
