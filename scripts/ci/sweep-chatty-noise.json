@@ -1,0 +1,32 @@
+[
+  {
+    "label": "noise-a",
+    "config": {
+      "compression.level": 3,
+      "compression.window_log": 20,
+      "compression.threads": 0,
+      "compression.batch_max_packets": 256,
+      "compression.batch_window_ms": 50
+    }
+  },
+  {
+    "label": "noise-b",
+    "config": {
+      "compression.level": 3,
+      "compression.window_log": 20,
+      "compression.threads": 0,
+      "compression.batch_max_packets": 256,
+      "compression.batch_window_ms": 50
+    }
+  },
+  {
+    "label": "noise-c",
+    "config": {
+      "compression.level": 3,
+      "compression.window_log": 20,
+      "compression.threads": 0,
+      "compression.batch_max_packets": 256,
+      "compression.batch_window_ms": 50
+    }
+  }
+]

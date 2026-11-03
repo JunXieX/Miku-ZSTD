@@ -278,6 +278,7 @@ class Scenario:
         self.traffic_source = "unknown"
         self.console_lock = threading.Lock()
         self.load_profile = "idle"
+        self.load_expected_packets = 0
         self.plugin_config = {}
         self.run_label = os.environ.get("MZSTD_RUN_LABEL", "")
         self.load_stop = None
@@ -922,6 +923,11 @@ class Scenario:
 
         if self.load_profile == "chatty":
             interval = max(5, env_int("LOAD_CHAT_MS", 50)) / 1000.0
+            # 固定长度：实测发现不定长的 chat 小包会让各次运行的 raw 相差 28%，
+            # 那样测出来的"差异"其实是负载量差异。补齐到固定字节数后 raw 才可比。
+            pad = max(0, env_int("LOAD_CHAT_BYTES", 380))
+            padding = "x" * pad
+            self.load_expected_packets = int(self.duration / interval) * len(clients)
 
             def chat_loop() -> None:
                 seq = 0
@@ -932,15 +938,16 @@ class Scenario:
                         seq += 1
                         try:
                             # 不等待回显：20 条/秒逐条等确认会把节奏限制在日志轮询上。
-                            self.write_console('tellraw %s {"text":"mz %d"}'
-                                               % (client["username"], seq))
+                            self.write_console('tellraw %s {"text":"mz %d %s"}'
+                                               % (client["username"], seq, padding))
                         except (ScenarioError, OSError) as failure:
                             self.load_error = failure
                             return
 
             self.load_thread = threading.Thread(target=chat_loop, name="mikuzstd-load", daemon=True)
             self.load_thread.start()
-            print("[lab] load profile: chatty 1 packet / %d ms" % int(interval * 1000), flush=True)
+            print("[lab] load profile: chatty 1 packet / %d ms, %d byte payload, ~%d packets expected"
+                  % (int(interval * 1000), pad + 8, self.load_expected_packets), flush=True)
             return
 
         interval = max(200, env_int("LOAD_STEP_MS", 1000)) / 1000.0
@@ -1103,6 +1110,7 @@ class Scenario:
                 "fabric_api_version": FABRIC_API_VERSION,
                 "warmup_seconds": self.warmup,
                 "load_profile": self.load_profile,
+                "load_expected_packets": self.load_expected_packets,
                 "run_label": self.run_label,
                 "plugin_config": self.plugin_config,
                 "sampling_interval_ms": 250,
