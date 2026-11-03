@@ -22,6 +22,17 @@ REQUIRED_EXECUTABLES = ("xvfb-run", "java", "python3", "frps", "frpc")
 MIN_FREE_DISK_BYTES = 6 * 1024 ** 3
 
 
+def memory_bytes() -> int:
+    """MemTotal from /proc, so a later capacity verdict can be checked against it."""
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return 0
+
+
 def java_major(java: str) -> int | None:
     try:
         completed = subprocess.run([java, "-version"], capture_output=True, text=True)
@@ -60,6 +71,7 @@ def collect() -> tuple[dict, list[str]]:
         "executables": executables,
         "free_disk_bytes": free,
         "cpu_count": os.cpu_count(),
+        "memory_bytes": memory_bytes(),
         "environment": "github-hosted",
         "problems": problems,
     }

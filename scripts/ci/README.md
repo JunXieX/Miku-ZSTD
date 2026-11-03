@@ -15,7 +15,8 @@ Build 里的 Python 协议客户端只验证 Paper/Velocity 的线协议状态�
 
 ## 托管冒烟怎么跑
 
-1. Actions → Real Client (Hosted) → Run workflow。可选输入：`duration_seconds`（30–600，默认 120）、`compression_threshold`（默认 256）。
+1. Actions → Real Client (Hosted) → Run workflow。可选输入：`duration_seconds`（30–600，默认 120）、`compression_threshold`（默认 256）、`clients`（同一服务器上的真实客户端数，默认 1）。
+   并发组按 `clients` 区分，所以 1/2/5 三次调度可以并行跑在不同 runner 上，互不排队。
 2. 工作流自己完成：构建本提交的 Fabric/Paper 成品 → 拉取固定版本 Krypton（sha512 校验）与 FRP（sha256 校验）→ 准备客户端运行时（首次下载约 600 MB，之后命中 Actions 缓存）→ 跑公共编排器与校验器。
 3. 产物只有三个白名单文件：`sanitized/summary.json`、`sanitized/runner-preflight.json`、`sanitized/lifecycle.jsonl`。其中 summary 额外带一个受限的原始样本块 `samples.rtt_ms`（纯数值、条数与 `rtt_sample_count` 一致、最多 5000 条），用于事后重算分位点。
 
@@ -76,6 +77,32 @@ Build 里的 Python 协议客户端只验证 Paper/Velocity 的线协议状态�
 - **CPU / RSS**：Paper 进程 `utime+stime` 窗口差值，与进程 `VmHWM` 峰值；不含客户端与 FRP 的开销。
 - **active_seconds**：观测模组单调时钟累计的 PLAY 时长；期间采样间隔 250 ms。
 - 缺 PLAY、缺 zstd 激活（客户端未打印下行接管日志）、加载的 Miku-ZSTD 摘要与被测成品不一致、窗口内进程退出或掉线，一律判失败，不补零、不缩窗口、不改人数。
+
+## 容量探针（clients）
+
+`clients` 用于找托管 runner 的真实容量边界，而不是猜：每个客户端都是一整棵进程树（xvfb-run + Xvfb + 游戏 JVM），驱动按进程树统计每个实例的 CPU 秒数与 RSS 峰值，并在报告里给出 `capacity` 段：
+
+- `clients[]`：每实例 `cpu_seconds`、`rss_peak_bytes`；
+- `total_client_cpu_seconds`、`total_client_rss_bytes`、`client_cpu_utilisation`、`paper_rss_bytes`；
+- `server_tick_lag_warnings`：测量窗口内 Paper 的 `Can't keep up` 次数；
+- `clients[].fps_p50` / `fps_p05`：客户端自己报告的渲染帧率（观测模组从 `Minecraft.getFps()` 采样）；
+- `verdict`：`sufficient` 或 `insufficient`，后者附 `reasons`。
+
+判定为 `insufficient` 的条件（任一命中）：测量窗口内 Paper 出现 `Can't keep up`；客户端 JVM 合计占用超过 90% 可用核；任一客户端的 `fps_p50` 低于 `MZSTD_MIN_CLIENT_FPS`（默认 20）。
+
+**实测容量曲线（4 vCPU / 15.6 GB 托管 runner，60 s 窗口，llvmpipe 软件渲染）**：
+
+| 客户端数 | 每实例 CPU | 每实例 fps_p50 | fps_p05 | 客户端 RSS 合计 | queue p99 | 判定 |
+|---:|---:|---:|---:|---:|---:|---|
+| 1 | 157.9 s | 27 | 12 | 1.53 GB | 3.146 ms | sufficient |
+| 2 | 99.1 / 99.3 s | 16 / 15 | 2 / 3 | 2.87 GB | 4.719 ms | insufficient |
+| 5 | 40–45 s | 5 | 0–1 | 7.45 GB | 9.437 ms | insufficient |
+
+结论：**这种托管机只够跑 1 个可用的真实客户端**（功能验证用），2 个起每实例帧率腰斩、5 个只剩 5 fps。注意总量 CPU 只到 0.65→0.89，说明瓶颈不是"核被吃满"，而是软件渲染下单客户端吞吐本身就有限——所以不能拿 CPU 总量当容量判据。
+
+**为什么必须看 fps**：加客户端时 CPU 总量会被摊薄，每个客户端自己分到的核越来越少——实测 4 vCPU 托管机上 1 个客户端用 161.7 CPU 秒，5 个客户端合计 216.0 CPU 秒但平摊到每个只有约 40 秒。只看总 CPU 或"进程还活着"会把这判成通过，只有客户端自己的帧率能说明它还剩多少可用性。
+
+判定为 `insufficient` 时报告仍会落盘（状态 `capacity_exceeded`，数字可在 "Report measured metrics" 步骤里看到），但编排器与校验器都会拒收。**不会因为换更少的人或换成协议机器人而放行。**
 
 ## 自托管模式（保留）
 
