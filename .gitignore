@@ -50,3 +50,7 @@ desktop.ini
 TROUBLESHOOTING.md
 # 本地开发文档（不进仓库）
 DEVELOPMENT.md
+
+# ===== Python =====
+__pycache__/
+*.pyc

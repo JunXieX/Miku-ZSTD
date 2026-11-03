@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "miku_zstd_ci",
+  "version": "1.0.0",
+  "name": "Miku-ZSTD CI Observer",
+  "description": "仅用于 CI 的真实客户端观测组件：记录实际加载的模组来源、PLAY 状态与入站字节数。不进入任何发布物。",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "cn.miku.zstd.ci.CiObserver"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.19.5",
+    "minecraft": ">=26.2",
+    "java": ">=25"
+  }
+}
