@@ -652,6 +652,7 @@ class Scenario:
             "rtt_p95_ms": round(percentile(round_trips, 0.95), 3),
             "rtt_p99_ms": round(percentile(round_trips, 0.99), 3),
             "rtt_p999_ms": round(percentile(round_trips, 0.999), 3),
+            "rtt_samples_ms": [round(value, 3) for value in round_trips[:2000]],
             "observed_client_inbound_bytes": max(0, observer_after - observer_before),
             "states": states,
         }
@@ -707,7 +708,9 @@ class Scenario:
             "frp": {"use_compression": True,
                     "entry_port": self.ports["frp_remote"],
                     "entry": "127.0.0.1:%d" % self.ports["frp_remote"]},
-            "metrics": {key: value for key, value in measurement.items() if key != "states"},
+            "metrics": {key: value for key, value in measurement.items()
+                        if key not in ("states", "rtt_samples_ms")},
+            "samples": {"rtt_ms": measurement.get("rtt_samples_ms", [])},
             "measurement": {
                 "minecraft_version": DEFAULT_VERSION,
                 "loader_version": DEFAULT_LOADER,
@@ -724,6 +727,13 @@ class Scenario:
                 "rtt_source": ("game client sends /mikuzstd ping <token> on its own monotonic clock "
                                "and stops the timer when the pong system chat arrives; this includes "
                                "server command handling, not raw TCP RTT"),
+                "rtt_floor": ("the server executes commands on a 20 tick/s loop and the client handles "
+                              "the reply on its render thread, so the floor is one server tick plus one "
+                              "client frame; compare variants under the same settings only"),
+                "wire_vs_client_bytes": {
+                    "plugin_wire_bytes": measurement.get("compressed_wire_bytes", 0),
+                    "client_inbound_bytes": measurement.get("observed_client_inbound_bytes", 0),
+                },
                 "latency_scope": ("plugin histograms cleared once before the measured interval, "
                                   "so percentiles describe this window only"),
                 "latency_stage_semantics": {

@@ -232,6 +232,35 @@ class RealClientResultTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "synthetic fixture"):
             self.call_validate("smoke")
 
+    def test_samples_are_exported_when_they_match_the_count(self):
+        data = self.smoke()
+        data["samples"] = {"rtt_ms": [1.5, 2.5, 3.0]}
+        data["metrics"]["rtt_sample_count"] = 3
+        self.write(data)
+        with contextlib.redirect_stdout(io.StringIO()):
+            clean = validate("smoke", self.path, 1, "candidate", None, 10, 0)
+        self.assertEqual(clean["samples"]["rtt_ms"], [1.5, 2.5, 3.0])
+
+    def test_samples_must_match_the_reported_count(self):
+        data = self.smoke()
+        data["samples"] = {"rtt_ms": [1.0]}
+        self.write(data)
+        with self.assertRaisesRegex(ValueError, "disagrees"):
+            self.call_validate("smoke")
+
+    def test_samples_must_stay_numeric_and_bounded(self):
+        data = self.smoke()
+        data["samples"] = {"rtt_ms": ["12"]}
+        data["metrics"]["rtt_sample_count"] = 1
+        self.write(data)
+        with self.assertRaisesRegex(ValueError, "numeric"):
+            self.call_validate("smoke")
+        data["samples"] = {"rtt_ms": [1.0] * 6000}
+        data["metrics"]["rtt_sample_count"] = 6000
+        self.write(data)
+        with self.assertRaisesRegex(ValueError, "limit"):
+            self.call_validate("smoke")
+
     def test_harness_summary_contract_matches_validator(self):
         from types import SimpleNamespace
         import lab_harness

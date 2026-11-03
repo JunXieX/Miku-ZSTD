@@ -74,6 +74,33 @@ def check_runtime(data, count, duration):
     return clean
 
 
+SAMPLE_LIMIT = 5000
+
+
+def check_samples(data, metrics):
+    """Validate the optional bounded raw sample block and return it for export.
+
+    Raw numbers are the only reason percentiles can be recomputed later, so they
+    are exported as-is — but only as a flat list of finite non-negative numbers,
+    with a hard length limit, and only when the count agrees with the metrics.
+    """
+    samples = data.get("samples")
+    if samples is None:
+        return None
+    require(isinstance(samples, dict), "samples must be an object")
+    values = samples.get("rtt_ms")
+    require(isinstance(values, list), "samples.rtt_ms must be a list")
+    require(len(values) <= SAMPLE_LIMIT, "sample list exceeds the exported limit")
+    count = metrics.get("rtt_sample_count") if isinstance(metrics, dict) else None
+    require(isinstance(count, int) and count == len(values),
+            "rtt sample count disagrees with metrics")
+    for value in values:
+        require(isinstance(value, (int, float)) and not isinstance(value, bool),
+                "rtt sample must be numeric")
+        require(math.isfinite(value) and value >= 0, "rtt sample must be finite and non-negative")
+    return {"rtt_ms": values}
+
+
 def check_metrics(metrics, minimum, benchmark, label):
     require(isinstance(metrics, dict), f"{label} must be an object")
     for key in COMMON + (BENCH if benchmark else ()):
@@ -120,6 +147,9 @@ def validate(mode, path, expected_clients, expected_sha, expected_baseline_sha, 
     if expected_hashes:
         require(data.get("artifact_sha256") == expected_hashes["candidate"], "candidate artifact SHA256 mismatch")
         clean["artifact_sha256"] = expected_hashes["candidate"]
+    samples = check_samples(data, data.get("metrics", {}))
+    if samples is not None:
+        clean["samples"] = samples
     if pair:
         rounds = data.get("paired_rounds")
         require(isinstance(rounds, list) and len(rounds) == required_rounds, "paired_rounds count differs from request")
@@ -154,6 +184,9 @@ def validate(mode, path, expected_clients, expected_sha, expected_baseline_sha, 
                 if expected_hashes:
                     require(vm.get("artifact_sha256") == expected_hashes[variant], f"{variant} artifact SHA256 mismatch")
                     out[variant]["artifact_sha256"] = expected_hashes[variant]
+                vm_samples = check_samples(vm, vm)
+                if vm_samples is not None:
+                    out[variant]["samples"] = vm_samples
             clean_rounds.append(out)
         require(total_duration >= min_duration, "paired durations below requested total")
         require(math.isclose(metrics["duration_seconds"], total_duration, rel_tol=1e-6, abs_tol=0.001), "aggregate duration differs from paired intervals")
