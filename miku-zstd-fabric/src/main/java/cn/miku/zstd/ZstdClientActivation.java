@@ -67,11 +67,9 @@ public final class ZstdClientActivation {
         var handler = channel.pipeline().get("zstd_decoder");
         boolean started = handler instanceof ZstdBatchDecoder decoder
                 ? decoder.hasStartedStream() : Boolean.TRUE.equals(channel.attr(ACTIVATED).get());
-        boolean zstdCommitted = channel.attr(ZstdChannelManager.ZSTD_STATE).get()
-                == ZstdChannelManager.TransportState.ZSTD_ACTIVE;
-        if (started || zstdCommitted) {
+        if (started) {
             channel.attr(ACTIVATED).set(Boolean.FALSE);
-            LOGGER.warn("[Zstd] closing connection — compression disabled after Zstd switch");
+            LOGGER.warn("[Zstd] closing continuous stream — compression disabled after stream input");
             channel.close();
             return;
         }
