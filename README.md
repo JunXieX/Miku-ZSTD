@@ -1,4 +1,4 @@
-# Miku-ZSTD 6.1.0
+# Miku-ZSTD
 
 作者：JunXieX　|　MikuMC系列插件交流群：1105054380　|　非开源项目，请勿二次分发
 
