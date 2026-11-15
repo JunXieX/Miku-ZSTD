@@ -57,6 +57,30 @@ class ZstdPaperConfigLoadTest {
         assertEquals(generated, Files.readString(file, StandardCharsets.UTF_8));
     }
 
+    @Test
+    @DisplayName("login 段缺省：应答预算 10s、迟到应答窗口 120s")
+    void loginSectionDefaults() throws IOException {
+        Path file = directory.resolve("config.yml");
+        Files.writeString(file, "logging: {debug: false}\n", StandardCharsets.UTF_8);
+        ZstdPaperConfig.load(file);
+        assertEquals(10000, ZstdPaperConfig.INSTANCE.answerTimeoutMs);
+        assertEquals(120000, ZstdPaperConfig.INSTANCE.lateAnswerWindowMs);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"login: {answer_timeout_ms: 1, late_answer_window_ms: 1}",
+            "login: {answer_timeout_ms: 999999, late_answer_window_ms: 9999999}"})
+    @DisplayName("login 段越界值被夹取到合法区间")
+    void loginSectionIsClamped(String contents) throws IOException {
+        Path file = directory.resolve("config.yml");
+        Files.writeString(file, contents, StandardCharsets.UTF_8);
+        ZstdPaperConfig.load(file);
+        int answer = ZstdPaperConfig.INSTANCE.answerTimeoutMs;
+        int late = ZstdPaperConfig.INSTANCE.lateAnswerWindowMs;
+        assertTrue(answer >= 1000 && answer <= 120000, "answer_timeout_ms 越界: " + answer);
+        assertTrue(late >= 5000 && late <= 600000, "late_answer_window_ms 越界: " + late);
+    }
+
     @ParameterizedTest
     @ValueSource(strings = {"", "{}", "compression: {level: 6}", "logging: {}", "logging:"})
     @DisplayName("空文件或缺省logging/debug：真实load为false且不覆写已有文件")

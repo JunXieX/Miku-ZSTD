@@ -12,6 +12,7 @@
 - 新生成的服务端配置默认关闭调试日志，已有配置中的显式设置保持原样。
 - 代理上 `/mikuzstd bar` 对后端同名命令的遮蔽：具备代理权限时在代理执行，否则已连接后端的玩家交由后端鉴权。
 - 关闭后端原版压缩时，仍保留 `/mikuzstd bar` 的执行与补全。
+- 6.1.1 把协商应答等待从写死的 3 秒（Paper）/ 2 秒（Velocity）改为可配置的 `login.answer_timeout_ms`（默认 10 秒），超时改为<b>先回落原版</b>而不是直接断开连接；客户端补上压缩管线看门狗，未观察到 SetCompression 时按原版应答，不再无限期等待。登录阶段新增一行可检索的诊断日志。
 - 6.1.0 新增分段耗时（`latency`）、往返探测（`ping`）与精确字节计数（`traffic`）三个诊断命令；`batch_max_packets` 默认提高到 256，新增默认关闭的 `batch_max_bytes` 字节预算。
 - 6.0.4 修复 Fabric + Krypton 在协商应答早于 SetCompression 时发出未封装登录包的问题；使用 FRP 转发仍可保持 `transport.useCompression=true`。
 - 6.0.2 起不再设置小包直存阈值，所有接管后的下行包都进入连续压缩流；旧协商协议的客户端协商不匹配时保持原版。
@@ -26,7 +27,7 @@
 | 客户端 | Minecraft 26.2 + Fabric | 当前构建使用 Fabric Loader 0.19.5、Fabric API 0.160.0+26.2 |
 | 代理 | Velocity 4.x | 当前真实服务器登录回归使用 4.3.1 |
 | 直连服务端 | Paper / Folia 26.2 | 当前构建基于 Paper 26.2；真实服务器登录回归使用 Paper 26.2 |
-| 配套文件 | Miku-ZSTD 服务端插件与 Fabric 模组 | 建议服务端与 Fabric 客户端统一使用 6.0.4；旧协议客户端协商不匹配时保持原版 |
+| 配套文件 | Miku-ZSTD 服务端插件与 Fabric 模组 | 建议服务端与 Fabric 客户端统一使用 6.1.1；旧协议客户端协商不匹配时保持原版 |
 
 以上是当前构建与回归基线，不代表其他游戏或代理版本已经逐一验证。
 
@@ -74,6 +75,10 @@ compression:
   batch_max_packets: 256
   batch_max_bytes: 0
 
+login:
+  answer_timeout_ms: 10000
+  late_answer_window_ms: 120000
+
 bossbar:
   format: "&a%players% &7人在用 &8| &f%raw% &7→ &a%wire% &8| 压缩率 &e%ratio%"
 
@@ -89,12 +94,14 @@ logging:
 | `compression.batch_window_ms` | `50` | 上游只写不 flush 时的兜底时间，单位毫秒；正常批次随上游 flush 发出 |
 | `compression.batch_max_packets` | `256` | 每个压缩批次最多合并的包数；批次输出可能跨多个传输帧 |
 | `compression.batch_max_bytes` | `0` | 每个压缩批次的原始字节预算，范围 0–16777216；`0` 为不启用。用于大小差异极大的流量：包数上限对聊天小包与区块大包代表的字节量差两个数量级 |
+| `login.answer_timeout_ms` | `10000` | 等客户端协商应答的预算，范围 1000–120000 毫秒。超时后本端回落原版并照常放行登录（只影响这一轮是否走 zstd）；必须明显大于客户端模组的 2000ms 看门狗 |
+| `login.late_answer_window_ms` | `120000` | 协商定案后继续吞掉迟到应答的窗口，范围 5000–600000 毫秒（Velocity 端无此项）。窗口要盖住整个登录 + 配置阶段，否则玩家在资源包下载期间停留过久会被判为意外的查询应答而断连 |
 | `bossbar.format` | 示例所示 | 当前实例监控文本，支持 `&` 颜色代码 |
 | `logging.debug` | `false` | 排查协商、安装与连接问题时开启；Velocity 同时据此启停每 60 秒一次的带宽剖析 |
 
 BossBar 占位符：`%players%` 为使用 zstd 通道的人数，`%raw%` 为原始下行带宽，`%wire%` 为压缩后带宽，`%ratio%` 为压缩后 / 原始的百分比；带宽值自带单位，空闲时压缩率显示 `--`。原始带宽包含包长度前缀与包体，线路带宽包含 Minecraft 外层长度；不包含 TCP、加密等额外开销。
 
-**升级已有配置：** 旧项 `compression.skip_compress_below_bytes` 已不生效，无需手动删除也不会改变连续压缩行为。已有文件保留原文、注释及未知旧键，不会被重写；新模板不再生成该项。新文件、空配置或缺少 `logging.debug` 时采用 `false`。已有文件明确写着 `debug: true` 时仍保留 `true`，升级不会替用户关闭。要关闭旧设置，请主动修改为 `false` 并按下文加载。
+**升级已有配置：** 旧项 `compression.skip_compress_below_bytes` 已不生效，无需手动删除也不会改变连续压缩行为。已有文件保留原文、注释及未知旧键，不会被重写；新模板不再生成该项。新文件、空配置或缺少 `logging.debug` 时采用 `false`。缺少 `login.answer_timeout_ms` / `login.late_answer_window_ms` 时取代码内默认值（10 秒 / 120 秒），不需要手动补键。已有文件明确写着 `debug: true` 时仍保留 `true`，升级不会替用户关闭。要关闭旧设置，请主动修改为 `false` 并按下文加载。
 
 ### 修改后如何生效
 

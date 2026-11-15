@@ -121,9 +121,29 @@ public class ZstdHijacker extends ChannelDuplexHandler {
     private static final String COMPRESSION_DECODER = "compression-decoder";
     private static final String COMPRESSION_ENCODER = "compression-encoder";
 
-    /** 等待协商应答的重试间隔与次数（合计约 2s） */
+    /** 等待协商应答的重试间隔；次数由 {@code login.answer_timeout_ms} 换算（默认 10s）。 */
     private static final long RESPONSE_RETRY_MS = 100;
-    private static final int RESPONSE_MAX_RETRIES = 20;
+
+    /**
+     * 等客户端协商应答的重试次数。
+     *
+     * <p>⚠️ 旧实现写死 20 × 100ms = 2s，且超时收尾是<b>直接断开连接</b>：客户端只要在
+     * 进服瞬间忙上两秒（加载区块 / 初次解析整合包资源 / 一次 GC），这一轮就会被踢掉，
+     * 而两端日志都只有一行 Connecting to。现在预算可配（默认 10s），且超时先回落原版。</p>
+     */
+    private static int responseMaxRetries() {
+        int millis = ZstdVelocityConfig.INSTANCE.answerTimeoutMs;
+        return Math.max(1, millis / (int) RESPONSE_RETRY_MS);
+    }
+
+    /**
+     * 安装阶段的重试次数（15 × 100ms = 1.5s），<b>不</b>跟应答预算共用。
+     *
+     * <p>锚点（原版压缩处理器）是 {@code setupCompression} 同一次调用里紧跟着装上的，
+     * 正常几微秒就位；等不到就是这条连接压根没有压缩层。用 10 秒的应答预算来等锚点，
+     * 只会让"锚点缺失"这种配置问题的现场多卡十秒。</p>
+     */
+    private static final int INSTALL_MAX_RETRIES = 15;
 
     /**
      * 取"发送登录期查询包"的写入位置：<b>只能用 {@code minecraft-encoder} 的 context</b>。
@@ -485,20 +505,17 @@ public class ZstdHijacker extends ChannelDuplexHandler {
         if (mgr == null || mgr.isReplaced()) return;
 
         if (!mgr.isAnswerReceived()) {
-            // 协议 v8 只剩一段等待：negotiate 的应答（一个 RTT）。原来"字典推送 → 等字典应答"
-            // 那一段 10s 预算随训练字典一起删掉了，所以这里只需一个 2s 上限。
-            if (attempt >= RESPONSE_MAX_RETRIES) {
-                LOGGER.warn("[Zstd] Negotiate response not received after {}ms — closing connection"
-                                + "（客户端没有回 packet id 0x02 的 login plugin 应答）",
-                        RESPONSE_RETRY_MS * RESPONSE_MAX_RETRIES);
-                // ⚠️ 完全没应答只可能是异常（原版客户端也会回 success=false 走 isProtocolMismatch）。
-                // 按原版补发扣包时，对端若其实是模组客户端（应答丢了），它已切 zstd → 必断连。
-                // 明确关连接，让客户端重连一次，故障也更可见。
-                releaseHeld(ctx);
-                ctx.channel().close();
-                if (ctx.pipeline().get(ZstdHijacker.class) != null) {
-                    ctx.pipeline().remove(this);
-                }
+            // 协议 v8 只剩一段等待：negotiate 的应答（一个 RTT）。预算由
+            // login.answer_timeout_ms 换算（默认 10s），不再写死 2s。
+            int budget = responseMaxRetries();
+            if (attempt >= budget) {
+                // ⚠️ 走到这里必然"还没激活"（方法开头就早退了 isReplaced 的情况），
+                // 客户端此刻仍在原版路径上：按原版补发扣住的包是安全的，玩家照常进服。
+                // 旧实现无条件 close()，把"客户端只是慢了一拍"也一起踢掉，现场只剩一行
+                // Connecting to —— 正是本次"进不去且两端无异常"最可能的形态。
+                LOGGER.warn("[Zstd] Negotiate response not received after {}ms (remote={}) — falling back to vanilla",
+                        RESPONSE_RETRY_MS * budget, channel.remoteAddress());
+                giveUp(ctx); // 回落原版：按原版补发扣包 + 摘掉自身
                 return;
             }
             channel.eventLoop().schedule(() -> tryActivate(ctx, attempt + 1),
@@ -552,11 +569,12 @@ public class ZstdHijacker extends ChannelDuplexHandler {
     }
 
     /**
-     * 安装阶段的独立重试循环（预算 {@link #RESPONSE_MAX_RETRIES}，与应答等待阶段互不影响）。
+     * 安装阶段的独立重试循环（预算 {@link #INSTALL_MAX_RETRIES}，与应答等待阶段互不影响）。
      *
      * <p>⚠️ 必须与 {@code tryActivate0} 的 attempt 分开计数：那个 attempt 指的是
-     * "等协商/字典应答等了多少轮"，字典阶段可等 100 轮。若共用，慢链路上进入安装阶段时
-     * attempt 已 > 20，安装重试会被立刻判为耗尽 → 明明锚点马上就好，却直接回落原版。</p>
+     * "等协商应答等了多少轮"（现在由 {@code login.answer_timeout_ms} 换算，默认 100 轮）。
+     * 若共用，慢链路上进入安装阶段时 attempt 已接近预算，安装重试会被立刻判为耗尽
+     * → 明明锚点马上就好，却直接回落原版。</p>
      *
      * @param installAttempt 安装阶段自己的重试序号（首轮 0）
      * @return 语义同 {@link #activateZstd}：true = 已激活，调用方应补发扣包
@@ -593,7 +611,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
             // 1) 重试——原版压缩处理器是 SetCompression 之后才装的，可能尚未就绪；
             // 2) 重试用尽后必须 releaseHeld——否则 hold 期间扣下的包永不补发，
             //    客户端表现为**连接卡死**（而不是断连），且日志里只有一行 ERROR，极难排查。
-            if (installAttempt < RESPONSE_MAX_RETRIES) {
+            if (installAttempt < INSTALL_MAX_RETRIES) {
                 channel.eventLoop().schedule(() -> installHandlers(ctx, mgr, installAttempt + 1),
                         RESPONSE_RETRY_MS, TimeUnit.MILLISECONDS);
                 return false; // 重试期间保持 holding：包必须留到管道定型后再发

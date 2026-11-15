@@ -40,6 +40,25 @@ public class ZstdPaperConfig {
     public final String bossbarFormat;
 
     /**
+     * 等客户端协商应答的预算（毫秒）。
+     *
+     * <p>⚠️ 旧实现写死 3 秒（100ms × 30）。低配客户端在进服瞬间要加载区块/整合包资源、
+     * 还可能撞上一次 GC，3 秒很容易 miss；而 miss 的代价是<b>直接断开这条连接</b>——
+     * 玩家看到的就是"进不去、日志里什么都没有"。放宽到 10 秒后，同一次延迟只会退回原版
+     * （照常进服，只是这一轮没有 zstd）。</p>
+     */
+    public final int answerTimeoutMs;
+
+    /**
+     * 协商定案后继续吞下迟到应答的窗口（毫秒）。
+     *
+     * <p>⚠️ 旧实现写死 10 秒。玩家在登录/配置阶段停留超过 10 秒（下载服务端资源包、
+     * 大整合包首次加载）时，迟到的那条应答就会漏给 {@code ServerLoginPacketListenerImpl}，
+     * 被判定为 "unexpected query response" 直接断连。默认 120 秒覆盖整个登录+配置阶段。</p>
+     */
+    public final int lateAnswerWindowMs;
+
+    /**
      * ⚠️ 与 Velocity 端同规则：<b>所有数值都夹取</b>，不接受越界值。
      *
      * <p>越界的 {@code window_log} 会在构造 {@code ZstdPaperChannelManager} 时让
@@ -54,6 +73,10 @@ public class ZstdPaperConfig {
         this.batchWindowMs = clamp(getInt(c, "batch_window_ms", 50), 0, 1000);
         this.batchMaxPackets = clamp(getInt(c, "batch_max_packets", 256), 1, 4096);
         this.batchMaxBytes = clamp(getInt(c, "batch_max_bytes", 0), 0, 16 * 1024 * 1024);
+
+        Map<String, Object> lg = section(map, "login");
+        this.answerTimeoutMs = clamp(getInt(lg, "answer_timeout_ms", 10000), 1000, 120000);
+        this.lateAnswerWindowMs = clamp(getInt(lg, "late_answer_window_ms", 120000), 5000, 600000);
 
         Map<String, Object> l = section(map, "logging");
         this.debug = getBool(l, "debug", false);
@@ -143,6 +166,17 @@ public class ZstdPaperConfig {
                       # 每批的原始字节预算，范围 0-16777216；0 = 不启用（只按包数收批）。
                       # 包数上限对大小差异极大的流量不成立：64 个聊天包几 KB、64 个区块包可能上兆。
                       batch_max_bytes: 0
+
+                    login:
+                      # 等客户端协商应答的预算（毫秒，1000-120000，默认 10000）。
+                      # 超时后本端退回原版（照常进服，只是这一轮不走 zstd），不再直接断开连接。
+                      # 必须显著大于客户端 ZstdLoginNetworking 的看门狗（固定 2000ms）。
+                      answer_timeout_ms: 10000
+
+                      # 协商定案后继续吞掉迟到应答的窗口（毫秒，5000-600000，默认 120000）。
+                      # 玩家在登录/配置阶段停留较久（资源包下载）时，迟到应答若漏给原版登录监听器
+                      # 会被判为 unexpected query response 而断连；这个窗口要盖住整个登录+配置阶段。
+                      late_answer_window_ms: 120000
 
                     bossbar:
                       # ── BossBar 实时监控文本（/mikuzstd bar 开关）──

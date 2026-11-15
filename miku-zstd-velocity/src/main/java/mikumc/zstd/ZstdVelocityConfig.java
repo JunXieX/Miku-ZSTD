@@ -53,6 +53,15 @@ public class ZstdVelocityConfig {
     public final String bossbarFormat;
 
     /**
+     * 等客户端协商应答的预算（毫秒）。
+     *
+     * <p>⚠️ 旧实现写死 2 秒，且超时直接断开连接。客户端在进服瞬间忙两秒（加载区块、
+     * 初次解析整合包资源、一次 GC）就会 miss，代价是整条连接被踢——玩家看到的是
+     * "进不去"，两端日志只有一行 Connecting to。放宽到 10 秒后同一次延迟只退回原版。</p>
+     */
+    public final int answerTimeoutMs;
+
+    /**
      * ⚠️ <b>所有数值都经 {@link #clamp(int, int, int)} 夹取</b>，不接受越界值。
      *
      * <p>以前配置原样透传：{@code window_log: 60} 这类越界值会在构造
@@ -68,6 +77,9 @@ public class ZstdVelocityConfig {
         this.batchWindowMs = clamp(getInt(c, "batch_window_ms", 50), 0, 1000);
         this.batchMaxPackets = clamp(getInt(c, "batch_max_packets", 256), 1, 4096);
         this.batchMaxBytes = clamp(getInt(c, "batch_max_bytes", 0), 0, 16 * 1024 * 1024);
+
+        Map<String, Object> lg = getMap(map, "login");
+        this.answerTimeoutMs = clamp(getInt(lg, "answer_timeout_ms", 10000), 1000, 120000);
 
         Map<String, Object> l = getMap(map, "logging");
         this.debug = getBool(l, "debug", false);
@@ -172,6 +184,12 @@ public class ZstdVelocityConfig {
 
                       # 每批的原始字节预算，范围 0-16777216；0 = 不启用（只按包数收批）。
                       batch_max_bytes: 0
+
+                    login:
+                      # 等客户端协商应答的预算（毫秒，1000-120000，默认 10000）。
+                      # 超时后本端退回原版（照常进服，只是这一轮不走 zstd），不再直接断开连接。
+                      # 必须显著大于客户端 ZstdLoginNetworking 的看门狗（固定 2000ms）。
+                      answer_timeout_ms: 10000
 
                     bossbar:
                       # ── BossBar 实时监控文本（/mikuzstd bar 开关）──
