@@ -131,6 +131,47 @@ public class ZstdChannelManager {
     }
 
     /**
+     * 诊断查询（{@code zstd:diag}）的两个 txId：预取与卡住探针各一个，-1 表示还没发。
+     *
+     * <p>⚠️ 与 {@code negotiateTxId} 同理：注册过的 txId 对应的应答必须由本侧吃掉。
+     * Velocity 会把"没有 inflight 对应的登录应答"当成协议错误处置，而这条连接
+     * 本来只是卡住，不该因为加了诊断被踢掉。</p>
+     */
+    private volatile int preflightTxId = -1;
+    private volatile int stallTxId = -1;
+
+    public int getPreflightTxId() {
+        return preflightTxId;
+    }
+
+    public int getStallTxId() {
+        return stallTxId;
+    }
+
+    /** 是否属于本连接发出的诊断查询（预取或卡住探针）。 */
+    public boolean isDiagTxId(int txId) {
+        return txId > 0 && (txId == preflightTxId || txId == stallTxId);
+    }
+
+    /** 抢占预取查询的 txId：每条连接只发一次。 */
+    public synchronized boolean claimPreflightTxId(int txId) {
+        if (this.preflightTxId != -1) {
+            return false;
+        }
+        this.preflightTxId = txId;
+        return true;
+    }
+
+    /** 抢占卡住探针的 txId：每条连接只发一次。 */
+    public synchronized boolean claimStallTxId(int txId) {
+        if (this.stallTxId != -1) {
+            return false;
+        }
+        this.stallTxId = txId;
+        return true;
+    }
+
+    /**
      * Hijacker/嗅探器拦截到 negotiate 应答时回填结果。
      *
      * <p>⚠️ <b>状态语义（三端必须完全一致）</b>：{@code 0 = 客户端会启用 zstd}，

@@ -543,6 +543,277 @@ jobs:
           sleep 2
 
   # ──────────────────────────────────────────────────────────────────────
+  # 卡住会话自动取证的真机验证（Paper）。
+  #
+  # 为什么必须是真机：这条链路的每一环都只在真实登录时序里成立 ——
+  #   协商应答 → 服务端发出 zstd:switch → 客户端<b>故意不确认</b> → 连接卡住
+  #   → 看门狗判定 → 服务端在"还扣着登录包"的状态下另发一条 zstd:diag
+  #   → 客户端回传 gzip → 现场落盘。
+  # 单元测试只能证明帧格式，证明不了"扣包时那条查询真的出得去"与
+  # "应答真的被自己吃掉、没漏给原版登录监听器"（后者会直接把连接按
+  # unexpected query response 断开，而这条连接本来只是卡住）。
+  # ──────────────────────────────────────────────────────────────────────
+  e2e-paper-stall:
+    name: E2E (Paper, 卡住取证)
+    needs: [paper]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: 'temurin'
+      - uses: actions/download-artifact@v4
+        with:
+          name: Miku-ZSTD-Paper
+          path: dist
+      - name: Fetch Paper 26.2
+        run: |
+          set -euo pipefail
+          URL=$(curl -fsSL https://fill.papermc.io/v3/projects/paper/versions/26.2/builds \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["downloads"]["server:default"]["url"])')
+          echo "paper=$URL"
+          curl -fsSL "$URL" -o paper.jar
+      - name: Prepare server
+        run: |
+          set -euo pipefail
+          mkdir -p server/plugins/Miku-ZSTD
+          cp dist/*.jar server/plugins/
+          cd server
+          echo "eula=true" > eula.txt
+          cat > server.properties <<'EOF'
+          online-mode=false
+          network-compression-threshold=256
+          server-port=25600
+          server-ip=127.0.0.1
+          level-type=minecraft\:flat
+          spawn-protection=0
+          max-players=5
+          view-distance=2
+          simulation-distance=2
+          sync-chunk-writes=false
+          enable-command-block=false
+          motd=MikuZSTD-E2E
+          EOF
+          # 判定阈值压到 5s：默认 15s 只是为了让慢客户端不被误判，这里要的是"快出结论"。
+          # 预取关闭：本用例要走"卡住探针"那一条，预取会把 txId 先占掉一次。
+          cat > plugins/Miku-ZSTD/config.yml <<'EOF'
+          logging: {}
+          login:
+            answer_timeout_ms: 60000
+          diagnostics:
+            enabled: true
+            stall_detect_ms: 5000
+            pull_client_log: true
+            preflight: false
+            max_kb: 64
+            keep_bundles: 3
+          EOF
+          ls plugins/ plugins/Miku-ZSTD/
+      - name: Start Paper
+        run: |
+          set -euo pipefail
+          cd server
+          nohup java -Dterminal.jline=false -Dterminal.ansi=false -Xms768M -Xmx1536M -jar ../paper.jar --nogui > server.log 2>&1 &
+          echo $! > server.pid
+          for i in $(seq 1 180); do
+            if grep -q 'Done (' server.log; then echo "server up in ${i}s"; exit 0; fi
+            sleep 1
+          done
+          echo "server did not start"; tail -80 server.log; exit 1
+      - name: Run stuck client
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import glob, gzip, os, socket, struct, sys, time, zlib
+
+          HOST = os.environ.get("MZ_E2E_HOST", "127.0.0.1")
+          PORT = int(os.environ.get("MZ_E2E_PORT", "25600"))
+          PROTOCOL = 776
+          NEGOTIATE = 12
+          USERNAME = "StuckBot"
+          FAKE_LOG = (b"[Zstd] negotiate rx version=12\n" * 40) + b"[Zstd] stuck before switch confirm\n"
+
+          def varint(n):
+              out = bytearray()
+              while True:
+                  b = n & 0x7F
+                  n >>= 7
+                  if n: out.append(b | 0x80)
+                  else:
+                      out.append(b); return bytes(out)
+
+          def s(x):
+              b = x.encode(); return varint(len(b)) + b
+
+          def recvn(sock, n):
+              d = b""
+              while len(d) < n:
+                  c = sock.recv(n - len(d))
+                  if not c: raise EOFError("eof")
+                  d += c
+              return d
+
+          def rv(sock):
+              num = 0; sh = 0
+              while True:
+                  c = recvn(sock, 1)[0]
+                  num |= (c & 0x7F) << sh
+                  if not (c & 0x80): return num
+                  sh += 7
+                  if sh > 35: raise ValueError("varint too long")
+
+          def dv(buf, pos):
+              num = 0; sh = 0
+              while True:
+                  b = buf[pos]; pos += 1
+                  num |= (b & 0x7F) << sh
+                  if not (b & 0x80): return num, pos
+                  sh += 7
+
+          def send(sock, packet, threshold):
+              use_zlib = threshold is not None and len(packet) >= threshold
+              if threshold is None:
+                  body = packet
+              elif use_zlib:
+                  body = varint(len(packet)) + zlib.compress(packet)
+              else:
+                  body = b"\x00" + packet
+              sock.sendall(varint(len(body)) + body)
+
+          def vanilla_packet(body, threshold):
+              if threshold is None:
+                  return body
+              raw, pos = dv(body, 0)
+              if raw == 0:
+                  return body[pos:]
+              return zlib.decompress(body[pos:])
+
+          sock = socket.create_connection((HOST, PORT), timeout=20)
+          sock.settimeout(30)
+          hs = varint(0) + varint(PROTOCOL) + s("127.0.0.1\x00ZSTD\x00") + struct.pack(">H", PORT) + varint(2)
+          sock.sendall(varint(len(hs)) + hs)
+          ls = varint(0) + s(USERNAME) + b"\x02" * 16
+          sock.sendall(varint(len(ls)) + ls)
+
+          threshold = None
+          negotiate_answered = False
+          switch_seen = False
+          diag_answered = 0
+          disconnected = False
+          # 关键：故意不确认 zstd:switch。连接会停在"服务端扣着登录包等确认"的状态，
+          # 正是线上那种"名字进来了、人没进来"的幽灵连接。
+          deadline = time.time() + 40
+          while time.time() < deadline:
+              ln = rv(sock)
+              body = recvn(sock, ln)
+              packet = vanilla_packet(body, threshold)
+              pid, pos = dv(packet, 0)
+              if pid == 0x03:
+                  threshold, _ = dv(packet, pos)
+                  print("  SetCompression threshold=%d" % threshold)
+              elif pid == 0x04:
+                  tx, p = dv(packet, pos)
+                  sl, p = dv(packet, p)
+                  chan = packet[p:p + sl].decode()
+                  payload = packet[p + sl:]
+                  if chan == "zstd:negotiate":
+                      version = struct.unpack(">i", payload[:4])[0]
+                      assert version == NEGOTIATE, "服务端协商版本应为 %d，实际 %d" % (NEGOTIATE, version)
+                      send(sock, varint(0x02) + varint(tx) + b"\x01" + varint(0), threshold)
+                      negotiate_answered = True
+                      print("  negotiate answered READY")
+                  elif chan == "zstd:switch":
+                      switch_seen = True
+                      print("  switch query received (deliberately NOT confirmed)")
+                  elif chan == "zstd:diag":
+                      version, mode = struct.unpack(">iB", payload[:5])
+                      assert version == 1, "诊断载荷版本应为 1，实际 %d" % version
+                      packed = gzip.compress(FAKE_LOG)
+                      answer = (bytes([0]) + struct.pack(">i", 1)
+                                + struct.pack(">i", len(FAKE_LOG)) + packed)
+                      send(sock, varint(0x02) + varint(tx) + b"\x01" + answer, threshold)
+                      diag_answered += 1
+                      print("  diag answered mode=%d payload=%dB raw=%dB" % (mode, len(packed), len(FAKE_LOG)))
+                  else:
+                      send(sock, varint(0x02) + varint(tx) + b"\x00", threshold)
+              elif pid == 0x00:
+                  print("  DISCONNECT: %s" % packet[pos:pos + 120])
+                  disconnected = True
+                  break
+              elif pid == 0x02:
+                  print("  unexpected LoginSuccess: 幽灵连接不应完成登录")
+                  break
+
+          # 回完诊断后必须还活着：漏给原版登录监听器会被判 unexpected query response 直接断开。
+          settle_until = time.time() + 3
+          sock.settimeout(1)
+          while time.time() < settle_until:
+              try:
+                  ln = rv(sock)
+              except (socket.timeout, TimeoutError):
+                  continue
+              except EOFError:
+                  disconnected = True
+                  break
+              body = recvn(sock, ln)
+              packet = vanilla_packet(body, threshold)
+              pid, _ = dv(packet, 0)
+              if pid == 0x00:
+                  print("  DISCONNECT after diag: %s" % packet[1:120])
+                  disconnected = True
+                  break
+          sock.close()
+
+          print("  negotiate_answered=%s switch_seen=%s diag_answered=%d disconnected=%s"
+                % (negotiate_answered, switch_seen, diag_answered, disconnected))
+          ok = negotiate_answered and switch_seen and diag_answered >= 1 and not disconnected
+          sys.exit(0 if ok else 1)
+          PY
+      - name: Verify bundle on disk
+        run: |
+          set -euo pipefail
+          cd server
+          echo "----- stall bundles -----"
+          ls -R plugins/Miku-ZSTD/logs/stall || true
+          test -f plugins/Miku-ZSTD/logs/zstd-debug.log || { echo "调试文件没有生成"; exit 1; }
+          mapfile -t dirs < <(find plugins/Miku-ZSTD/logs/stall -mindepth 1 -maxdepth 1 -type d)
+          [ "${#dirs[@]}" -ge 1 ] || { echo "没有生成现场目录"; exit 1; }
+          python3 - <<'PY'
+          import glob, gzip, os, sys
+          dirs = sorted(glob.glob("plugins/Miku-ZSTD/logs/stall/*"))
+          assert dirs, "没有现场目录"
+          print("bundles: %s" % dirs)
+          ok = False
+          for d in dirs:
+              client = os.path.join(d, "client.log.gz")
+              server = os.path.join(d, "server.log")
+              session = os.path.join(d, "session.txt")
+              assert os.path.isfile(server), "缺少 server.log: " + d
+              assert os.path.isfile(session), "缺少 session.txt: " + d
+              with open(session, encoding="utf-8") as fh:
+                  text = fh.read()
+              assert "卡住探针" in text, "session.txt 没有记录判定模式: " + text
+              if os.path.isfile(client):
+                  with open(client, "rb") as fh:
+                      raw = gzip.decompress(fh.read())
+                  assert b"stuck before switch confirm" in raw, "客户端日志内容不符"
+                  print("%s: client=%dB raw=%dB" % (d, os.path.getsize(client), len(raw)))
+                  ok = True
+          assert ok, "没有任何现场包含 client.log.gz"
+          print("stall bundle assertions OK")
+          PY
+          grep -q "判定卡住" server.log || { echo "缺少卡住判定日志"; tail -40 server.log; exit 1; }
+          grep -q "已捕获客户端日志" server.log || { echo "缺少客户端日志回传日志"; tail -40 server.log; exit 1; }
+          echo "stall diagnostics verified"
+      - name: Stop server
+        if: always()
+        run: |
+          cd server 2>/dev/null || exit 0
+          [ -f server.pid ] && kill "$(cat server.pid)" 2>/dev/null || true
+          sleep 2
+
+  # ──────────────────────────────────────────────────────────────────────
   # Velocity 端真机冒烟：真代理 + 协议级客户端，只跑到"登录完成"。
   #
   # 为什么要单独一个 job：Velocity 与 Paper 的字节路径不同（外层 bodyLen 由

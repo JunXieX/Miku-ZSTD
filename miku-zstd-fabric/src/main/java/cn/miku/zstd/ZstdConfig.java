@@ -40,6 +40,17 @@ public class ZstdConfig {
     /** 调试文件保留的历史份数。 */
     public final int debugKeepFiles;
 
+    /**
+     * 服务端判定"卡住"并索取日志时，是否把本机调试日志尾部回传。
+     *
+     * <p>默认开：这条通道只在玩家已经进不去服的时候才会被用到，回传的是本机调试文件尾部
+     * （不含聊天、不含账号信息），正是唯一能定位问题的那份东西。</p>
+     */
+    public final boolean sendClientLog;
+
+    /** 单次回传的尾部上限（KiB）。服务端的 {@code diagnostics.max_kb} 不应小于它。 */
+    public final int diagMaxKb;
+
     private ZstdConfig(Map<String, Object> map) {
         Map<String, Object> display = section(map, "display");
         this.hudEnabled = getBool(display, "hud_enabled", false);
@@ -49,6 +60,10 @@ public class ZstdConfig {
         this.debugFile = getString(logging, "file", "Miku-ZSTD/logs/zstd-debug.log");
         this.debugMaxFileMb = clamp(getInt(logging, "max_file_mb", 8), 1, 128);
         this.debugKeepFiles = clamp(getInt(logging, "keep_files", 2), 0, 10);
+
+        Map<String, Object> diagnostics = section(map, "diagnostics");
+        this.sendClientLog = getBool(diagnostics, "send_client_log", true);
+        this.diagMaxKb = clamp(getInt(diagnostics, "max_kb", 256), 16, 512);
     }
 
     private static int clamp(int value, int min, int max) {
@@ -126,6 +141,16 @@ public class ZstdConfig {
                       # 单个文件上限（MiB，1-128）与保留的历史份数（0-10）。
                       max_file_mb: 8
                       keep_files: 2
+
+                    diagnostics:
+                      # ── 卡住取证（6.1.1）──
+                      # 服务端发现你"名字进去了、人没进来"时，会向本机索取调试日志尾部。
+                      # 一条连接最多被问两次（登录后预取一次 + 判定卡住时一次），
+                      # 只发上面那个调试文件的尾部，不含聊天与账号信息。
+                      send_client_log: true
+
+                      # 单次回传的尾部上限（KiB，16-512）。
+                      max_kb: 256
                     """;
             Files.writeString(configPath, yaml, StandardCharsets.UTF_8);
         } catch (IOException e) {

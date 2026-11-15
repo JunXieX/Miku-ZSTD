@@ -112,6 +112,7 @@ public final class ZstdCommand {
 
         source.sendMessage(Component.text("  " + mikumc.zstd.protocol.ZstdDebugLog.statsLine(),
                 NamedTextColor.GRAY));
+        source.sendMessage(Component.text("  " + ZstdVelocityDiag.statusLine(), NamedTextColor.GRAY));
         source.sendMessage(Component.text("  带宽剖析：" + (cfg.profiler ? "开启（每 60 秒写进调试日志）" : "关闭"),
                 NamedTextColor.GRAY));
     }
@@ -141,13 +142,15 @@ public final class ZstdCommand {
             plugin.applyDebugFromConfig();
         }
         ZstdBandwidthProfiler.start(ZstdVelocityConfig.INSTANCE.profiler, 60);
+        ZstdVelocityDiag.applyConfig();
         source.sendMessage(Component.text("配置已重载。", NamedTextColor.GREEN));
         // ⚠️ 必须说清楚作用范围，否则管理员会以为 reload 没生效。三类参数都不会作用于已有连接：
         //   · level / window_log：连接建立时应用到该连接的 zstd 上下文（见 ZstdChannelManager 构造器）；
         //   · batch_window_ms / batch_max_packets：编码器 handlerAdded 时快照；
         //   · threads：线程池只在首次 init 时固定。
         source.sendMessage(Component.text(
-                "即时生效：logging 段（file / max_file_mb / keep_files / console_debug / profiler）、bossbar.format；"
+                "即时生效：logging 段（file / max_file_mb / keep_files / console_debug / profiler）、"
+                        + "diagnostics 段、bossbar.format；"
                         + "需新连接：level、window_log、batch_window_ms、batch_max_packets、batch_max_bytes；"
                         + "需重启代理：threads。已有连接仍在用旧值。",
                 NamedTextColor.YELLOW));

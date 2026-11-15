@@ -7,6 +7,7 @@ import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelPipeline;
 import io.netty.channel.ChannelPromise;
 import io.netty.util.ReferenceCountUtil;
+import mikumc.zstd.protocol.ZstdDiagFrames;
 import mikumc.zstd.protocol.ZstdNegotiateStatus;
 import mikumc.zstd.protocol.ZstdVarInts;
 import mikumc.zstd.protocol.ZstdDebugLog;
@@ -183,6 +184,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
     @Override
     public void handlerAdded(ChannelHandlerContext ctx) {
         this.selfCtx = ctx;
+        ZstdVelocityDiag.open(ctx.channel());
         // 记录类来源：plugins/ 下若存在同 id 的多个 jar，Velocity 只会加载其一，
         // 此时"改了代码却没生效"极难察觉——这行日志可以直接确认加载的是哪个 jar
         ZstdDebugLog.d("[Zstd] ZstdHijacker loaded from {}",
@@ -222,6 +224,25 @@ public class ZstdHijacker extends ChannelDuplexHandler {
             // 其它插件发起的、txId 恰为 0 的登录查询应答会被我们误吞
             Object idValue = invokeOrNull(M_RESP_ID, msg);
             int txId = idValue instanceof Number n ? n.intValue() : 0;
+            if (mgr.isDiagTxId(txId)) {
+                // 诊断应答（预取/卡住探针）：txId 在本侧登记过就必须吃掉。
+                // 下传的后果比丢一条日志严重得多：内核没有对应的 inflight，
+                // 会按协议错误处置，把这条"卡住但还有救"的连接直接断掉。
+                try {
+                    Object contentValue = invokeOrNull(M_RESP_CONTENT, msg);
+                    byte[] payload = null;
+                    if (contentValue instanceof ByteBuf bb) {
+                        payload = new byte[bb.readableBytes()];
+                        bb.getBytes(bb.readerIndex(), payload);
+                    }
+                    ZstdVelocityDiag.onAnswer(ctx.channel(), txId, payload);
+                } catch (Throwable t) {
+                    ZstdDebugLog.d("[Zstd] diag answer handling failed: {}", t.toString());
+                } finally {
+                    ReferenceCountUtil.release(msg);
+                }
+                return;
+            }
             if (mgr.getNegotiateTxId() != 0 && txId == mgr.getNegotiateTxId()) {
                 try {
                     Object contentValue = invokeOrNull(M_RESP_CONTENT, msg);
@@ -232,6 +253,10 @@ public class ZstdHijacker extends ChannelDuplexHandler {
                         status = readStatus(data);
                     }
                     mgr.markNegotiateResponse(status, success);
+                    if (success && status == ZstdNegotiateStatus.READY) {
+                        // 客户端认得模组才值得预取：它这一轮就算卡死，上一轮的痕迹还在文件里。
+                        ZstdVelocityDiag.onNegotiated(ctx.channel());
+                    }
                     // 立即触发激活（若 SetCompression 已写出），省掉最长 100ms 的轮询等待
                     ZstdHijacker.notifyAnswerReceived(ctx.channel());
                 } finally {
@@ -370,6 +395,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
      */
     @Override
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+        ZstdVelocityDiag.close(ctx.channel());
         failHeldPromises(new ClosedChannelException());
         super.channelInactive(ctx);
     }
@@ -390,6 +416,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
      */
     @Override
     public void handlerRemoved(ChannelHandlerContext ctx) throws Exception {
+        ZstdVelocityDiag.close(ctx.channel());
         failHeldPromises(new ClosedChannelException());
         super.handlerRemoved(ctx);
     }
@@ -738,6 +765,51 @@ public class ZstdHijacker extends ChannelDuplexHandler {
             }
         } catch (Exception e) {
             LOGGER.error("[Zstd] Failed to send negotiate", e);
+        }
+    }
+
+    /**
+     * 发一条 {@code zstd:diag} 查询（卡住取证用）。
+     *
+     * <p>与 {@link #sendNegotiateNow} 同一条发送路径：登录查询必须从
+     * {@code minecraft-encoder} 的 context 写出，帧长度才会被补上。</p>
+     *
+     * @param mode {@link ZstdDiagFrames#MODE_STALL} 或 {@link ZstdDiagFrames#MODE_PREFLIGHT}
+     */
+    static void sendDiagQuery(Channel channel, byte mode) {
+        try {
+            ChannelHandlerContext writeCtx = loginQueryWriteCtx(channel.pipeline());
+            if (writeCtx == null) {
+                return;
+            }
+            ZstdChannelManager mgr = channel.attr(ZstdChannelManager.KEY).get();
+            if (mgr == null) {
+                return;
+            }
+            int txId = ThreadLocalRandom.current().nextInt(1, Integer.MAX_VALUE);
+            boolean stall = mode == ZstdDiagFrames.MODE_STALL;
+            boolean claimed = stall ? mgr.claimStallTxId(txId) : mgr.claimPreflightTxId(txId);
+            if (!claimed) {
+                return;
+            }
+            ByteBuf buf = writeCtx.alloc().buffer();
+            boolean written = false;
+            try {
+                ZstdVarInts.write(buf, 0x04);
+                ZstdVarInts.write(buf, txId);
+                ZstdVarInts.writeString(buf, ZstdDiagFrames.CHANNEL);
+                ZstdDiagFrames.writeRequest(buf, ZstdDiagFrames.PROTOCOL_VERSION, mode);
+                writeCtx.writeAndFlush(buf);
+                written = true;
+                ZstdDebugLog.d("[Zstd] Sent zstd:diag mode={} txId={} remote={}", mode, txId,
+                        channel.remoteAddress());
+            } finally {
+                if (!written && buf.refCnt() > 0) {
+                    buf.release();
+                }
+            }
+        } catch (Throwable t) {
+            ZstdDebugLog.d("[Zstd] 诊断查询发送失败（忽略）: {}", t.toString());
         }
     }
 

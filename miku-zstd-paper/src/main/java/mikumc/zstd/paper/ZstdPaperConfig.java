@@ -56,6 +56,24 @@ public class ZstdPaperConfig {
     /** 调试文件保留的历史份数。 */
     public final int debugKeepFiles;
 
+    /** 是否启用"卡住会话自动取证"（默认开：判定卡住时拉取客户端日志尾部并落盘）。 */
+    public final boolean diagnosticsEnabled;
+
+    /** 判定"卡住"的阈值（毫秒，5000-120000，默认 15000）。 */
+    public final int stallDetectMs;
+
+    /** 卡住时是否向客户端索取调试日志尾部。 */
+    public final boolean pullClientLog;
+
+    /** 登录协商成功后是否立刻预取一次"上一轮的尾巴"（覆盖客户端已卡死、这次问不到的情况）。 */
+    public final boolean preflight;
+
+    /** 单次取尾部的大小上限（KiB，16-1024，默认 256），同时是服务端接受上限。 */
+    public final int diagMaxKb;
+
+    /** 保留的现场组数（1-100，默认 20）。 */
+    public final int keepBundles;
+
     /** BossBar 文本模板（支持 & 颜色代码与 %players%/%raw%/%wire%/%ratio% 占位符）。 */
     public final String bossbarFormat;
 
@@ -104,6 +122,14 @@ public class ZstdPaperConfig {
         this.debugFile = getString(l, "file", "logs/zstd-debug.log");
         this.debugMaxFileMb = clamp(getInt(l, "max_file_mb", 8), 1, 128);
         this.debugKeepFiles = clamp(getInt(l, "keep_files", 2), 0, 10);
+
+        Map<String, Object> dg = section(map, "diagnostics");
+        this.diagnosticsEnabled = getBool(dg, "enabled", true);
+        this.stallDetectMs = clamp(getInt(dg, "stall_detect_ms", 15000), 5000, 120000);
+        this.pullClientLog = getBool(dg, "pull_client_log", true);
+        this.preflight = getBool(dg, "preflight", true);
+        this.diagMaxKb = clamp(getInt(dg, "max_kb", 256), 16, 1024);
+        this.keepBundles = clamp(getInt(dg, "keep_bundles", 20), 1, 100);
 
         Map<String, Object> bb = section(map, "bossbar");
         this.bossbarFormat = getString(bb, "format", DEFAULT_BOSSBAR_FORMAT);
@@ -201,6 +227,25 @@ public class ZstdPaperConfig {
                       # 玩家在登录/配置阶段停留较久（资源包下载）时，迟到应答若漏给原版登录监听器
                       # 会被判为 unexpected query response 而断连；这个窗口要盖住整个登录+配置阶段。
                       late_answer_window_ms: 120000
+
+                    diagnostics:
+                      # ── 卡住会话自动取证（6.1.1）──
+                      # 判定"名字进来了、人没进来"的连接卡住后，自动做两件事：
+                      #   1) 把本端调试文件尾部与连接事实写进 logs/stall/<玩家>-<时间>/；
+                      #   2) 向该玩家的客户端要一份它自己的调试日志尾部（需客户端 6.1.1+）。
+                      # 现场目录三件套：server.log / client.log.gz / session.txt。
+                      enabled: true
+                      # 判定阈值（毫秒，5000-120000）。太小会把慢客户端也当卡住。
+                      stall_detect_ms: 15000
+                      # 卡住时向客户端索取日志尾部。
+                      pull_client_log: true
+                      # 登录协商成功后立刻取一次"上一轮尾巴"：客户端已经卡死时，
+                      # 本次查询它读不到，但上一次留下的痕迹能这样带上来。
+                      preflight: true
+                      # 取尾部大小上限（KiB，16-1024），同时也是服务端接受上限。
+                      max_kb: 256
+                      # 保留多少组现场（1-100），超出按时间删最旧。
+                      keep_bundles: 20
 
                     bossbar:
                       # ── BossBar 实时监控文本（/mikuzstd bar 开关）──

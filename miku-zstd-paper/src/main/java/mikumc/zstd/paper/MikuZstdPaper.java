@@ -67,6 +67,24 @@ public class MikuZstdPaper extends JavaPlugin {
         ZstdPaperConfig.load(Path.of(getDataFolder().getPath(), "config.yml"));
         initDebugLog();
 
+        // 卡住会话自动取证：连接由协商器登记，玩家名这里登记（异步登录阶段最早能拿到）。
+        ZstdPaperDiag.start(this, getDataFolder().toPath());
+        try {
+            getServer().getPluginManager().registerEvents(new org.bukkit.event.Listener() {
+                @org.bukkit.event.EventHandler
+                public void onPreLogin(org.bukkit.event.player.AsyncPlayerPreLoginEvent event) {
+                    ZstdPaperDiag.onPreLogin(event.getName(), event.getAddress());
+                }
+
+                @org.bukkit.event.EventHandler
+                public void onJoin(org.bukkit.event.player.PlayerJoinEvent event) {
+                    // 进服即"没卡住"：证明这一步是必须的，否则每个正常玩家都会被误判。
+                    ZstdPaperDiag.onJoin(event.getPlayer().getAddress());
+                }
+            }, this);
+        } catch (Throwable t) {
+            LOGGER.warn("[Zstd] 登记卡住取证的名字来源失败（不影响连接）: {}", t.toString());
+        }
 
         // 命令与监控不依赖压缩管线。代理后端常将阈值设为 -1，仍须注册可执行命令。
         registerPermissions();
@@ -142,6 +160,7 @@ public class MikuZstdPaper extends JavaPlugin {
             LOGGER.warn("[Zstd] 关闭上下文池时异常", t);
         }
         unregisterPermissions();
+        ZstdPaperDiag.stop();
         LOGGER.info("[Zstd] Miku-ZSTD Paper 已停用");
         // ⚠️ 必须是最后一步：上面每一步的诊断都要先落到文件；close 会把队列里剩下的行刷完、
         // 再结束写线程（不留下持有本插件类加载器的线程，插件重载才不泄漏）。

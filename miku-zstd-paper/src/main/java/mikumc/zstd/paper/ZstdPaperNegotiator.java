@@ -125,7 +125,16 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
             if (isQueryAnswer(msg)) {
                 int switchTx = readSwitchTxId(msg);
                 ZstdPaperChannelManager m = ctx.channel().attr(ZstdPaperChannelManager.KEY).get();
-                if (m != null && (readInt(msg, "transactionId", "id", "transactionID") == m.getNegotiateTxId()
+                int answerTx = readInt(msg, "transactionId", "id", "transactionID");
+                // 诊断应答（预取/卡住探针）与协商应答一样，绝不能漏给原版登录监听器：
+                // 它不认识这两个 txId，会把"卡住但还有救"的连接直接按 unexpected query response 断开。
+                if (m != null && m.isDiagTxId(answerTx)) {
+                    byte[] diagPayload = readBytes(msg, "data", "payload", "contents");
+                    io.netty.util.ReferenceCountUtil.release(msg);
+                    ZstdPaperDiag.onAnswer(ctx.channel(), answerTx, diagPayload);
+                    return;
+                }
+                if (m != null && (answerTx == m.getNegotiateTxId()
                         || (switchTx > 0 && m.isReplaced() && m.markSwitchConfirmed(switchTx)))) {
                     io.netty.util.ReferenceCountUtil.release(msg);
                     return;
@@ -182,6 +191,12 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
             String cn = msg.getClass().getSimpleName();
             if (cn.contains("Query") || cn.contains("Plugin")) {
                 int tx = readInt(msg, "transactionId", "id", "transactionID");
+                if (tx != 0 && mgr.isDiagTxId(tx)) {
+                    byte[] diagPayload = readBytes(msg, "data", "payload", "contents");
+                    io.netty.util.ReferenceCountUtil.release(msg);
+                    ZstdPaperDiag.onAnswer(ctx.channel(), tx, diagPayload);
+                    return;
+                }
                 if (tx != 0 && tx == mgr.getNegotiateTxId()) {
                     byte[] payload = readBytes(msg, "data", "payload", "contents");
                     // 取不到字节 = 客户端没理解这次查询（success=false），与"理解了但拒绝"必须分开表述
@@ -200,6 +215,10 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
                             cn, tx, status, success, ctx.channel().remoteAddress());
                     io.netty.util.ReferenceCountUtil.release(msg);
                     mgr.markResponse(status, success);
+                    if (success && status == ZstdNegotiateStatus.READY) {
+                        // 客户端认得这个模组才值得预取：它这一轮就算卡死，上一轮的痕迹还在文件里。
+                        ZstdPaperDiag.onNegotiated(ctx.channel());
+                    }
                     ctx.channel().eventLoop().execute(() -> tryActivate(ctx, 0));
                     return;
                 }
@@ -551,7 +570,15 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
     }
 
     @Override
+    public void handlerAdded(ChannelHandlerContext ctx) throws Exception {
+        // 卡住取证按连接登记：只有被本协商器看过的连接才可能在"卡住"时被找回来。
+        ZstdPaperDiag.open(ctx.channel());
+        super.handlerAdded(ctx);
+    }
+
+    @Override
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+        ZstdPaperDiag.close(ctx.channel());
         releaseHeldOnTeardown();
         super.channelInactive(ctx);
     }
@@ -570,6 +597,7 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
      */
     @Override
     public void handlerRemoved(ChannelHandlerContext ctx) throws Exception {
+        ZstdPaperDiag.close(ctx.channel());
         releaseHeldOnTeardown();
         super.handlerRemoved(ctx);
     }

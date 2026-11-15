@@ -127,6 +127,37 @@ class ZstdVelocityConfigLoadTest {
         }
     }
 
+@Test
+    @DisplayName("diagnostics 段缺省：开启取证、15s 判定、预取开启、256KiB 尾、保留 20 组")
+    void diagnosticsSectionDefaults() throws IOException {
+        Path file = directory.resolve("config.yml");
+        Files.writeString(file, "logging: {}\n", StandardCharsets.UTF_8);
+        ZstdVelocityConfig.load(file);
+        assertTrue(ZstdVelocityConfig.INSTANCE.diagnosticsEnabled);
+        assertTrue(ZstdVelocityConfig.INSTANCE.pullClientLog);
+        assertTrue(ZstdVelocityConfig.INSTANCE.preflight);
+        assertEquals(15000, ZstdVelocityConfig.INSTANCE.stallDetectMs);
+        assertEquals(256, ZstdVelocityConfig.INSTANCE.diagMaxKb);
+        assertEquals(20, ZstdVelocityConfig.INSTANCE.keepBundles);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "diagnostics: {stall_detect_ms: 1, max_kb: 1, keep_bundles: 0}",
+            "diagnostics: {stall_detect_ms: 999999, max_kb: 99999, keep_bundles: 9999}"})
+    @DisplayName("diagnostics 段越界值被夹取到合法区间")
+    void diagnosticsSectionIsClamped(String contents) throws IOException {
+        Path file = directory.resolve("config.yml");
+        Files.writeString(file, contents, StandardCharsets.UTF_8);
+        ZstdVelocityConfig.load(file);
+        int stall = ZstdVelocityConfig.INSTANCE.stallDetectMs;
+        int kb = ZstdVelocityConfig.INSTANCE.diagMaxKb;
+        int keep = ZstdVelocityConfig.INSTANCE.keepBundles;
+        assertTrue(stall >= 5000 && stall <= 120000, "stall_detect_ms 越界: " + stall);
+        assertTrue(kb >= 16 && kb <= 1024, "max_kb 越界: " + kb);
+        assertTrue(keep >= 1 && keep <= 100, "keep_bundles 越界: " + keep);
+    }
+
     @Test
     @DisplayName("旧阈值与未知键在重复真实load后原文保留")
     void userContentsSurviveRepeatedLoad() throws IOException {

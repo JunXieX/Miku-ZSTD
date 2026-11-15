@@ -99,6 +99,7 @@ public final class ZstdPaperCommand implements BasicCommand {
                 + " 下行批处理=" + cfg.batchWindowMs + "ms/" + cfg.batchMaxPackets + "包");
 
         sender.sendMessage("§7  " + mikumc.zstd.protocol.ZstdDebugLog.statsLine());
+        sender.sendMessage("§7  " + ZstdPaperDiag.statusLine());
         sender.sendMessage("§7  在线玩家：" + org.bukkit.Bukkit.getOnlinePlayers().size());
         sender.sendMessage("§7  线程池：" + ZstdCompressPool.summary());
         sender.sendMessage("§7  分段耗时：" + ZstdCompressPool.latencyLine());

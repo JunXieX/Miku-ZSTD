@@ -88,6 +88,24 @@ public class ZstdVelocityConfig {
      */
     public final int answerTimeoutMs;
 
+    /** 是否启用"卡住会话自动取证"（默认开：判定卡住时拉取客户端日志尾部并落盘）。 */
+    public final boolean diagnosticsEnabled;
+
+    /** 判定"卡住"的阈值（毫秒，5000-120000，默认 15000）。 */
+    public final int stallDetectMs;
+
+    /** 卡住时是否向客户端索取调试日志尾部。 */
+    public final boolean pullClientLog;
+
+    /** 协商成功后是否立刻预取一次"上一轮的尾巴"（覆盖客户端已卡死、这次问不到的情况）。 */
+    public final boolean preflight;
+
+    /** 单次取尾部的大小上限（KiB，16-1024，默认 256），同时是服务端接受上限。 */
+    public final int diagMaxKb;
+
+    /** 保留的现场组数（1-100，默认 20）。 */
+    public final int keepBundles;
+
     /**
      * ⚠️ <b>所有数值都经 {@link #clamp(int, int, int)} 夹取</b>，不接受越界值。
      *
@@ -115,6 +133,14 @@ public class ZstdVelocityConfig {
         this.debugMaxFileMb = clamp(getInt(l, "max_file_mb", 8), 1, 128);
         this.debugKeepFiles = clamp(getInt(l, "keep_files", 2), 0, 10);
         this.profiler = getBool(l, "profiler", false);
+
+        Map<String, Object> dg = getMap(map, "diagnostics");
+        this.diagnosticsEnabled = getBool(dg, "enabled", true);
+        this.stallDetectMs = clamp(getInt(dg, "stall_detect_ms", 15000), 5000, 120000);
+        this.pullClientLog = getBool(dg, "pull_client_log", true);
+        this.preflight = getBool(dg, "preflight", true);
+        this.diagMaxKb = clamp(getInt(dg, "max_kb", 256), 16, 1024);
+        this.keepBundles = clamp(getInt(dg, "keep_bundles", 20), 1, 100);
 
         Map<String, Object> bb = getMap(map, "bossbar");
         this.bossbarFormat = getString(bb, "format", mikumc.zstd.protocol.ZstdBossBarFormat.DEFAULT_FORMAT);
@@ -222,6 +248,25 @@ public class ZstdVelocityConfig {
                       # 超时后本端退回原版（照常进服，只是这一轮不走 zstd），不再直接断开连接。
                       # 必须显著大于客户端 ZstdLoginNetworking 的看门狗（固定 2000ms）。
                       answer_timeout_ms: 10000
+
+                    diagnostics:
+                      # ── 卡住会话自动取证（6.1.1）──
+                      # 玩家名已经确认、连接却始终没接上后端时，自动做两件事：
+                      #   1) 把本端调试文件尾部与连接事实写进 logs/stall/<玩家>-<时间>/；
+                      #   2) 向该玩家的客户端要一份它自己的调试日志尾部（需客户端 6.1.1+）。
+                      # 现场目录三件套：server.log / client.log.gz / session.txt。
+                      enabled: true
+                      # 判定阈值（毫秒，5000-120000）。太小会把慢客户端也当卡住。
+                      stall_detect_ms: 15000
+                      # 卡住时向客户端索取日志尾部。
+                      pull_client_log: true
+                      # 协商成功后立刻取一次"上一轮尾巴"：客户端已经卡死时，
+                      # 本次查询它读不到，但上一次留下的痕迹能这样带上来。
+                      preflight: true
+                      # 取尾部大小上限（KiB，16-1024），同时也是服务端接受上限。
+                      max_kb: 256
+                      # 保留多少组现场（1-100），超出按时间删最旧。
+                      keep_bundles: 20
 
                     bossbar:
                       # ── BossBar 实时监控文本（/mikuzstd bar 开关）──

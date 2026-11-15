@@ -98,7 +98,42 @@ public class ZstdPaperChannelManager {
         return true;
     }
 
+    /**
+     * 诊断查询（{@code zstd:diag}）的两个 txId：预取与卡住探针各一个，-1 表示还没发。
+     *
+     * <p>⚠️ 注册过协商 txId 的同类应答都必须在本处理器里吃掉：漏给
+     * {@code ServerLoginPacketListenerImpl} 就是 "unexpected query response" 直接断连——
+     * 而这条连接本来只是"卡住"，还有救，不能因为加了诊断反而把它踢掉。</p>
+     */
+    private volatile int preflightTxId = -1;
+    private volatile int stallTxId = -1;
 
+    public int getPreflightTxId() {
+        return preflightTxId;
+    }
+
+    public int getStallTxId() {
+        return stallTxId;
+    }
+
+    /** 是否属于本连接发出的诊断查询（预取或卡住探针）。 */
+    public boolean isDiagTxId(int txId) {
+        return txId > 0 && (txId == preflightTxId || txId == stallTxId);
+    }
+
+    /** 抢占预取查询的 txId：每条连接只发一次。 */
+    public synchronized boolean claimPreflightTxId(int txId) {
+        if (this.preflightTxId != -1) return false;
+        this.preflightTxId = txId;
+        return true;
+    }
+
+    /** 抢占卡住探针的 txId：每条连接只发一次（卡住只会判定一次）。 */
+    public synchronized boolean claimStallTxId(int txId) {
+        if (this.stallTxId != -1) return false;
+        this.stallTxId = txId;
+        return true;
+    }
 
     /**
      * 回填协商结论。语义与另两端完全一致：

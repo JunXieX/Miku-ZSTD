@@ -13,8 +13,12 @@ import org.slf4j.LoggerFactory;
 import cn.miku.zstd.mixin.ClientHandshakePacketListenerAccessor;
 import cn.miku.zstd.mixin.ConnectionAccessor;
 
+import java.nio.file.Path;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.function.Consumer;
+import mikumc.zstd.protocol.ZstdDiagFrames;
 import mikumc.zstd.protocol.ZstdNegotiateStatus;
 
 /**
@@ -56,6 +60,22 @@ public final class ZstdLoginNetworking {
 
     public static void register() {
         ClientLoginNetworking.registerGlobalReceiver(ZstdNegotiatePayload.ID, ZstdLoginNetworking::handleNegotiate);
+        ClientLoginNetworking.registerGlobalReceiver(ZstdDiagPayload.ID, ZstdLoginNetworking::handleDiag);
+    }
+
+    /**
+     * 读尾部与压缩都在这里做：它们要碰磁盘，不能占用 Netty event loop。
+     *
+     * <p>单线程足够：这条通道一条连接最多被问两次，且只在玩家已经卡住时出现。</p>
+     */
+    private static final ExecutorService DIAG_WORKER = Executors.newSingleThreadExecutor(runnable -> {
+        Thread thread = new Thread(runnable, "miku-zstd-diag-client");
+        thread.setDaemon(true);
+        return thread;
+    });
+
+    /** 一次诊断回传的内容。 */
+    private record DiagBody(int status, int rawLength, byte[] gzip) {
     }
 
     private static CompletableFuture<FriendlyByteBuf> handleNegotiate(
@@ -265,6 +285,109 @@ public final class ZstdLoginNetworking {
                     barrier.elapsedMillis(), barrier.outcome(), channel.remoteAddress());
             return answer(effective);
         });
+    }
+
+    /**
+     * 服务端卡住取证：把本机调试日志尾部压上应答。
+     *
+     * <p>⚠️ 两个约束必须同时满足，否则这条通道会帮倒忙：</p>
+     * <ul>
+     *   <li><b>不能占 event loop 做文件 I/O</b>：读尾部与 gzip 都丢给 {@link #DIAG_WORKER}；</li>
+     *   <li><b>应答必须等压缩管线</b>：它和 {@code zstd:negotiate} 的应答走同一条写出路径，
+     *       原版压缩装好之后没有长度前缀就是坏帧，服务端读不出来。</li>
+     * </ul>
+     *
+     * <p>取不到 Channel 或读文件失败时也要回一个状态码：服务端那边正卡在"等不到应答"里，
+     * 一个明确的 {@code ERROR}/{@code NO_LOG} 比沉默有用得多。</p>
+     */
+    private static CompletableFuture<FriendlyByteBuf> handleDiag(
+            Minecraft client, ClientHandshakePacketListenerImpl handler,
+            FriendlyByteBuf data, Consumer<io.netty.channel.ChannelFutureListener> listenerConsumer) {
+        Channel channel = null;
+        try {
+            Connection connection = ((ClientHandshakePacketListenerAccessor) handler).getConnection();
+            channel = ((ConnectionAccessor) connection).getChannel();
+            int requestVersion = data.readInt();
+            byte mode = data.readByte();
+            ZstdDebugLog.d("[Zstd] diag rx mode={} version={} (client={}, remote={})",
+                    mode, requestVersion, ZstdDiagFrames.PROTOCOL_VERSION, channel.remoteAddress());
+            if (requestVersion != ZstdDiagFrames.PROTOCOL_VERSION) {
+                return CompletableFuture.completedFuture(diagAnswer(
+                        new DiagBody(ZstdDiagFrames.STATUS_ERROR, 0, null)));
+            }
+            if (!ZstdConfig.INSTANCE.sendClientLog) {
+                ZstdDebugLog.d("[Zstd] diag tx skipped: send_client_log=false");
+                return CompletableFuture.completedFuture(diagAnswer(
+                        new DiagBody(ZstdDiagFrames.STATUS_NO_LOG, 0, null)));
+            }
+            final Channel responseChannel = channel;
+            return CompletableFuture.supplyAsync(ZstdLoginNetworking::readDiagBody, DIAG_WORKER)
+                    .handle((body, error) -> {
+                        if (error != null || body == null) {
+                            ZstdDebugLog.d("[Zstd] diag read failed: {}",
+                                    error == null ? "empty" : error.toString());
+                            return new DiagBody(ZstdDiagFrames.STATUS_ERROR, 0, null);
+                        }
+                        return body;
+                    })
+                    .thenCompose(body -> afterCompression(responseChannel, () -> {
+                        ZstdDebugLog.d("[Zstd] diag tx status={} raw={}B gzip={}B",
+                                body.status(), body.rawLength(), body.gzip() == null ? 0 : body.gzip().length);
+                        return diagAnswer(body);
+                    }));
+        } catch (Throwable t) {
+            ZstdDebugLog.d("[Zstd] diag rx failed: {}", t.toString());
+            return CompletableFuture.completedFuture(diagAnswer(
+                    new DiagBody(ZstdDiagFrames.STATUS_ERROR, 0, null)));
+        }
+    }
+
+    /** 读调试文件尾部并压缩；读不到就按 {@code NO_LOG} 回。 */
+    private static DiagBody readDiagBody() {
+        Path file = ZstdDebugLog.file();
+        if (file == null) {
+            return new DiagBody(ZstdDiagFrames.STATUS_NO_LOG, 0, null);
+        }
+        ZstdDiagFrames.Tail tail = ZstdDiagFrames.readTail(file, ZstdConfig.INSTANCE.diagMaxKb << 10);
+        if (tail.isEmpty()) {
+            return new DiagBody(ZstdDiagFrames.STATUS_NO_LOG, 0, null);
+        }
+        byte[] gzip = ZstdDiagFrames.gzip(tail.data());
+        if (gzip == null) {
+            return new DiagBody(ZstdDiagFrames.STATUS_ERROR, tail.data().length, null);
+        }
+        int status = tail.truncated() ? ZstdDiagFrames.STATUS_TRUNCATED : ZstdDiagFrames.STATUS_OK;
+        return new DiagBody(status, tail.data().length, gzip);
+    }
+
+    private static FriendlyByteBuf diagAnswer(DiagBody body) {
+        FriendlyByteBuf buf = new FriendlyByteBuf(Unpooled.buffer());
+        ZstdDiagFrames.writeAnswer(buf, body.status(), ZstdDiagFrames.PROTOCOL_VERSION,
+                body.rawLength(), body.gzip());
+        return buf;
+    }
+
+    /**
+     * 等压缩管线就位后再构造应答（与协商应答同一屏障）。
+     *
+     * <p>⚠️ 屏障可能已被取消（连接关闭 / 下一轮协商开始）。{@code whenComplete} 在取消时同样会
+     * 触发，所以这里不会把应答挂死——迟到总比不回包好。</p>
+     */
+    private static <T> CompletableFuture<T> afterCompression(Channel channel,
+            java.util.function.Supplier<T> build) {
+        CompressionResponseBarrier barrier = channel == null ? null : channel.attr(RESPONSE_BARRIER).get();
+        if (barrier == null) {
+            return CompletableFuture.completedFuture(build.get());
+        }
+        CompletableFuture<T> out = new CompletableFuture<>();
+        barrier.readyFuture().whenComplete((ignored, error) -> {
+            try {
+                out.complete(build.get());
+            } catch (Throwable t) {
+                out.completeExceptionally(t);
+            }
+        });
+        return out;
     }
 
     static final class CompressionResponseBarrier {

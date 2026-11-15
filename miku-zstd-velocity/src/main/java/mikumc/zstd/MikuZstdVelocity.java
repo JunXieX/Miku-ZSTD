@@ -63,6 +63,20 @@ public class MikuZstdVelocity {
                         .build(),
                 mikuCommand);
         installHandshakeSniffer();
+        // 卡住会话自动取证：连接由 ZstdHijacker 登记，玩家名由 PostLoginEvent 登记。
+        ZstdVelocityDiag.start(this, proxy, logger, dataDir);
+    }
+
+    /**
+     * 名字登记：代理端是唯一在"接上后端之前"就知道玩家名的一侧。
+     *
+     * <p>卡住取证要用它给现场目录命名——后端那边只能看到代理的地址，
+     * 拿不到名字，现场就只剩一堆 {@code unknown-*}。</p>
+     */
+    @Subscribe
+    public void onPostLogin(com.velocitypowered.api.event.connection.PostLoginEvent event) {
+        ZstdVelocityDiag.onPostLogin(event.getPlayer().getRemoteAddress(),
+                event.getPlayer().getUsername());
     }
 
     /**
@@ -194,6 +208,7 @@ public class MikuZstdVelocity {
         } catch (Throwable t) {
             logger.warn("[Zstd] failed to shut down ctx pool", t);
         }
+        ZstdVelocityDiag.stop();
         logger.info("[Zstd] Miku-ZSTD shut down");
         // ⚠️ 最后一步：上面的收尾诊断先落盘，再结束写线程（不留持有本插件类加载器的线程）。
         ZstdDebugLog.close();
