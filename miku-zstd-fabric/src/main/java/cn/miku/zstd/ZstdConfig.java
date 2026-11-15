@@ -22,9 +22,48 @@ public class ZstdConfig {
 
     public final boolean hudEnabled;
 
+    /**
+     * 是否把逐连接诊断写进 {@code <游戏目录>/} 下的调试文件（默认<b>开启</b>）。
+     *
+     * <p>⚠️ 客户端没有"服务端控制台"，但 {@code latest.log} 同样不是给玩家看的东西；
+     * 诊断一律进独立的小文件，出问题时玩家直接把这个文件发出来即可，
+     * 不必在一份几十万行的 {@code latest.log} 里翻。</p>
+     */
+    public final boolean debug;
+
+    /** 调试文件路径（相对游戏目录）。 */
+    public final String debugFile;
+
+    /** 单个调试文件的字节上限（MiB）。 */
+    public final int debugMaxFileMb;
+
+    /** 调试文件保留的历史份数。 */
+    public final int debugKeepFiles;
+
     private ZstdConfig(Map<String, Object> map) {
         Map<String, Object> display = section(map, "display");
         this.hudEnabled = getBool(display, "hud_enabled", false);
+
+        Map<String, Object> logging = section(map, "logging");
+        this.debug = getBool(logging, "debug", true);
+        this.debugFile = getString(logging, "file", "Miku-ZSTD/logs/zstd-debug.log");
+        this.debugMaxFileMb = clamp(getInt(logging, "max_file_mb", 8), 1, 128);
+        this.debugKeepFiles = clamp(getInt(logging, "keep_files", 2), 0, 10);
+    }
+
+    private static int clamp(int value, int min, int max) {
+        if (value < min) return min;
+        return Math.min(value, max);
+    }
+
+    private static int getInt(Map<String, Object> map, String key, int def) {
+        Object value = map.get(key);
+        return value instanceof Number ? ((Number) value).intValue() : def;
+    }
+
+    private static String getString(Map<String, Object> map, String key, String def) {
+        Object value = map.get(key);
+        return value instanceof String s && !s.isBlank() ? s : def;
     }
 
     private static boolean getBool(Map<String, Object> map, String key, boolean def) {
@@ -74,6 +113,19 @@ public class ZstdConfig {
                       # HUD 显示下行速率与压缩率。
                       # 游戏内按 F8 可临时开关（不落盘，重启后恢复此设置）。
                       hud_enabled: false
+
+                    logging:
+                      # ── 调试日志（默认开启，写文件、不进 latest.log）──
+                      # 记协商、看门狗、切换确认、管线安装这些逐连接诊断。
+                      # 连不上服/卡在连接协商时，把下面这个文件发出来即可。
+                      debug: true
+
+                      # 文件路径（相对游戏目录）。默认 <游戏目录>/Miku-ZSTD/logs/zstd-debug.log
+                      file: "Miku-ZSTD/logs/zstd-debug.log"
+
+                      # 单个文件上限（MiB，1-128）与保留的历史份数（0-10）。
+                      max_file_mb: 8
+                      keep_files: 2
                     """;
             Files.writeString(configPath, yaml, StandardCharsets.UTF_8);
         } catch (IOException e) {

@@ -7,6 +7,7 @@ import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelPromise;
 import mikumc.zstd.protocol.ZstdNegotiateStatus;
 import mikumc.zstd.protocol.ZstdVarInts;
+import mikumc.zstd.protocol.ZstdDebugLog;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -194,7 +195,8 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
                         status = ZstdNegotiateStatus.sanitize(
                                 ZstdVarInts.readOr(payload, cursor, ZstdNegotiateStatus.FALLBACK));
                     }
-                    LOGGER.info("[Zstd] 协商应答: {} tx={} status={} success={} remote={}",
+                    // 每条连接都会命中一次，写调试文件而不是控制台：控制台只留"激活成功"那一行。
+                    ZstdDebugLog.d("[Zstd] 协商应答: {} tx={} status={} success={} remote={}",
                             cn, tx, status, success, ctx.channel().remoteAddress());
                     io.netty.util.ReferenceCountUtil.release(msg);
                     mgr.markResponse(status, success);
@@ -232,7 +234,7 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
             ZstdVarInts.writeString(buf, "zstd:negotiate");
             buf.writeInt(ZstdPaperChannelManager.PROTOCOL_VERSION); // 载荷：只有版本
             ctx.writeAndFlush(buf);
-            LOGGER.info("[Zstd] Sent zstd:negotiate txId={} remote={}", txId, ctx.channel().remoteAddress());
+            ZstdDebugLog.d("[Zstd] Sent zstd:negotiate txId={} remote={}", txId, ctx.channel().remoteAddress());
         } catch (Throwable t) {
             if (buf.refCnt() > 0) buf.release();
             throw t;
@@ -304,7 +306,7 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
             // 这条日志是"该连接到底有没有压缩层"的唯一一手证据：
             // 有它 = setupCompression 已执行（客户端即将切压缩）；没有它却回落原版，
             // 说明这条连接的 SetCompression 压根没发出（阈值 <0 或 isMemoryConnection）。
-            LOGGER.info("[Zstd] SetCompression 写出（remote={}, pipeline={}）",
+            ZstdDebugLog.d("[Zstd] SetCompression 写出（remote={}, pipeline={}）",
                     ctx.channel().remoteAddress(), ctx.channel().pipeline().names());
             sendNegotiate(ctx); // 兜底（写操作放在锁外，避免持锁进 netty）
             super.write(ctx, msg, promise);
@@ -365,7 +367,7 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
 
         // 走到这里说明应答是 0（就绪）：isRefused 那条分支已经处理了 2（保持原版）。
         // 没有字典下发或补偿阶段；安装就绪后等待原版 switch 确认。
-        LOGGER.debug("[Zstd] 正在安装下行 zstd 编码器 (pipeline={})", channel.pipeline().names());
+        ZstdDebugLog.d("[Zstd] 正在安装下行 zstd 编码器 (pipeline={})", channel.pipeline().names());
         // 安装阶段仍然走自己的重试循环（计数从 0 起）：它等的是原版 handler 出现，
         // 与"等协商应答"是两条独立的时序，共用一个 attempt 会让晚进入安装阶段的一方
         // 一上来就被判预算耗尽。
@@ -409,7 +411,7 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
             // SetCompression"。旧标签写成 setCompressionSeen，运维会据此误判成"服务器没发压缩包"。
             // 级别也必须是 debug：24 人在线的服上，每次回落都打一整行 pipeline 会淹没真问题；
             // 需要它的时候把 logging.debug 打开即可（5.0.36 起默认就是开的）。
-            LOGGER.debug("[Zstd] anchors 未出现（compress/decompress 缺失）— 该连接回落原版; "
+            ZstdDebugLog.d("[Zstd] anchors 未出现（compress/decompress 缺失）— 该连接回落原版; "
                             + "remote={}, holding={}, pipeline={}",
                     channel.remoteAddress(), holding, channel.pipeline().names());
             finishVanilla(ctx);
@@ -442,7 +444,7 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
         }
         mgr.setReplaced(true); // 计数已内聚在 setReplaced 内（幂等，避免重复 +1）
         LOGGER.info("[Zstd] zstd transport activated on {}", MikuZstdPaper.platformName());
-        LOGGER.debug("[Zstd] activation pipeline: {}", channel.pipeline().names());
+        ZstdDebugLog.d("[Zstd] activation pipeline: {}", channel.pipeline().names());
 
         // ⚠️ 闸门此刻正扣着登录期的大帧（例如 LoginSuccess 压缩帧）。客户端在收到它之前
         // 不可能完成登录，也就没有任何东西会触发它的切换 —— 必须主动补一条"服务端已就绪"。
@@ -525,7 +527,7 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
             ctx.pipeline().remove(this);
         } catch (Throwable t) {
             // 幂等：可能已移除、或通道正在关闭 → 无需处理
-            LOGGER.debug("[Zstd] negotiator self-removal skipped: {}", t.toString());
+            ZstdDebugLog.d("[Zstd] negotiator self-removal skipped: {}", t.toString());
         }
     }
 
@@ -541,7 +543,7 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
             heldPackets.clear();
             heldPromises.clear();
         }
-        LOGGER.debug("[Zstd] releasing {} packet(s) held during activation window", packets.size());
+        ZstdDebugLog.d("[Zstd] releasing {} packet(s) held during activation window", packets.size());
         for (int i = 0; i < packets.size(); i++) {
             ctx.write(packets.get(i), promises.get(i));
         }
@@ -589,7 +591,7 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
             io.netty.util.ReferenceCountUtil.release(p);
         }
         if (!promises.isEmpty()) {
-            LOGGER.debug("[Zstd] negotiator torn down with {} held packet(s) — failing their promises",
+            ZstdDebugLog.d("[Zstd] negotiator torn down with {} held packet(s) — failing their promises",
                     promises.size());
             for (ChannelPromise p : promises) {
                 p.tryFailure(new java.nio.channels.ClosedChannelException());
@@ -646,7 +648,7 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
         if (writeCtx == null) writeCtx = pipeline.context("compression-encoder");
         if (writeCtx == null) writeCtx = pipeline.context("zstd_encoder");
         if (writeCtx == null) {
-            LOGGER.debug("[Zstd] cannot send switch request — no compression anchor in pipeline");
+            ZstdDebugLog.d("[Zstd] cannot send switch request — no compression anchor in pipeline");
             return;
         }
         ByteBuf packet = writeCtx.alloc().buffer();
@@ -662,11 +664,11 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
             ZstdVarInts.write(frame, 0);
             frame.writeBytes(packet);
             writeCtx.writeAndFlush(frame);
-            LOGGER.debug("[Zstd] switch request sent");
+            ZstdDebugLog.d("[Zstd] switch request sent");
         } catch (Throwable t) {
             if (packet.refCnt() > 0) packet.release();
             if (frame.refCnt() > 0) frame.release();
-            LOGGER.debug("[Zstd] failed to send switch request: {}", t.toString());
+            ZstdDebugLog.d("[Zstd] failed to send switch request: {}", t.toString());
         } finally {
             if (packet.refCnt() > 0) packet.release();
         }
@@ -744,7 +746,7 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
                 return out;
             }
         }
-        LOGGER.debug("[Zstd] 未能从 {} 取出应答字节（该包的负载结构可能又变了）", v.getClass().getName());
+        ZstdDebugLog.d("[Zstd] 未能从 {} 取出应答字节（该包的负载结构可能又变了）", v.getClass().getName());
         return null;
     }
 

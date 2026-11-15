@@ -1,5 +1,6 @@
 package cn.miku.zstd;
 
+import mikumc.zstd.protocol.ZstdDebugLog;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.Font;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
@@ -90,7 +91,7 @@ public final class ZstdHudRenderer {
         if (changed) {
             LOGGER.info("[Zstd] {}", message);
         } else {
-            LOGGER.debug("[Zstd] {}", message);
+            ZstdDebugLog.d("[Zstd] {}", message);
         }
     }
 

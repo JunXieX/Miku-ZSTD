@@ -4,6 +4,7 @@ import io.netty.buffer.ByteBuf;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelPipeline;
+import mikumc.zstd.protocol.ZstdDebugLog;
 import mikumc.zstd.protocol.ZstdStepFrames;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -77,7 +78,7 @@ public final class ZstdClientActivation {
         channel.attr(ACTIVATED).set(Boolean.FALSE);
         // 尚未消费任何流字节时才允许保留协商状态，等待后续 SetCompression。
         if (changed) {
-            LOGGER.info("[Zstd] 压缩被对端禁用（threshold<0）——客户端下行退回原版; pipeline={}",
+            ZstdDebugLog.d("[Zstd] 压缩被对端禁用（threshold<0）——客户端下行退回原版; pipeline={}",
                     channel.pipeline().names());
         }
     }
@@ -199,10 +200,10 @@ public final class ZstdClientActivation {
             ZstdStepFrames.writeConfirm(packet, txId, accepted);
             encoder.writeAndFlush(packet);
             packet = null; // 所有权已交给原版上行管线。
-            LOGGER.debug("[Zstd] switch {} sent through vanilla upstream (txId={})",
+            ZstdDebugLog.d("[Zstd] switch {} sent through vanilla upstream (txId={})",
                     accepted ? "confirmation" : "rejection", txId);
         } catch (Throwable t) {
-            LOGGER.debug("[Zstd] failed to send switch response: {}", t.toString());
+            ZstdDebugLog.d("[Zstd] failed to send switch response: {}", t.toString());
         } finally {
             if (packet != null && packet.refCnt() > 0) packet.release();
         }
@@ -261,7 +262,7 @@ public final class ZstdClientActivation {
         if (p.get("zstd_switch_sniffer") != null) {
             if (isBeforeInPipeline(p, "zstd_switch_sniffer", anchor)) return;
             p.remove("zstd_switch_sniffer");
-            LOGGER.debug("[Zstd] switch sniffer was on the wrong side of {} — reinserting", anchor);
+            ZstdDebugLog.d("[Zstd] switch sniffer was on the wrong side of {} — reinserting", anchor);
         }
         p.addBefore(anchor, "zstd_switch_sniffer", new ZstdSwitchSniffer());
     }
@@ -273,7 +274,7 @@ public final class ZstdClientActivation {
         if (p.get("zstd_decoder") != null) {
             if (isBeforeInPipeline(p, "zstd_decoder", anchor)) return true;
             p.remove("zstd_decoder");
-            LOGGER.debug("[Zstd] zstd_decoder was on the wrong side of {} — reinserting", anchor);
+            ZstdDebugLog.d("[Zstd] zstd_decoder was on the wrong side of {} — reinserting", anchor);
         }
         p.addBefore(anchor, "zstd_decoder", new ZstdBatchDecoder());
         return true;

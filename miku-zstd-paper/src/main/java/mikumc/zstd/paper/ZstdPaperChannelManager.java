@@ -2,6 +2,7 @@ package mikumc.zstd.paper;
 
 import com.github.luben.zstd.ZstdCompressCtx;
 import mikumc.zstd.protocol.ZstdCtxPool;
+import mikumc.zstd.protocol.ZstdDebugLog;
 import io.netty.channel.Channel;
 import io.netty.util.AttributeKey;
 import mikumc.zstd.protocol.ZstdCompressLock;
@@ -116,11 +117,11 @@ public class ZstdPaperChannelManager {
         int s = mikumc.zstd.protocol.ZstdNegotiateStatus.sanitize(status);
         this.refused = s == mikumc.zstd.protocol.ZstdNegotiateStatus.VANILLA;
         if (!clientAnswered) {
-            LOGGER.debug("[Zstd] 客户端未识别 zstd:negotiate（未安装 Miku-ZSTD 模组），保持原版 zlib");
+            ZstdDebugLog.d("[Zstd] 客户端未识别 zstd:negotiate（未安装 Miku-ZSTD 模组），保持原版 zlib");
         } else if (this.refused) {
-            LOGGER.debug("[Zstd] 客户端保持原版（status={}）——多为两端版本不匹配", s);
+            ZstdDebugLog.d("[Zstd] 客户端保持原版（status={}）——多为两端版本不匹配", s);
         } else {
-            LOGGER.debug("[Zstd] 协商应答：status={} → 可激活", s);
+            ZstdDebugLog.d("[Zstd] 协商应答：status={} → 可激活", s);
         }
     }
 
@@ -239,7 +240,7 @@ public class ZstdPaperChannelManager {
             p.remove(name);
             return true;
         } catch (Throwable t) {
-            LOGGER.debug("[Zstd] 摘除管线处理器 {} 失败（忽略）: {}", name, t.toString());
+            ZstdDebugLog.d("[Zstd] 摘除管线处理器 {} 失败（忽略）: {}", name, t.toString());
             return false;
         }
     }
@@ -262,7 +263,7 @@ public class ZstdPaperChannelManager {
         var p = channel.pipeline();
         if (p.get("zstd_switch_gate") != null) return true;
         if (p.get("encoder") == null) {
-            LOGGER.debug("[Zstd] 切换闸门无法安装（encoder 锚点缺失）; pipeline={}", p.names());
+            ZstdDebugLog.d("[Zstd] 切换闸门无法安装（encoder 锚点缺失）; pipeline={}", p.names());
             return false;
         }
         if (!hasConfirmAnchor(channel)) return false;
@@ -289,7 +290,7 @@ public class ZstdPaperChannelManager {
                 return;
             }
         }
-        LOGGER.debug("[Zstd] 确认嗅探器未能安装（压缩解码器锚点缺失）; pipeline={}", p.names());
+        ZstdDebugLog.d("[Zstd] 确认嗅探器未能安装（压缩解码器锚点缺失）; pipeline={}", p.names());
     }
 
     /**
@@ -302,7 +303,7 @@ public class ZstdPaperChannelManager {
     public boolean markSwitchConfirmed(int txId) {
         var gate = switchGate;
         if (gate == null) {
-            LOGGER.debug("[Zstd] switch confirmation received after the gate was already released");
+            ZstdDebugLog.d("[Zstd] switch confirmation received after the gate was already released");
             return false;
         }
         return gate.confirm(txId);

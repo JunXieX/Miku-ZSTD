@@ -4,8 +4,6 @@ import io.netty.channel.ChannelDuplexHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelPromise;
 import io.netty.util.ReferenceCountUtil;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.nio.channels.ClosedChannelException;
 import java.util.ArrayList;
@@ -73,8 +71,6 @@ import java.util.concurrent.TimeUnit;
  * </ul>
  */
 public final class ZstdSwitchGate extends ChannelDuplexHandler {
-
-    private static final Logger LOGGER = LoggerFactory.getLogger("miku-zstd");
 
     /** 切换握手的通道标识（写进登录查询包的通道名）。 */
     public static final String CHANNEL = "zstd:switch";
@@ -149,7 +145,7 @@ public final class ZstdSwitchGate extends ChannelDuplexHandler {
     public boolean confirm(int txId) {
         int expected = expectedTxId;
         if (expected != 0 && txId != expected) {
-            LOGGER.debug("[Zstd] switch confirmation txId mismatch: got={}, expected={}", txId, expected);
+            ZstdDebugLog.d("[Zstd] switch confirmation txId mismatch: got={}, expected={}", txId, expected);
             return false;
         }
         release();
@@ -168,15 +164,17 @@ public final class ZstdSwitchGate extends ChannelDuplexHandler {
     public boolean releaseUnconfirmed(int txId) {
         int expected = expectedTxId;
         if (expected != 0 && txId != expected) {
-            LOGGER.debug("[Zstd] switch answer txId mismatch: got={}, expected={}", txId, expected);
+            ZstdDebugLog.d("[Zstd] switch answer txId mismatch: got={}, expected={}", txId, expected);
             return false;
         }
-        LOGGER.debug("[Zstd] switch not confirmed by client (txId={}) — releasing held packets", txId);
+        ZstdDebugLog.d("[Zstd] switch not confirmed by client (txId={}) — releasing held packets", txId);
         // ⚠️ 这是<b>正常兼容路径</b>而非异常：旧版客户端没有切换嗅探器，收到询问后会按原版
         // 规则回一个空应答，而它同样在 SetCompression 时切到了 zstd —— 服务端照常放行即可。
-        // 以前这条打 WARN，运维看到会以为出了问题（实测日志里就是这么被误读的），现降为 INFO。
+        // 以前这条打 WARN，运维看到会以为出了问题（实测日志里就是这么被误读的）；
+        // 现在它只在调试文件里留一条（控制台不出现）——它描述的是旧版模组的正常兼容路径，
+        // 不是需要人工介入的信号。
         if (UNCONFIRMED_WARNED.compareAndSet(false, true)) {
-            LOGGER.info("[Zstd] 客户端未回切换确认（不带魔数的应答）——旧版模组的正常行为，"
+            ZstdDebugLog.d("[Zstd] 客户端未回切换确认（不带魔数的应答）——旧版模组的正常行为，"
                     + "服务端已放行扣住的包；本条只提示一次");
         }
         // ⚠️ 延迟放行，不等这个空应答立刻放开：新客户端（延迟切换 / 或嗅探器还没跑完）
@@ -293,7 +291,7 @@ public final class ZstdSwitchGate extends ChannelDuplexHandler {
                 }
             } catch (Throwable t) {
                 // 管线正在被拆除时移除会失败：忽略即可（本处理器终将被 netty 自己清掉）
-                LOGGER.debug("[Zstd] gate self-removal skipped: {}", t.toString());
+                ZstdDebugLog.d("[Zstd] gate self-removal skipped: {}", t.toString());
             }
         }
     }

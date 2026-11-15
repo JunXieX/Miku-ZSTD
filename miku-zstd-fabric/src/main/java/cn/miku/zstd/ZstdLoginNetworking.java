@@ -2,6 +2,7 @@ package cn.miku.zstd;
 
 import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
+import mikumc.zstd.protocol.ZstdDebugLog;
 import net.fabricmc.fabric.api.client.networking.v1.ClientLoginNetworking;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientHandshakePacketListenerImpl;
@@ -83,7 +84,7 @@ public final class ZstdLoginNetworking {
             }
 
             int protocolVersion = data.readInt();
-            LOGGER.info("[Zstd] negotiate rx version={} (client={}, match={}, remote={})",
+            ZstdDebugLog.d("[Zstd] negotiate rx version={} (client={}, match={}, remote={})",
                     protocolVersion, ZstdChannelManager.PROTOCOL_VERSION,
                     protocolVersion == ZstdChannelManager.PROTOCOL_VERSION, channel.remoteAddress());
             if (protocolVersion != ZstdChannelManager.PROTOCOL_VERSION) {
@@ -107,7 +108,7 @@ public final class ZstdLoginNetworking {
                     .set(ZstdChannelManager.TransportState.NEGOTIATING);
             // 在 READY 答复交给网络前尝试挂接轻量切换嗅探器，避免响应监听器迟于switch帧。
             ZstdClientActivation.prepareForSwitch(channel);
-            LOGGER.debug("[Zstd] negotiate ok (version={}) \u2014 waiting for switch before activating zstd", protocolVersion);
+            ZstdDebugLog.d("[Zstd] negotiate ok (version={}) \u2014 waiting for switch before activating zstd", protocolVersion);
 
             // 应答写出后再补一次 switch 嗅探器安装，覆盖首次查询时 packet decoder 锚点尚未挂好的管线。
             // 此回调只准备原版阶段的嗅探器，不能提前安装连续流解码器。
@@ -179,7 +180,7 @@ public final class ZstdLoginNetworking {
         }
         // 这一轮的压缩管线还看不见：挂一个有界看门狗，避免"永不回包"。
         barrier.armWatchdog();
-        LOGGER.info("[Zstd] negotiate rx — waiting up to {}ms for compression setup (remote={})",
+        ZstdDebugLog.d("[Zstd] negotiate rx — waiting up to {}ms for compression setup (remote={})",
                 compressionWatchdogMs, channel.remoteAddress());
     }
 
@@ -202,7 +203,7 @@ public final class ZstdLoginNetworking {
             return;
         }
         if (compressionHandlersReady(channel)) {
-            LOGGER.info("[Zstd] compression handlers appeared after the watchdog — completing this round (remote={})",
+            ZstdDebugLog.d("[Zstd] compression handlers appeared after the watchdog — completing this round (remote={})",
                     channel.remoteAddress());
             barrier.complete("compression-ready-late");
             return;
@@ -214,7 +215,7 @@ public final class ZstdLoginNetworking {
             channel.attr(ZstdChannelManager.ZSTD_STATE).set(ZstdChannelManager.TransportState.PLAIN);
             ZstdClientActivation.onRoundDeclined(channel);
         } catch (Throwable t) {
-            LOGGER.debug("[Zstd] watchdog cleanup skipped: {}", t.toString());
+            ZstdDebugLog.d("[Zstd] watchdog cleanup skipped: {}", t.toString());
         }
         barrier.overrideToVanilla();
         barrier.complete("watchdog-vanilla");
@@ -259,7 +260,7 @@ public final class ZstdLoginNetworking {
         barrier.requestStatus(status);
         return barrier.readyFuture().thenApply(ignored -> {
             int effective = barrier.effectiveStatus();
-            LOGGER.info("[Zstd] negotiate answer={} ({}ms, outcome={}, remote={})",
+            ZstdDebugLog.d("[Zstd] negotiate answer={} ({}ms, outcome={}, remote={})",
                     effective == ZstdNegotiateStatus.READY ? "READY" : "VANILLA",
                     barrier.elapsedMillis(), barrier.outcome(), channel.remoteAddress());
             return answer(effective);
@@ -322,7 +323,7 @@ public final class ZstdLoginNetworking {
                 watchdog = channel.eventLoop().schedule(
                         () -> onCompressionWatchdog(this), millis, java.util.concurrent.TimeUnit.MILLISECONDS);
             } catch (Throwable t) {
-                LOGGER.debug("[Zstd] watchdog arm skipped: {}", t.toString());
+                ZstdDebugLog.d("[Zstd] watchdog arm skipped: {}", t.toString());
             }
         }
 
@@ -376,7 +377,7 @@ public final class ZstdLoginNetworking {
             channel.attr(ZstdChannelManager.ZSTD_STATE).set(ZstdChannelManager.TransportState.PLAIN);
             ZstdClientActivation.onRoundDeclined(channel);
         } catch (Throwable t) {
-            LOGGER.debug("[Zstd] markDeclined skipped: {}", t.toString());
+            ZstdDebugLog.d("[Zstd] markDeclined skipped: {}", t.toString());
         }
     }
 

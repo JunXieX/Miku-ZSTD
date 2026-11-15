@@ -3,9 +3,8 @@ package cn.miku.zstd;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.MessageToMessageDecoder;
+import mikumc.zstd.protocol.ZstdDebugLog;
 import mikumc.zstd.protocol.ZstdStepFrames;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.util.List;
 
@@ -36,8 +35,6 @@ import java.util.List;
  */
 public final class ZstdSwitchSniffer extends MessageToMessageDecoder<ByteBuf> {
 
-    private static final Logger LOGGER = LoggerFactory.getLogger(MikuZstd.LOGGER_NAME);
-
     /**
      * 单帧上限：询问包是 {@code [0][0x04][varint txId][len]["zstd:switch"][magic]} ≈ 23B，
      * 超过这个尺寸的帧一律不可能是它。
@@ -61,7 +58,7 @@ public final class ZstdSwitchSniffer extends MessageToMessageDecoder<ByteBuf> {
         }
 
         // 命中：在同一event loop内同步安装解码器，并先于确认处理后续同read数据帧。
-        LOGGER.debug("[Zstd] switch request received (txId={}) — installing downstream decoder", txId);
+        ZstdDebugLog.d("[Zstd] switch request received (txId={}) — installing downstream decoder", txId);
         ZstdClientActivation.activateAndConfirm(ctx.channel(), txId);
     }
 }

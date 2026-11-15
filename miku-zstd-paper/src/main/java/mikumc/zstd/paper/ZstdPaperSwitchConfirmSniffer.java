@@ -4,6 +4,7 @@ import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.MessageToMessageDecoder;
 import mikumc.zstd.protocol.ZstdStepFrames;
+import mikumc.zstd.protocol.ZstdDebugLog;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -78,9 +79,9 @@ public final class ZstdPaperSwitchConfirmSniffer extends MessageToMessageDecoder
         // 闸门只能等满 200ms 兜底（实测 5.0.9 的 delta=229ms 就是这条路径）。
         if (accepted) {
             ctx.pipeline().remove(this);
-            LOGGER.debug("[Zstd] switch confirmation received (txId={}) — releasing gate", txId);
+            ZstdDebugLog.d("[Zstd] switch confirmation received (txId={}) — releasing gate", txId);
         } else {
-            LOGGER.info("[Zstd] 客户端未回切换确认（不带魔数的应答）——旧版模组的正常行为，"
+            ZstdDebugLog.d("[Zstd] 客户端未回切换确认（不带魔数的应答）——旧版模组的正常行为，"
                     + "服务端将按 200ms 兜底放行；本条只提示一次");
         }
     }

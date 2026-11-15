@@ -34,7 +34,27 @@ public class ZstdPaperConfig {
 
     /** 每批原始字节预算；0 = 只按包数上限收批（保持旧行为）。 */
     public final int batchMaxBytes;
+
+    /**
+     * 是否把逐连接诊断写进插件目录下的调试文件（默认<b>开启</b>）。
+     *
+     * <p>⚠️ 6.1.1 起语义改变：旧实现用反射把 {@code miku-zstd} 这个 logger 调到 DEBUG，
+     * 也就是"诊断只会进控制台"。控制台是运维看告警的地方，几十条每连接的行会把真问题埋掉；
+     * 现在诊断一律进文件，控制台的口径一行不变。想同时看控制台请开 {@link #consoleDebug}。</p>
+     */
     public final boolean debug;
+
+    /** 是否把调试行同时镜像到控制台（默认关闭，仅排查时临时开）。 */
+    public final boolean consoleDebug;
+
+    /** 调试文件路径（相对插件数据目录）。 */
+    public final String debugFile;
+
+    /** 单个调试文件的字节上限（MiB）。 */
+    public final int debugMaxFileMb;
+
+    /** 调试文件保留的历史份数。 */
+    public final int debugKeepFiles;
 
     /** BossBar 文本模板（支持 & 颜色代码与 %players%/%raw%/%wire%/%ratio% 占位符）。 */
     public final String bossbarFormat;
@@ -79,7 +99,11 @@ public class ZstdPaperConfig {
         this.lateAnswerWindowMs = clamp(getInt(lg, "late_answer_window_ms", 120000), 5000, 600000);
 
         Map<String, Object> l = section(map, "logging");
-        this.debug = getBool(l, "debug", false);
+        this.debug = getBool(l, "debug", true);
+        this.consoleDebug = getBool(l, "console_debug", false);
+        this.debugFile = getString(l, "file", "logs/zstd-debug.log");
+        this.debugMaxFileMb = clamp(getInt(l, "max_file_mb", 8), 1, 128);
+        this.debugKeepFiles = clamp(getInt(l, "keep_files", 2), 0, 10);
 
         Map<String, Object> bb = section(map, "bossbar");
         this.bossbarFormat = getString(bb, "format", DEFAULT_BOSSBAR_FORMAT);
@@ -189,9 +213,22 @@ public class ZstdPaperConfig {
                       format: "&a%players% &7人在用 &8| &f%raw% &7\u2192 &a%wire% &8| 压缩率 &e%ratio%"
 
                     logging:
-                      # 调试日志开关：输出逐包诊断信息（协商、切换确认、扣包/放行、安装锚点）
-                      # 默认关闭；排查问题时再开启，已有配置不会被自动覆盖。
-                      debug: false
+                      # ── 调试日志（6.1.1 起默认开启，写文件、不刷控制台）──
+                      # 协商、切换确认、扣包/放行、安装锚点这些逐连接诊断会写进下面这个文件。
+                      # 出问题时把该文件直接发出来即可，不必再改服务端日志框架。
+                      debug: true
+
+                      # 调试文件路径（相对 plugins/Miku-ZSTD/）。
+                      file: "logs/zstd-debug.log"
+
+                      # 单个文件上限（MiB，1-128）与保留的历史份数（0-10）。
+                      # 超限即滚动：zstd-debug.log -> .1 -> .2 ...，总量有硬上界。
+                      max_file_mb: 8
+                      keep_files: 2
+
+                      # 是否同时把调试行打进服务端控制台。默认关闭：
+                      # 控制台留给真正的告警，几十条每连接的行会把它们埋掉。
+                      console_debug: false
                     """;
             Files.writeString(configPath, yaml, StandardCharsets.UTF_8);
         } catch (IOException e) {

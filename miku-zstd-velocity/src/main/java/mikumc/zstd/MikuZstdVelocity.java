@@ -16,8 +16,11 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.nio.file.Path;
 import mikumc.zstd.protocol.ZstdCompressPool;
+import mikumc.zstd.protocol.ZstdDebugLog;
 import java.io.IOException;
 import java.nio.file.Files;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 @Plugin(id = "miku-zstd", name = "Miku-ZSTD", version = BuildConstants.VERSION, authors = {"JunXieX"})
 public class MikuZstdVelocity {
@@ -29,6 +32,9 @@ public class MikuZstdVelocity {
     private final ProxyServer proxy;
     private final Path dataDirectory;
 
+    /** 解析后的数据目录（{@code plugins/Miku-ZSTD}）；reload 时按它重开调试文件。 */
+    private Path resolvedDataDir;
+
     @Inject
     public MikuZstdVelocity(Logger logger, ProxyServer proxy, @DataDirectory Path dataDirectory) {
         this.logger = logger;
@@ -39,11 +45,13 @@ public class MikuZstdVelocity {
     @Subscribe
     public void onProxyInitialization(ProxyInitializeEvent event) {
         Path dataDir = resolveDataDir(dataDirectory);
+        resolvedDataDir = dataDir;
         ZstdVelocityConfig.load(dataDir.resolve("config.yml"));
+        initDebugLog(dataDir);
         ZstdCompressPool.init(ZstdVelocityConfig.INSTANCE.compressThreads, 5);
         applyDebugFromConfig();
-        // 带宽剖析：用真实流量回答"字节花在哪个帧长区间"，debug 关闭时零开销
-        ZstdBandwidthProfiler.start(ZstdVelocityConfig.INSTANCE.debug, 60);
+        // 带宽剖析：用真实流量回答"字节花在哪个帧长区间"，profiler 关闭时零开销
+        ZstdBandwidthProfiler.start(ZstdVelocityConfig.INSTANCE.profiler, 60);
         logger.info("Miku-ZSTD Velocity plugin initialized");
         ZstdBossBarMonitor.init(proxy, this);
         // ⚠️ 必须注册 BrigadierCommand（显式建树）。用 metaBuilder + SimpleCommand 会生成
@@ -96,6 +104,34 @@ public class MikuZstdVelocity {
             logger.info("[Zstd] Handshake sniffer installed into server channel initializer");
         } catch (Throwable t) {
             logger.warn("[Zstd] Could not install handshake sniffer — falling back to handshake-event mode", t);
+        }
+    }
+
+    /**
+     * 打开调试文件通道并写会话横幅。
+     *
+     * <p>放在配置读完之后、任何依赖压缩管线的逻辑之前：后面握手嗅探、注入、
+     * 协商应答的全部诊断才有地方落。打开失败（目录只读、磁盘满）只降级为"不写文件"。</p>
+     */
+    private void initDebugLog(Path dataDir) {
+        ZstdVelocityConfig cfg = ZstdVelocityConfig.INSTANCE;
+        ZstdDebugLog.configure(
+                dataDir.resolve(cfg.debugFile),
+                cfg.debug,
+                cfg.debugMaxFileMb << 20,
+                cfg.debugKeepFiles,
+                cfg.consoleDebug ? line -> logger.debug("{}", line) : null);
+        if (cfg.debug && ZstdDebugLog.file() != null) {
+            Map<String, String> facts = new LinkedHashMap<>();
+            facts.put("compression", "level=" + cfg.level + " window_log=" + cfg.windowLog
+                    + " threads=" + cfg.compressThreads + " batch=" + cfg.batchWindowMs + "ms/"
+                    + cfg.batchMaxPackets + "packets/" + cfg.batchMaxBytes + "bytes");
+            facts.put("login", "answer_timeout_ms=" + cfg.answerTimeoutMs);
+            facts.put("logging", "console_debug=" + cfg.consoleDebug + " profiler=" + cfg.profiler
+                    + " max_file_mb=" + cfg.debugMaxFileMb + " keep_files=" + cfg.debugKeepFiles);
+            ZstdDebugLog.sessionHeader(BuildConstants.VERSION,
+                    "Velocity " + String.valueOf(proxy.getVersion()), facts);
+            logger.info("[Zstd] 调试日志: {}（出问题时把这个文件发出来即可）", ZstdDebugLog.file());
         }
     }
 
@@ -154,6 +190,8 @@ public class MikuZstdVelocity {
             logger.warn("[Zstd] failed to shut down ctx pool", t);
         }
         logger.info("[Zstd] Miku-ZSTD shut down");
+        // ⚠️ 最后一步：上面的收尾诊断先落盘，再结束写线程（不留持有本插件类加载器的线程）。
+        ZstdDebugLog.close();
     }
 
     @Subscribe
@@ -168,7 +206,7 @@ public class MikuZstdVelocity {
             // 而它本身不携带任何需要人工介入的信息 —— 真正值得 INFO 的是激活成功那一行。
             // 主机名末尾是 {@code \\0ZSTD\\0} 标记，直接打印会在日志里渲染成几个空格，
             // 看起来像"配置里多了空格"。转义一下，观感才和真实字节一致。
-            logger.debug("[Zstd] Connection already negotiated by sniffer: host={}",
+            ZstdDebugLog.d("[Zstd] Connection already negotiated by sniffer: host={}",
                     inbound.getRawVirtualHost().orElse("").replace("\u0000", "\\0"));
             return;
         }
@@ -219,16 +257,29 @@ public class MikuZstdVelocity {
         });
     }
 
-    /** 启动与reload只设置本插件命名logger：开启为DEBUG，关闭为INFO。 */
+    /** 启动与 reload 只设置本插件命名 logger：{@code console_debug} 开启为 DEBUG，关闭为 INFO。 */
     void applyDebugFromConfig() {
         applyDebugLogLevel();
     }
 
+    /**
+     * reload 后重开调试文件通道。
+     *
+     * <p>{@code logging} 段的路径、上限、份数与开关都在这里生效：先按新配置关旧再开新，
+     * 换文件时旧文件里已写的内容保持原样（不会被截断）。</p>
+     */
+    void reinitDebugLog() {
+        Path dir = resolvedDataDir;
+        if (dir != null) {
+            initDebugLog(dir);
+        }
+    }
+
     private void applyDebugLogLevel() {
-        boolean debug = ZstdVelocityConfig.INSTANCE.debug;
+        boolean debug = ZstdVelocityConfig.INSTANCE.consoleDebug;
         boolean ok = tryLog4j2(debug) || tryLogback(debug);
         if (ok) {
-            logger.info("[Zstd] Debug logging {}", debug ? "enabled" : "disabled");
+            logger.info("[Zstd] 控制台调试输出{}（logging.console_debug）", debug ? "已开启" : "已关闭");
         } else {
             logger.warn("[Zstd] Could not set debug log level — configure the logging framework manually");
         }

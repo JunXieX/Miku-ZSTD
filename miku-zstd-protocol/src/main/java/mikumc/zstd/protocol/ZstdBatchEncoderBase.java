@@ -459,7 +459,7 @@ public abstract class ZstdBatchEncoderBase extends ChannelDuplexHandler {
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
         if (isPacketCancellation(cause)) {
-            LOGGER.debug("[Zstd] packet cancelled before stream encoding: {}", cause.toString());
+            ZstdDebugLog.d("[Zstd] packet cancelled before stream encoding: {}", cause.toString());
             return;
         }
         synchronized (stateLock) {

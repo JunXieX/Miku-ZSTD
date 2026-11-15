@@ -110,7 +110,10 @@ public final class ZstdCommand {
                     NamedTextColor.RED));
         }
 
-        source.sendMessage(Component.text("  调试日志：" + (cfg.debug ? "开启" : "关闭"), NamedTextColor.GRAY));
+        source.sendMessage(Component.text("  " + mikumc.zstd.protocol.ZstdDebugLog.statsLine(),
+                NamedTextColor.GRAY));
+        source.sendMessage(Component.text("  带宽剖析：" + (cfg.profiler ? "开启（每 60 秒写进调试日志）" : "关闭"),
+                NamedTextColor.GRAY));
     }
 
     /** 各连接的压缩统计排行 —— 定位"是谁在拖后腿"。 */
@@ -130,19 +133,21 @@ public final class ZstdCommand {
 
     private void reload(CommandSource source) {
         ZstdVelocityConfig.reload();
-        // 让 logging.debug 的改动也生效（启动时只应用过一次）：
-        // 否则改完配置 reload 会显示 "debug: true"，日志却一条都不多——比不写这个开关更糟。
+        // 让 logging 段的改动也生效（启动时只应用过一次）：路径/上限/份数在 reinitDebugLog 里，
+        // 控制台镜像在 applyDebugFromConfig 里。不重开的话，改完配置 reload 会显示
+        // "debug: true" 却仍写旧文件——比不写这个开关更糟。
         if (plugin != null) {
+            plugin.reinitDebugLog();
             plugin.applyDebugFromConfig();
         }
-        ZstdBandwidthProfiler.start(ZstdVelocityConfig.INSTANCE.debug, 60);
+        ZstdBandwidthProfiler.start(ZstdVelocityConfig.INSTANCE.profiler, 60);
         source.sendMessage(Component.text("配置已重载。", NamedTextColor.GREEN));
         // ⚠️ 必须说清楚作用范围，否则管理员会以为 reload 没生效。三类参数都不会作用于已有连接：
         //   · level / window_log：连接建立时应用到该连接的 zstd 上下文（见 ZstdChannelManager 构造器）；
         //   · batch_window_ms / batch_max_packets：编码器 handlerAdded 时快照；
         //   · threads：线程池只在首次 init 时固定。
         source.sendMessage(Component.text(
-                "即时生效：logging.debug、bossbar.format；"
+                "即时生效：logging 段（debug / file / max_file_mb / keep_files / console_debug / profiler）、bossbar.format；"
                         + "需新连接：level、window_log、batch_window_ms、batch_max_packets、batch_max_bytes；"
                         + "需重启代理：threads。已有连接仍在用旧值。",
                 NamedTextColor.YELLOW));

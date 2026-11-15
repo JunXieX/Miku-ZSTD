@@ -1,6 +1,7 @@
 package mikumc.zstd;
 
 import mikumc.zstd.protocol.ZstdBossBarFormat;
+import mikumc.zstd.protocol.ZstdDebugLog;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -53,15 +54,15 @@ public final class ZstdBandwidthProfiler {
      * <p><b>幂等</b>：{@code /mikuzstd reload} 会再调一次——若不判重，每 reload 一次就会
      * 多出一个上报线程，带宽剖析越看越花。</p>
      *
-     * <p>⚠️ 反向也要处理：{@code reload} 把 {@code logging.debug} 从 true 改成 false 时，
+     * <p>⚠️ 反向也要处理：{@code reload} 把 {@code logging.profiler} 从 true 改成 false 时，
      * 必须<b>停掉</b>已在运行的上报线程。旧实现只把 {@code enabled} 置假就返回
-     * （{@code if (!debugEnabled) return;}），线程仍按周期空转——统计虽不再累加
+     * （{@code if (!profilerEnabled) return;}），线程仍按周期空转——统计虽不再累加
      *（{@link #record} 会早退），但"关了开关线程还在"本身就是一个泄漏点。</p>
      */
-    public static synchronized void start(boolean debugEnabled, int intervalSeconds) {
-        enabled = debugEnabled;
-        if (!debugEnabled) {
-            shutdown(); // reload 关闭 debug：连同线程一起收掉
+    public static synchronized void start(boolean profilerEnabled, int intervalSeconds) {
+        enabled = profilerEnabled;
+        if (!profilerEnabled) {
+            shutdown(); // reload 关闭 profiler：连同线程一起收掉
             return;
         }
         if (scheduler != null) return; // 已在运行
@@ -72,7 +73,7 @@ public final class ZstdBandwidthProfiler {
         });
         scheduler.scheduleWithFixedDelay(ZstdBandwidthProfiler::report,
                 intervalSeconds, intervalSeconds, TimeUnit.SECONDS);
-        LOGGER.info("[Zstd] 带宽剖析已启用，每 {}s 输出一次（关闭 logging.debug 可停用）", intervalSeconds);
+        ZstdDebugLog.d("[Zstd] 带宽剖析已启用，每 {}s 输出一次（logging.profiler 可停用）", intervalSeconds);
     }
 
     public static synchronized void shutdown() {
@@ -124,7 +125,7 @@ public final class ZstdBandwidthProfiler {
                         BAND_NAME[i], fmt(raw), 100.0 * raw / totalRaw, fmt(wire),
                         100.0 * wire / raw, frames, stored));
             }
-            LOGGER.info("[Zstd] 带宽剖析（本周期）：{}", sb);
+            ZstdDebugLog.d("[Zstd] 带宽剖析（本周期）：{}", sb);
         } catch (Throwable t) {
             LOGGER.warn("[Zstd] 带宽剖析输出失败", t);
         }

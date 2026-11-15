@@ -38,23 +38,59 @@ class ZstdPaperConfigLoadTest {
     }
 
     @Test
-    @DisplayName("首次真实load：默认关闭debug且生成的YAML也是false")
-    void newFileDefaultsToDebugOff() throws IOException {
+    @DisplayName("首次真实load：debug 默认开启（写文件），控制台镜像默认关闭")
+    void newFileDefaultsToDebugOn() throws IOException {
         Path file = directory.resolve("nested/config.yml");
         assertFalse(Files.exists(file));
         ZstdPaperConfig.load(file);
-        assertFalse(ZstdPaperConfig.INSTANCE.debug);
+        // 6.1.1 起 debug 只表示"写调试文件"，默认开启；控制台另有独立开关且默认关闭。
+        assertTrue(ZstdPaperConfig.INSTANCE.debug);
+        assertFalse(ZstdPaperConfig.INSTANCE.consoleDebug);
+        assertEquals("logs/zstd-debug.log", ZstdPaperConfig.INSTANCE.debugFile);
+        assertEquals(8, ZstdPaperConfig.INSTANCE.debugMaxFileMb);
+        assertEquals(2, ZstdPaperConfig.INSTANCE.debugKeepFiles);
         assertTrue(Files.isRegularFile(file));
         try (Reader reader = Files.newBufferedReader(file, StandardCharsets.UTF_8)) {
             Map<?, ?> generated = new Yaml().load(reader);
             Map<?, ?> logging = (Map<?, ?>) generated.get("logging");
-            assertEquals(Boolean.FALSE, logging.get("debug"));
+            assertEquals(Boolean.TRUE, logging.get("debug"));
+            assertEquals(Boolean.FALSE, logging.get("console_debug"));
+            assertEquals("logs/zstd-debug.log", logging.get("file"));
+            assertEquals(8, ((Number) logging.get("max_file_mb")).intValue());
+            assertEquals(2, ((Number) logging.get("keep_files")).intValue());
         }
         String generated = Files.readString(file, StandardCharsets.UTF_8);
         assertFalse(generated.contains("skip_compress_below_bytes"), "新模板不再生成旧直存阈值");
         ZstdPaperConfig.load(file);
-        assertFalse(ZstdPaperConfig.INSTANCE.debug);
+        assertTrue(ZstdPaperConfig.INSTANCE.debug);
         assertEquals(generated, Files.readString(file, StandardCharsets.UTF_8));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"logging: {max_file_mb: 0, keep_files: -5}",
+            "logging: {max_file_mb: 999, keep_files: 99}"})
+    @DisplayName("logging 段越界值被夹取到合法区间")
+    void loggingSectionIsClamped(String contents) throws IOException {
+        Path file = directory.resolve("config.yml");
+        Files.writeString(file, contents, StandardCharsets.UTF_8);
+        ZstdPaperConfig.load(file);
+        int megabytes = ZstdPaperConfig.INSTANCE.debugMaxFileMb;
+        int keep = ZstdPaperConfig.INSTANCE.debugKeepFiles;
+        assertTrue(megabytes >= 1 && megabytes <= 128, "max_file_mb 越界: " + megabytes);
+        assertTrue(keep >= 0 && keep <= 10, "keep_files 越界: " + keep);
+    }
+
+    @Test
+    @DisplayName("显式 console_debug 与自定义路径按原样生效")
+    void explicitConsoleDebugAndPathAreHonoured() throws IOException {
+        Path file = directory.resolve("config.yml");
+        Files.writeString(file,
+                "logging: {debug: false, console_debug: true, file: \"custom/dbg.log\"}\n",
+                StandardCharsets.UTF_8);
+        ZstdPaperConfig.load(file);
+        assertFalse(ZstdPaperConfig.INSTANCE.debug);
+        assertTrue(ZstdPaperConfig.INSTANCE.consoleDebug);
+        assertEquals("custom/dbg.log", ZstdPaperConfig.INSTANCE.debugFile);
     }
 
     @Test
@@ -83,13 +119,13 @@ class ZstdPaperConfigLoadTest {
 
     @ParameterizedTest
     @ValueSource(strings = {"", "{}", "compression: {level: 6}", "logging: {}", "logging:"})
-    @DisplayName("空文件或缺省logging/debug：真实load为false且不覆写已有文件")
-    void missingDebugDefaultsOffWithoutRewriting(String contents) throws IOException {
+    @DisplayName("空文件或缺省logging/debug：真实load为true且不覆写已有文件")
+    void missingDebugDefaultsOnWithoutRewriting(String contents) throws IOException {
         Path file = directory.resolve("config.yml");
         Files.writeString(file, contents, StandardCharsets.UTF_8);
         for (int i = 0; i < 2; i++) {
             ZstdPaperConfig.load(file);
-            assertFalse(ZstdPaperConfig.INSTANCE.debug);
+            assertTrue(ZstdPaperConfig.INSTANCE.debug);
             assertEquals(contents, Files.readString(file, StandardCharsets.UTF_8));
         }
     }

@@ -9,6 +9,7 @@ import io.netty.channel.ChannelPromise;
 import io.netty.util.ReferenceCountUtil;
 import mikumc.zstd.protocol.ZstdNegotiateStatus;
 import mikumc.zstd.protocol.ZstdVarInts;
+import mikumc.zstd.protocol.ZstdDebugLog;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -108,7 +109,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
         try {
             return m.invoke(target);
         } catch (Throwable t) {
-            LOGGER.debug("[Zstd] reflective read {} failed: {}", m.getName(), t);
+            ZstdDebugLog.d("[Zstd] reflective read {} failed: {}", m.getName(), t);
             return null;
         }
     }
@@ -184,7 +185,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
         this.selfCtx = ctx;
         // 记录类来源：plugins/ 下若存在同 id 的多个 jar，Velocity 只会加载其一，
         // 此时"改了代码却没生效"极难察觉——这行日志可以直接确认加载的是哪个 jar
-        LOGGER.debug("[Zstd] ZstdHijacker loaded from {}",
+        ZstdDebugLog.d("[Zstd] ZstdHijacker loaded from {}",
                 ZstdHijacker.class.getProtectionDomain().getCodeSource());
     }
 
@@ -213,7 +214,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
         if (LOGGER.isDebugEnabled() && mgr != null && mgr.isNegotiationSent()) {
             // 登录阶段的入站包诊断：定位"应答没被拦到"这类问题时非常有用。
             // 激活后本处理器会自移除，因此这里的量级只限于登录阶段的少量包。
-            LOGGER.debug("[Zstd] spy inbound: {} (mgr={}, txId={})",
+            ZstdDebugLog.d("[Zstd] spy inbound: {} (mgr={}, txId={})",
                     msg.getClass().getName(), mgr != null, mgr == null ? -1 : mgr.getNegotiateTxId());
         }
         if (mgr != null && C_LOGIN_RESPONSE != null && C_LOGIN_RESPONSE.isInstance(msg)) {
@@ -247,7 +248,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
         ZstdChannelManager mgr = ctx.channel().attr(ZstdChannelManager.KEY).get();
         if (LOGGER.isDebugEnabled() && mgr != null && mgr.isNegotiationSent() && !mgr.isReplaced()) {
             // 出站诊断：定位"激活窗口内的包走了哪条编码路径"
-            LOGGER.debug("[Zstd] spy outbound: {} (holding={}, activated={})",
+            ZstdDebugLog.d("[Zstd] spy outbound: {} (holding={}, activated={})",
                     msg.getClass().getSimpleName(), holding, pipelineActivated);
         }
 
@@ -256,7 +257,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
         // 事件兜底路径拿不到 nextState，这里用"首个出站包是不是 StatusResponse"来判 ——
         // ping 连接的首包必然是它，而登录连接的首包是 EncryptionRequest / SetCompression。
         if (mgr != null && !mgr.isNegotiationSent() && isStatusResponse(msg)) {
-            LOGGER.debug("[Zstd] first outbound is a status response — not a login connection, skipping zstd");
+            ZstdDebugLog.d("[Zstd] first outbound is a status response — not a login connection, skipping zstd");
             if (ctx.pipeline().get(ZstdHijacker.class) != null) {
                 ctx.pipeline().remove(this);
             }
@@ -272,7 +273,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
         if (C_SET_COMPRESSION != null && C_SET_COMPRESSION.isInstance(msg)) {
             int threshold = readThresholdValue(msg);
             if (threshold != UNKNOWN_THRESHOLD && threshold < 0) {
-                LOGGER.debug("[Zstd] peer disabled compression (threshold<0) — not negotiating");
+                ZstdDebugLog.d("[Zstd] peer disabled compression (threshold<0) — not negotiating");
                 if (ctx.pipeline().get(ZstdHijacker.class) != null) {
                     ctx.pipeline().remove(this);
                 }
@@ -301,7 +302,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
             if (threshold != UNKNOWN_THRESHOLD && threshold < 0) {
                 // 对端要"关掉压缩"（limbo 登录服就是这样把连接降回明文的）。
                 // 本端若继续用 zstd 发帧，对端会按明文读 —— 第一帧就错乱。
-                LOGGER.info("[Zstd] 压缩被禁用（threshold<0）——本端退回明文");
+                ZstdDebugLog.d("[Zstd] 压缩被禁用（threshold<0）——本端退回明文");
                 super.write(ctx, msg, promise); // 先把这条包原样送出，再让位
                 giveUp(ctx);
                 return;
@@ -310,7 +311,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
 
         if (!pipelineActivated && C_SET_COMPRESSION != null && C_SET_COMPRESSION.isInstance(msg)) {
             pipelineActivated = true;
-            LOGGER.debug("[Zstd] SetCompression detected — deferring zstd activation until negotiate response; pipeline={}",
+            ZstdDebugLog.d("[Zstd] SetCompression detected — deferring zstd activation until negotiate response; pipeline={}",
                     ctx.channel().pipeline().names());
             // ⚠️ 必须同步进入 hold：Velocity 在写完 SetCompression 后会立刻写 LoginSuccess，
             // 而激活要等协商应答（一个 RTT）。若不拦下这段窗口内的包，它们会走原版压缩编码器
@@ -403,7 +404,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
         if (heldPromises.isEmpty()) {
             return;
         }
-        LOGGER.debug("[Zstd] channel closed with {} held packet(s) — failing their promises",
+        ZstdDebugLog.d("[Zstd] channel closed with {} held packet(s) — failing their promises",
                 heldPromises.size());
         for (ChannelPromise p : heldPromises) {
             if (p != null) {
@@ -456,7 +457,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
         List<ChannelPromise> promises = new ArrayList<>(heldPromises);
         heldPackets.clear();
         heldPromises.clear();
-        LOGGER.debug("[Zstd] releasing {} packet(s) held during activation window", packets.size());
+        ZstdDebugLog.d("[Zstd] releasing {} packet(s) held during activation window", packets.size());
         for (int i = 0; i < packets.size(); i++) {
             ctx.write(packets.get(i), promises.get(i));
         }
@@ -729,7 +730,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
                 buf.writeInt(ZstdChannelManager.PROTOCOL_VERSION);
 
                 writeCtx.writeAndFlush(buf);
-                LOGGER.debug("[Zstd] Sent zstd:negotiate txId={} version={}",
+                ZstdDebugLog.d("[Zstd] Sent zstd:negotiate txId={} version={}",
                         txId, ZstdChannelManager.PROTOCOL_VERSION);
             } catch (Throwable t) {
                 if (buf.refCnt() > 0) buf.release();
@@ -790,7 +791,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
         // switch 控制帧固定采用原版未压缩形态，由客户端专用嗅探器截获。
         ChannelHandlerContext writeCtx = compressionWriteCtx(channel.pipeline());
         if (writeCtx == null) {
-            LOGGER.debug("[Zstd] cannot send switch request — compression anchor missing");
+            ZstdDebugLog.d("[Zstd] cannot send switch request — compression anchor missing");
             return false;
         }
         try {
@@ -814,7 +815,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
                 frame.writeBytes(packet);
 
                 writeCtx.writeAndFlush(frame);
-                LOGGER.debug("[Zstd] switch request sent");
+                ZstdDebugLog.d("[Zstd] switch request sent");
                 return true;
             } catch (Throwable t) {
                 if (packet.refCnt() > 0) packet.release();
@@ -824,7 +825,7 @@ public class ZstdHijacker extends ChannelDuplexHandler {
                 if (packet.refCnt() > 0) packet.release();
             }
         } catch (Exception e) {
-            LOGGER.debug("[Zstd] failed to send switch request: {}", e.toString());
+            ZstdDebugLog.d("[Zstd] failed to send switch request: {}", e.toString());
             return false;
         }
     }
