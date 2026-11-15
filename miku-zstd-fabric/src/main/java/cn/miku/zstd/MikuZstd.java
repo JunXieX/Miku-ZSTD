@@ -70,7 +70,6 @@ public final class MikuZstd {
         if (ZstdDebugLog.file() != null) {
             Map<String, String> facts = new LinkedHashMap<>();
             facts.put("hud_enabled", String.valueOf(cfg.hudEnabled));
-            facts.put("debug", String.valueOf(cfg.debug));
             facts.put("krypton", kryptonState());
             ZstdDebugLog.sessionHeader(modVersion(), "Fabric client", facts);
             // 控制台只留这一行：玩家据此就能找到要发的文件。

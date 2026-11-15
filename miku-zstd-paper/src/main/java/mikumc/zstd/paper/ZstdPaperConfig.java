@@ -279,6 +279,7 @@ public class ZstdPaperConfig {
 
                       # 是否同时把调试行打进服务端控制台。默认关闭：
                       # 控制台留给真正的告警，几十条每连接的行会把它们埋掉。
+                      # debug 关闭时本项没有任何输出（没有调试行可镜像）。
                       console_debug: false
                     """;
             Files.writeString(configPath, yaml, StandardCharsets.UTF_8);
