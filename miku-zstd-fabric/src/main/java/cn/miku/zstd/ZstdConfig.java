@@ -23,13 +23,13 @@ public class ZstdConfig {
     public final boolean hudEnabled;
 
     /**
-     * 是否把逐连接诊断写进 {@code <游戏目录>/} 下的调试文件（默认<b>开启</b>）。
+     * 旧配置里是否显式写着 {@code logging.debug=false}。
      *
-     * <p>⚠️ 客户端没有"服务端控制台"，但 {@code latest.log} 同样不是给玩家看的东西；
-     * 诊断一律进独立的小文件，出问题时玩家直接把这个文件发出来即可，
-     * 不必在一份几十万行的 {@code latest.log} 里翻。</p>
+     * <p>⚠️ 6.1.1 起客户端调试日志也<b>强制开启</b>：客户端没有"服务端控制台"，
+     * 而 {@code latest.log} 同样不是给玩家看的东西——诊断一律进独立的小文件，
+     * 出问题时玩家直接把这个文件发出来即可。这个字段不参与行为，只用于启动时一行提示。</p>
      */
-    public final boolean debug;
+    public final boolean legacyDebugIgnored;
 
     /** 调试文件路径（相对游戏目录）。 */
     public final String debugFile;
@@ -45,7 +45,7 @@ public class ZstdConfig {
         this.hudEnabled = getBool(display, "hud_enabled", false);
 
         Map<String, Object> logging = section(map, "logging");
-        this.debug = getBool(logging, "debug", true);
+        this.legacyDebugIgnored = Boolean.FALSE.equals(logging.get("debug"));
         this.debugFile = getString(logging, "file", "Miku-ZSTD/logs/zstd-debug.log");
         this.debugMaxFileMb = clamp(getInt(logging, "max_file_mb", 8), 1, 128);
         this.debugKeepFiles = clamp(getInt(logging, "keep_files", 2), 0, 10);
@@ -115,10 +115,10 @@ public class ZstdConfig {
                       hud_enabled: false
 
                     logging:
-                      # ── 调试日志（默认开启，写文件、不进 latest.log）──
+                      # ── 调试日志（强制开启，写文件、不进 latest.log）──
                       # 记协商、看门狗、切换确认、管线安装这些逐连接诊断。
                       # 连不上服/卡在连接协商时，把下面这个文件发出来即可。
-                      debug: true
+                      # ⚠️ 没有开关：旧版这里的 debug 键已移除，写了不生效。
 
                       # 文件路径（相对游戏目录）。默认 <游戏目录>/Miku-ZSTD/logs/zstd-debug.log
                       file: "Miku-ZSTD/logs/zstd-debug.log"

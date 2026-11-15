@@ -33,13 +33,12 @@ public class ZstdVelocityConfig {
     public final int compressThreads;
 
     /**
-     * 是否把逐连接诊断写进数据目录下的调试文件（默认<b>开启</b>）。
+     * 旧配置里是否显式写着 {@code logging.debug=false}。
      *
-     * <p>⚠️ 6.1.1 起语义改变：旧实现用反射把 {@code miku-zstd} 调到 DEBUG，即"诊断只进控制台"。
-     * 控制台是看告警的地方，每连接几十行会把真问题埋掉；现在诊断一律进文件，
-     * 想同时看控制台请开 {@link #consoleDebug}。</p>
+     * <p>⚠️ 6.1.1 起调试日志<b>强制开启</b>：它不再是开关，写了也关不掉。这个字段
+     * <b>不参与任何行为</b>，只在启动时用来打一行"为什么不生效"的提示。</p>
      */
-    public final boolean debug;
+    public final boolean legacyDebugIgnored;
 
     /** 是否把调试行同时镜像到控制台（默认关闭）。 */
     public final boolean consoleDebug;
@@ -56,8 +55,8 @@ public class ZstdVelocityConfig {
     /**
      * 是否启用带宽剖析（每 60 秒一段，写进调试文件）。
      *
-     * <p>⚠️ 它与 {@link #debug} 分开：剖析是"按帧长区间看字节花在哪"的分析工具，
-     * 不是故障诊断；跟着调试开关默认打开会让每个代理都不停地算分档统计。</p>
+     * <p>⚠️ 它独立于调试文件：剖析是"按帧长区间看字节花在哪"的分析工具，不是故障诊断；
+     * 默认关着，否则每个代理都会不停地算分档统计。</p>
      */
     public final boolean profiler;
 
@@ -110,7 +109,7 @@ public class ZstdVelocityConfig {
         this.answerTimeoutMs = clamp(getInt(lg, "answer_timeout_ms", 10000), 1000, 120000);
 
         Map<String, Object> l = getMap(map, "logging");
-        this.debug = getBool(l, "debug", true);
+        this.legacyDebugIgnored = Boolean.FALSE.equals(l.get("debug"));
         this.consoleDebug = getBool(l, "console_debug", false);
         this.debugFile = getString(l, "file", "logs/zstd-debug.log");
         this.debugMaxFileMb = clamp(getInt(l, "max_file_mb", 8), 1, 128);
@@ -235,10 +234,10 @@ public class ZstdVelocityConfig {
                       format: "&a%players% &7人在用 &8| &f%raw% &7\u2192 &a%wire% &8| 压缩率 &e%ratio%"
 
                     logging:
-                      # ── 调试日志（6.1.1 起默认开启，写文件、不刷控制台）──
+                      # ── 调试日志（6.1.1 起强制开启，写文件、不刷控制台）──
                       # 协商、切换确认、扣包/放行、安装锚点这些逐连接诊断会写进下面这个文件。
                       # 出问题时把该文件直接发出来即可，不必再改代理的日志框架。
-                      debug: true
+                      # ⚠️ 没有开关：旧版这里的 debug 键已移除，写了不生效、也不会被重写。
 
                       # 调试文件路径（相对 plugins/Miku-ZSTD/）。
                       file: "logs/zstd-debug.log"

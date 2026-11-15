@@ -134,8 +134,8 @@ public final class ZstdCommand {
     private void reload(CommandSource source) {
         ZstdVelocityConfig.reload();
         // 让 logging 段的改动也生效（启动时只应用过一次）：路径/上限/份数在 reinitDebugLog 里，
-        // 控制台镜像在 applyDebugFromConfig 里。不重开的话，改完配置 reload 会显示
-        // "debug: true" 却仍写旧文件——比不写这个开关更糟。
+        // 控制台镜像在 applyDebugFromConfig 里。不重开的话，改完路径却仍写旧文件，
+        // 服主会以为新配置没被读到。
         if (plugin != null) {
             plugin.reinitDebugLog();
             plugin.applyDebugFromConfig();
@@ -147,7 +147,7 @@ public final class ZstdCommand {
         //   · batch_window_ms / batch_max_packets：编码器 handlerAdded 时快照；
         //   · threads：线程池只在首次 init 时固定。
         source.sendMessage(Component.text(
-                "即时生效：logging 段（debug / file / max_file_mb / keep_files / console_debug / profiler）、bossbar.format；"
+                "即时生效：logging 段（file / max_file_mb / keep_files / console_debug / profiler）、bossbar.format；"
                         + "需新连接：level、window_log、batch_window_ms、batch_max_packets、batch_max_bytes；"
                         + "需重启代理：threads。已有连接仍在用旧值。",
                 NamedTextColor.YELLOW));

@@ -192,7 +192,8 @@ public final class ZstdDebugLog {
     public static String statsLine() {
         Path target = file;
         if (target == null) {
-            return "调试日志：关闭（logging.debug=false）";
+            // 6.1.1 起没有关闭开关，这里只剩"本端打开失败"这一种情况。
+            return "调试日志：关闭（未启用或写入失败）";
         }
         long bytes;
         synchronized (FILE_LOCK) {

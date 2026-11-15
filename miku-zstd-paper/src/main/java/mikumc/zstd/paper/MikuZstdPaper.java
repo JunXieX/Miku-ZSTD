@@ -227,6 +227,10 @@ public class MikuZstdPaper extends JavaPlugin {
      * <p>顺序很重要：配置一读完就建通道，后面挂钩、注入、协商的诊断才有地方落。
      * 通道建立失败（目录只读、磁盘满）只降级为"不写文件"，功能照旧。</p>
      *
+     * <p>⚠️ 6.1.1 起<b>强制开启</b>：这里传的是字面量 {@code true}，配置里没有开关。
+     * 定位"卡在连接协商中"那种现场，靠的就是用户直接把这个文件发过来；能关掉就等于
+     * 把唯一的证据关掉了，所以不留这个口子。</p>
+     *
      * <p>控制台口径由 {@code logging.console_debug} 单独决定：为 true 时才把同一批行镜像进
      * 控制台（沿用 log4j2 反射把 logger 调到 DEBUG，失败则退回 INFO 直写）。</p>
      */
@@ -234,18 +238,21 @@ public class MikuZstdPaper extends JavaPlugin {
         ZstdPaperConfig cfg = ZstdPaperConfig.INSTANCE;
         ZstdDebugLog.configure(
                 getDataFolder().toPath().resolve(cfg.debugFile),
-                cfg.debug,
+                true,
                 cfg.debugMaxFileMb << 20,
                 cfg.debugKeepFiles,
                 cfg.consoleDebug ? line -> LOGGER.debug("{}", line) : null);
-        if (cfg.debug && ZstdDebugLog.file() != null) {
+        if (cfg.legacyDebugIgnored) {
+            LOGGER.info("[Zstd] 调试日志已强制开启（6.1.1 起不再可关闭），配置里的 logging.debug 已忽略");
+        }
+        if (ZstdDebugLog.file() != null) {
             Map<String, String> facts = new LinkedHashMap<>();
             facts.put("compression", "level=" + cfg.level + " window_log=" + cfg.windowLog
                     + " threads=" + cfg.compressThreads + " batch=" + cfg.batchWindowMs + "ms/"
                     + cfg.batchMaxPackets + "packets/" + cfg.batchMaxBytes + "bytes");
             facts.put("login", "answer_timeout_ms=" + cfg.answerTimeoutMs
                     + " late_answer_window_ms=" + cfg.lateAnswerWindowMs);
-            facts.put("logging", "console_debug=" + cfg.consoleDebug
+            facts.put("logging", "forced=on console_debug=" + cfg.consoleDebug
                     + " max_file_mb=" + cfg.debugMaxFileMb + " keep_files=" + cfg.debugKeepFiles);
             facts.put("world", "online_mode 与 network-compression-threshold 见 status 子命令");
             ZstdDebugLog.sessionHeader(getPluginMeta().getVersion(), platformName(), facts);
@@ -259,8 +266,8 @@ public class MikuZstdPaper extends JavaPlugin {
     /**
      * 按配置开启 debug 日志（Level 由 log4j2 反射设置）。
      *
-     * <p>Paper 用 log4j2，与 Velocity 端同一套路。缺这一步时 {@code logging.debug}
-     * 是个"写了也没用"的配置——模板却承诺它会输出逐包诊断。</p>
+     * <p>Paper 用 log4j2，与 Velocity 端同一套路。只在 {@code logging.console_debug} 开启时调用：
+     * 调试行本来就写文件，这里是"额外再镜像一份到控制台"。</p>
      */
     private void applyDebugLogLevel() {
         try {

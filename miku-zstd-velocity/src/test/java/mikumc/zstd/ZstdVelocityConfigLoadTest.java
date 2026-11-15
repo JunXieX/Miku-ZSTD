@@ -45,13 +45,13 @@ class ZstdVelocityConfigLoadTest {
     }
 
     @Test
-    @DisplayName("首次真实load：debug 默认开启（写文件），console_debug 与 profiler 默认关闭")
-    void newFileDefaultsToDebugOn() throws IOException {
+    @DisplayName("首次真实load：调试日志强制开启，模板里不再生成 debug 键")
+    void newTemplateHasNoDebugSwitch() throws IOException {
         Path file = directory.resolve("nested/config.yml");
         assertFalse(Files.exists(file));
         ZstdVelocityConfig.load(file);
-        // 6.1.1 起 debug 只表示"写调试文件"，默认开启；控制台与剖析各有独立开关。
-        assertTrue(ZstdVelocityConfig.INSTANCE.debug);
+        // 6.1.1 起调试日志强制开启：没有 debug 开关，控制台与剖析各有独立开关。
+        assertFalse(ZstdVelocityConfig.INSTANCE.legacyDebugIgnored);
         assertFalse(ZstdVelocityConfig.INSTANCE.consoleDebug);
         assertFalse(ZstdVelocityConfig.INSTANCE.profiler);
         assertEquals("logs/zstd-debug.log", ZstdVelocityConfig.INSTANCE.debugFile);
@@ -61,7 +61,7 @@ class ZstdVelocityConfigLoadTest {
         try (Reader reader = Files.newBufferedReader(file, StandardCharsets.UTF_8)) {
             Map<?, ?> generated = new Yaml().load(reader);
             Map<?, ?> logging = (Map<?, ?>) generated.get("logging");
-            assertEquals(Boolean.TRUE, logging.get("debug"));
+            assertFalse(logging.containsKey("debug"), "模板不应再生成 debug 键（它已经不是开关）");
             assertEquals(Boolean.FALSE, logging.get("console_debug"));
             assertEquals(Boolean.FALSE, logging.get("profiler"));
             assertEquals("logs/zstd-debug.log", logging.get("file"));
@@ -71,7 +71,6 @@ class ZstdVelocityConfigLoadTest {
         String generated = Files.readString(file, StandardCharsets.UTF_8);
         assertFalse(generated.contains("skip_compress_below_bytes"), "新模板不再生成旧直存阈值");
         ZstdVelocityConfig.load(file);
-        assertTrue(ZstdVelocityConfig.INSTANCE.debug);
         assertEquals(generated, Files.readString(file, StandardCharsets.UTF_8));
     }
 
@@ -94,43 +93,55 @@ class ZstdVelocityConfigLoadTest {
     void profilerAndConsoleDebugAreIndependent() throws IOException {
         Path file = directory.resolve("config.yml");
         Files.writeString(file,
-                "logging: {debug: false, console_debug: true, profiler: true}\n",
+                "logging: {console_debug: true, profiler: true}\n",
                 StandardCharsets.UTF_8);
         ZstdVelocityConfig.load(file);
-        assertFalse(ZstdVelocityConfig.INSTANCE.debug);
         assertTrue(ZstdVelocityConfig.INSTANCE.consoleDebug);
         assertTrue(ZstdVelocityConfig.INSTANCE.profiler);
     }
 
     @ParameterizedTest
     @ValueSource(strings = {"", "{}", "compression: {level: 6}", "logging: {}", "logging:"})
-    @DisplayName("空文件或缺省logging/debug：真实load为true且不覆写已有文件")
-    void missingDebugDefaultsOnWithoutRewriting(String contents) throws IOException {
+    @DisplayName("空文件或缺省 logging 段：不覆写已有文件，也不误判成旧键")
+    void missingLoggingSectionDoesNotRewrite(String contents) throws IOException {
         Path file = directory.resolve("config.yml");
         Files.writeString(file, contents, StandardCharsets.UTF_8);
         for (int i = 0; i < 2; i++) {
             ZstdVelocityConfig.load(file);
-            assertTrue(ZstdVelocityConfig.INSTANCE.debug);
+            assertFalse(ZstdVelocityConfig.INSTANCE.legacyDebugIgnored);
             assertEquals(contents, Files.readString(file, StandardCharsets.UTF_8));
         }
     }
 
-    @ParameterizedTest
-    @ValueSource(booleans = {true, false})
-    @DisplayName("显式debug值、旧阈值与未知键在重复真实load后原文保留")
-    void explicitDebugAndUserContentsSurviveRepeatedLoad(boolean debug) throws IOException {
+    @Test
+    @DisplayName("旧配置里的 debug: false 只留下提示标记，原文不被重写")
+    void legacyDebugFalseIsIgnoredNotRewritten() throws IOException {
+        Path file = directory.resolve("config.yml");
+        String contents = "logging: {debug: false, keep_files: 5}\n";
+        Files.writeString(file, contents, StandardCharsets.UTF_8);
+        for (int i = 0; i < 2; i++) {
+            ZstdVelocityConfig.load(file);
+            assertTrue(ZstdVelocityConfig.INSTANCE.legacyDebugIgnored, "应识别出旧键并提示一次");
+            assertEquals(5, ZstdVelocityConfig.INSTANCE.debugKeepFiles, "其它键照常生效");
+            assertEquals(contents, Files.readString(file, StandardCharsets.UTF_8), "不得重写用户原文");
+        }
+    }
+
+    @Test
+    @DisplayName("旧阈值与未知键在重复真实load后原文保留")
+    void userContentsSurviveRepeatedLoad() throws IOException {
         Path file = directory.resolve("config.yml");
         String contents = """
                 # 保留用户注释
                 compression: {level: 6, skip_compress_below_bytes: 65536}
-                logging: {debug: %s}
+                logging: {debug: false}
                 custom-key: keep
-                """.formatted(debug);
+                """;
         Files.writeString(file, contents, StandardCharsets.UTF_8);
         for (int i = 0; i < 2; i++) {
             ZstdVelocityConfig.load(file);
-            assertEquals(debug, ZstdVelocityConfig.INSTANCE.debug);
             assertEquals(6, ZstdVelocityConfig.INSTANCE.level);
+            assertTrue(ZstdVelocityConfig.INSTANCE.legacyDebugIgnored);
             assertEquals(contents, Files.readString(file, StandardCharsets.UTF_8));
         }
     }

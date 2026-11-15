@@ -51,16 +51,22 @@ public final class MikuZstd {
      *
      * <p>放在配置读完之后、任何网络逻辑之前：协商、看门狗、切换确认的诊断才有地方落。
      * 打开失败（目录只读、磁盘满）只降级为"不写文件"，游戏照常进出服。</p>
+     *
+     * <p>⚠️ 6.1.1 起<b>强制开启</b>：这里传字面量 {@code true}，配置里没有开关——
+     * "连不上服"这种现场只有客户端那份文件能说明问题，不能给它留关掉的口子。</p>
      */
     private static void initDebugLog() {
         ZstdConfig cfg = ZstdConfig.INSTANCE;
         ZstdDebugLog.configure(
                 Paths.get(cfg.debugFile),
-                cfg.debug,
+                true,
                 cfg.debugMaxFileMb << 20,
                 cfg.debugKeepFiles,
                 null);
-        if (cfg.debug && ZstdDebugLog.file() != null) {
+        if (cfg.legacyDebugIgnored) {
+            LOGGER.info("[Zstd] 调试日志已强制开启（6.1.1 起不再可关闭），配置里的 logging.debug 已忽略");
+        }
+        if (ZstdDebugLog.file() != null) {
             Map<String, String> facts = new LinkedHashMap<>();
             facts.put("hud_enabled", String.valueOf(cfg.hudEnabled));
             facts.put("krypton", kryptonState());
