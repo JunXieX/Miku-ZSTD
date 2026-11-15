@@ -34,10 +34,49 @@ public class ZstdPaperConfig {
 
     /** 每批原始字节预算；0 = 只按包数上限收批（保持旧行为）。 */
     public final int batchMaxBytes;
+
+    /**
+     * 是否把逐连接诊断写进插件目录下的调试文件（默认<b>开启</b>）。
+     *
+     * <p>⚠️ 6.1.1 起语义改变：旧实现用反射把 {@code miku-zstd} 这个 logger 调到 DEBUG，
+     * 也就是"诊断只会进控制台"。控制台是运维看告警的地方，几十条每连接的行会把真问题埋掉；
+     * 现在诊断一律进文件，控制台的口径一行不变。想同时看控制台请开 {@link #consoleDebug}。</p>
+     */
     public final boolean debug;
+
+    /** 是否把调试行同时镜像到控制台（默认关闭，仅排查时临时开）。 */
+    public final boolean consoleDebug;
+
+    /** 调试文件路径（相对插件数据目录）。 */
+    public final String debugFile;
+
+    /** 单个调试文件的字节上限（MiB）。 */
+    public final int debugMaxFileMb;
+
+    /** 调试文件保留的历史份数。 */
+    public final int debugKeepFiles;
 
     /** BossBar 文本模板（支持 & 颜色代码与 %players%/%raw%/%wire%/%ratio% 占位符）。 */
     public final String bossbarFormat;
+
+    /**
+     * 等客户端协商应答的预算（毫秒）。
+     *
+     * <p>⚠️ 旧实现写死 3 秒（100ms × 30）。低配客户端在进服瞬间要加载区块/整合包资源、
+     * 还可能撞上一次 GC，3 秒很容易 miss；而 miss 的代价是<b>直接断开这条连接</b>——
+     * 玩家看到的就是"进不去、日志里什么都没有"。放宽到 10 秒后，同一次延迟只会退回原版
+     * （照常进服，只是这一轮没有 zstd）。</p>
+     */
+    public final int answerTimeoutMs;
+
+    /**
+     * 协商定案后继续吞下迟到应答的窗口（毫秒）。
+     *
+     * <p>⚠️ 旧实现写死 10 秒。玩家在登录/配置阶段停留超过 10 秒（下载服务端资源包、
+     * 大整合包首次加载）时，迟到的那条应答就会漏给 {@code ServerLoginPacketListenerImpl}，
+     * 被判定为 "unexpected query response" 直接断连。默认 120 秒覆盖整个登录+配置阶段。</p>
+     */
+    public final int lateAnswerWindowMs;
 
     /**
      * ⚠️ 与 Velocity 端同规则：<b>所有数值都夹取</b>，不接受越界值。
@@ -55,8 +94,16 @@ public class ZstdPaperConfig {
         this.batchMaxPackets = clamp(getInt(c, "batch_max_packets", 256), 1, 4096);
         this.batchMaxBytes = clamp(getInt(c, "batch_max_bytes", 0), 0, 16 * 1024 * 1024);
 
+        Map<String, Object> lg = section(map, "login");
+        this.answerTimeoutMs = clamp(getInt(lg, "answer_timeout_ms", 10000), 1000, 120000);
+        this.lateAnswerWindowMs = clamp(getInt(lg, "late_answer_window_ms", 120000), 5000, 600000);
+
         Map<String, Object> l = section(map, "logging");
-        this.debug = getBool(l, "debug", false);
+        this.debug = getBool(l, "debug", true);
+        this.consoleDebug = getBool(l, "console_debug", false);
+        this.debugFile = getString(l, "file", "logs/zstd-debug.log");
+        this.debugMaxFileMb = clamp(getInt(l, "max_file_mb", 8), 1, 128);
+        this.debugKeepFiles = clamp(getInt(l, "keep_files", 2), 0, 10);
 
         Map<String, Object> bb = section(map, "bossbar");
         this.bossbarFormat = getString(bb, "format", DEFAULT_BOSSBAR_FORMAT);
@@ -144,6 +191,17 @@ public class ZstdPaperConfig {
                       # 包数上限对大小差异极大的流量不成立：64 个聊天包几 KB、64 个区块包可能上兆。
                       batch_max_bytes: 0
 
+                    login:
+                      # 等客户端协商应答的预算（毫秒，1000-120000，默认 10000）。
+                      # 超时后本端退回原版（照常进服，只是这一轮不走 zstd），不再直接断开连接。
+                      # 必须显著大于客户端 ZstdLoginNetworking 的看门狗（固定 2000ms）。
+                      answer_timeout_ms: 10000
+
+                      # 协商定案后继续吞掉迟到应答的窗口（毫秒，5000-600000，默认 120000）。
+                      # 玩家在登录/配置阶段停留较久（资源包下载）时，迟到应答若漏给原版登录监听器
+                      # 会被判为 unexpected query response 而断连；这个窗口要盖住整个登录+配置阶段。
+                      late_answer_window_ms: 120000
+
                     bossbar:
                       # ── BossBar 实时监控文本（/mikuzstd bar 开关）──
                       # 支持 & 颜色代码，以及以下占位符：
@@ -155,9 +213,22 @@ public class ZstdPaperConfig {
                       format: "&a%players% &7人在用 &8| &f%raw% &7\u2192 &a%wire% &8| 压缩率 &e%ratio%"
 
                     logging:
-                      # 调试日志开关：输出逐包诊断信息（协商、切换确认、扣包/放行、安装锚点）
-                      # 默认关闭；排查问题时再开启，已有配置不会被自动覆盖。
-                      debug: false
+                      # ── 调试日志（6.1.1 起默认开启，写文件、不刷控制台）──
+                      # 协商、切换确认、扣包/放行、安装锚点这些逐连接诊断会写进下面这个文件。
+                      # 出问题时把该文件直接发出来即可，不必再改服务端日志框架。
+                      debug: true
+
+                      # 调试文件路径（相对 plugins/Miku-ZSTD/）。
+                      file: "logs/zstd-debug.log"
+
+                      # 单个文件上限（MiB，1-128）与保留的历史份数（0-10）。
+                      # 超限即滚动：zstd-debug.log -> .1 -> .2 ...，总量有硬上界。
+                      max_file_mb: 8
+                      keep_files: 2
+
+                      # 是否同时把调试行打进服务端控制台。默认关闭：
+                      # 控制台留给真正的告警，几十条每连接的行会把它们埋掉。
+                      console_debug: false
                     """;
             Files.writeString(configPath, yaml, StandardCharsets.UTF_8);
         } catch (IOException e) {

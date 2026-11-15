@@ -16,9 +16,12 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import mikumc.zstd.protocol.ZstdCompressPool;
+import mikumc.zstd.protocol.ZstdDebugLog;
 
 /**
  * Miku-ZSTD Paper 端插件入口。
@@ -62,9 +65,8 @@ public class MikuZstdPaper extends JavaPlugin {
     @Override
     public void onEnable() {
         ZstdPaperConfig.load(Path.of(getDataFolder().getPath(), "config.yml"));
-        if (ZstdPaperConfig.INSTANCE.debug) {
-            applyDebugLogLevel();
-        }
+        initDebugLog();
+
 
         // 命令与监控不依赖压缩管线。代理后端常将阈值设为 -1，仍须注册可执行命令。
         registerPermissions();
@@ -110,7 +112,7 @@ public class MikuZstdPaper extends JavaPlugin {
         try {
             getServer().getPluginManager().removePermission("mikuzstd.command");
         } catch (Throwable t) {
-            LOGGER.debug("[Zstd] 移除权限节点失败: {}", t.toString());
+            ZstdDebugLog.d("[Zstd] 移除权限节点失败: {}", t.toString());
         }
     }
 
@@ -141,6 +143,9 @@ public class MikuZstdPaper extends JavaPlugin {
         }
         unregisterPermissions();
         LOGGER.info("[Zstd] Miku-ZSTD Paper 已停用");
+        // ⚠️ 必须是最后一步：上面每一步的诊断都要先落到文件；close 会把队列里剩下的行刷完、
+        // 再结束写线程（不留下持有本插件类加载器的线程，插件重载才不泄漏）。
+        ZstdDebugLog.close();
     }
 
     /**
@@ -162,7 +167,7 @@ public class MikuZstdPaper extends JavaPlugin {
                 hook.field().setAccessible(true);
                 hook.field().set(hook.target(), hook.original());
             } catch (Throwable t) {
-                LOGGER.debug("[Zstd] 还原 childHandler 失败（忽略）", t);
+                ZstdDebugLog.d("[Zstd] 还原 childHandler 失败（忽略）", t);
             }
         }
         hookedFields.clear();
@@ -173,7 +178,7 @@ public class MikuZstdPaper extends JavaPlugin {
         try {
             forEachLiveConnectionChannel(MikuZstdPaper::revertConnection);
         } catch (Throwable t) {
-            LOGGER.debug("[Zstd] 摘除在线连接的协商器失败（忽略）", t);
+            ZstdDebugLog.d("[Zstd] 摘除在线连接的协商器失败（忽略）", t);
         }
     }
 
@@ -191,7 +196,7 @@ public class MikuZstdPaper extends JavaPlugin {
                 try {
                     p.remove("miku-zstd-negotiator");
                 } catch (Throwable t) {
-                    LOGGER.debug("[Zstd] 摘除协商器失败（忽略）: {}", t.toString());
+                    ZstdDebugLog.d("[Zstd] 摘除协商器失败（忽略）: {}", t.toString());
                 }
             }
             ZstdPaperChannelManager mgr = channel.attr(ZstdPaperChannelManager.KEY).getAndSet(null);
@@ -204,7 +209,7 @@ public class MikuZstdPaper extends JavaPlugin {
             if (activated) {
                 // 对端此刻仍按 zstd 收发，原版管线发过去它只会解不开；断开让客户端重连，
                 // 重连后插件已停用，自然走原版 zlib。
-                LOGGER.debug("[Zstd] 插件停用：断开已激活的连接 {}（客户端重连后走原版压缩）",
+                ZstdDebugLog.d("[Zstd] 插件停用：断开已激活的连接 {}（客户端重连后走原版压缩）",
                         channel.remoteAddress());
                 channel.close();
             }
@@ -213,6 +218,41 @@ public class MikuZstdPaper extends JavaPlugin {
             task.run();
         } else {
             channel.eventLoop().execute(task);
+        }
+    }
+
+    /**
+     * 打开调试文件通道，并写一段会话横幅。
+     *
+     * <p>顺序很重要：配置一读完就建通道，后面挂钩、注入、协商的诊断才有地方落。
+     * 通道建立失败（目录只读、磁盘满）只降级为"不写文件"，功能照旧。</p>
+     *
+     * <p>控制台口径由 {@code logging.console_debug} 单独决定：为 true 时才把同一批行镜像进
+     * 控制台（沿用 log4j2 反射把 logger 调到 DEBUG，失败则退回 INFO 直写）。</p>
+     */
+    private void initDebugLog() {
+        ZstdPaperConfig cfg = ZstdPaperConfig.INSTANCE;
+        ZstdDebugLog.configure(
+                getDataFolder().toPath().resolve(cfg.debugFile),
+                cfg.debug,
+                cfg.debugMaxFileMb << 20,
+                cfg.debugKeepFiles,
+                cfg.consoleDebug ? line -> LOGGER.debug("{}", line) : null);
+        if (cfg.debug && ZstdDebugLog.file() != null) {
+            Map<String, String> facts = new LinkedHashMap<>();
+            facts.put("compression", "level=" + cfg.level + " window_log=" + cfg.windowLog
+                    + " threads=" + cfg.compressThreads + " batch=" + cfg.batchWindowMs + "ms/"
+                    + cfg.batchMaxPackets + "packets/" + cfg.batchMaxBytes + "bytes");
+            facts.put("login", "answer_timeout_ms=" + cfg.answerTimeoutMs
+                    + " late_answer_window_ms=" + cfg.lateAnswerWindowMs);
+            facts.put("logging", "console_debug=" + cfg.consoleDebug
+                    + " max_file_mb=" + cfg.debugMaxFileMb + " keep_files=" + cfg.debugKeepFiles);
+            facts.put("world", "online_mode 与 network-compression-threshold 见 status 子命令");
+            ZstdDebugLog.sessionHeader(getPluginMeta().getVersion(), platformName(), facts);
+            LOGGER.info("[Zstd] 调试日志: {}（出问题时把这个文件发出来即可）", ZstdDebugLog.file());
+        }
+        if (cfg.consoleDebug) {
+            applyDebugLogLevel();
         }
     }
 
@@ -229,7 +269,7 @@ public class MikuZstdPaper extends JavaPlugin {
             Object debugLevel = levelClass.getField("DEBUG").get(null);
             configuratorClass.getMethod("setLevel", String.class, levelClass)
                     .invoke(null, "miku-zstd", debugLevel);
-            LOGGER.info("[Zstd] Debug logging enabled");
+            LOGGER.info("[Zstd] 控制台调试输出已开启（logging.console_debug=true）");
         } catch (Throwable t) {
             LOGGER.warn("[Zstd] 无法设置 debug 日志等级，请自行配置日志框架（设置未生效）: {}", t.toString());
         }
@@ -452,7 +492,7 @@ public class MikuZstdPaper extends JavaPlugin {
                 channel.eventLoop().schedule(() -> injectHandlers(channel, attempt + 1),
                         10, TimeUnit.MILLISECONDS);
             } else {
-                LOGGER.debug("[Zstd] packet_handler 始终未出现，放弃为本次连接注入协商器; pipeline={}",
+                ZstdDebugLog.d("[Zstd] packet_handler 始终未出现，放弃为本次连接注入协商器; pipeline={}",
                         p.names());
             }
             return;

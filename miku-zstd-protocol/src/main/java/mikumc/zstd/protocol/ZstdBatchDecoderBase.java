@@ -341,15 +341,15 @@ public abstract class ZstdBatchDecoderBase extends MessageToMessageDecoder<ByteB
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
         if (isPacketCancellation(cause)) {
-            LOGGER.debug("[Zstd] packet cancelled by another plugin (remote={}): {}",
+            ZstdDebugLog.d("[Zstd] packet cancelled by another plugin (remote={}): {}",
                     ctx.channel().remoteAddress(), cause.toString());
             return;
         }
         if (isConnectionIoError(cause)) {
-            LOGGER.debug("[Zstd] connection I/O error (remote={}): {}",
+            ZstdDebugLog.d("[Zstd] connection I/O error (remote={}): {}",
                     ctx.channel().remoteAddress(), cause.toString());
         } else if (stopped(ctx)) {
-            LOGGER.debug("[Zstd] decoder exception after channel closed (remote={}): {}",
+            ZstdDebugLog.d("[Zstd] decoder exception after channel closed (remote={}): {}",
                     ctx.channel().remoteAddress(), cause.toString());
         } else {
             LOGGER.warn("[Zstd] decoder exception — closing channel (remote={})",

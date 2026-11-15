@@ -9,9 +9,10 @@
 - 对服务端到客户端的下行流量使用连续 Zstandard 压缩，同一连接保留压缩历史，待发数据随上游 flush 输出。
 - 支持代理入口与玩家直连两种部署形态；Paper 与 Folia 使用同一份 Paper 产物。
 - 提供状态、连接流量排行与 BossBar 监控；客户端按 F8 查看下行速率与压缩率。
-- 新生成的服务端配置默认关闭调试日志，已有配置中的显式设置保持原样。
+- 6.1.1 起调试日志**默认开启并写成文件**（服务端/代理为 `plugins/Miku-ZSTD/logs/zstd-debug.log`，客户端为 `<游戏目录>/Miku-ZSTD/logs/zstd-debug.log`），控制台口径不变；玩家进不去服时把该文件发出来即可定位。
 - 代理上 `/mikuzstd bar` 对后端同名命令的遮蔽：具备代理权限时在代理执行，否则已连接后端的玩家交由后端鉴权。
 - 关闭后端原版压缩时，仍保留 `/mikuzstd bar` 的执行与补全。
+- 6.1.1 把协商应答等待从写死的 3 秒（Paper）/ 2 秒（Velocity）改为可配置的 `login.answer_timeout_ms`（默认 10 秒），超时改为<b>先回落原版</b>而不是直接断开连接；客户端补上压缩管线看门狗，未观察到 SetCompression 时按原版应答，不再无限期等待。协商与激活的逐连接诊断统一写进调试文件（默认开启，单文件 8 MiB、保留 2 份历史），控制台只留启用/停用、激活成功与真正的告警。
 - 6.1.0 新增分段耗时（`latency`）、往返探测（`ping`）与精确字节计数（`traffic`）三个诊断命令；`batch_max_packets` 默认提高到 256，新增默认关闭的 `batch_max_bytes` 字节预算。
 - 6.0.4 修复 Fabric + Krypton 在协商应答早于 SetCompression 时发出未封装登录包的问题；使用 FRP 转发仍可保持 `transport.useCompression=true`。
 - 6.0.2 起不再设置小包直存阈值，所有接管后的下行包都进入连续压缩流；旧协商协议的客户端协商不匹配时保持原版。
@@ -26,7 +27,7 @@
 | 客户端 | Minecraft 26.2 + Fabric | 当前构建使用 Fabric Loader 0.19.5、Fabric API 0.160.0+26.2 |
 | 代理 | Velocity 4.x | 当前真实服务器登录回归使用 4.3.1 |
 | 直连服务端 | Paper / Folia 26.2 | 当前构建基于 Paper 26.2；真实服务器登录回归使用 Paper 26.2 |
-| 配套文件 | Miku-ZSTD 服务端插件与 Fabric 模组 | 建议服务端与 Fabric 客户端统一使用 6.0.4；旧协议客户端协商不匹配时保持原版 |
+| 配套文件 | Miku-ZSTD 服务端插件与 Fabric 模组 | 建议服务端与 Fabric 客户端统一使用 6.1.1；旧协议客户端协商不匹配时保持原版 |
 
 以上是当前构建与回归基线，不代表其他游戏或代理版本已经逐一验证。
 
@@ -36,8 +37,8 @@
 
 | 场景 | 安装位置 | 监控范围 |
 |---|---|---|
-| 玩家通过 Velocity 进服 | 代理安装 `Miku-ZSTD-6.0.4-Velocity.jar`，玩家安装 Fabric 产物 | 代理实例处理的玩家下行连接 |
-| 玩家直连 Paper / Folia | 服务端安装 `Miku-ZSTD-6.0.4-Paper.jar`，玩家安装 Fabric 产物 | 该服务端实例处理的下行连接 |
+| 玩家通过 Velocity 进服 | 代理安装 `Miku-ZSTD-6.1.1-Velocity.jar`，玩家安装 Fabric 产物 | 代理实例处理的玩家下行连接 |
+| 玩家直连 Paper / Folia | 服务端安装 `Miku-ZSTD-6.1.1-Paper.jar`，玩家安装 Fabric 产物 | 该服务端实例处理的下行连接 |
 | 代理与后端均安装插件 | 按各自用途安装，分别配置与授权 | 两端统计独立，后端面板不会自动汇总代理的玩家出口 |
 
 代理架构只需代理插件与客户端模组即可覆盖玩家侧链路；后端 Paper 插件属于独立安装项。
@@ -46,7 +47,7 @@
 
 1. 将对应产物放进运行实例的 `plugins/`，同一实例只保留一份本插件。
 2. Paper / Folia 将 `server.properties` 的 `network-compression-threshold` 设为非负值，建议从 `256` 开始。Velocity 使用其自身的压缩阈值配置。
-3. 重启对应实例。首次启动生成 `plugins/Miku-ZSTD/config.yml`；代理与后端各有自己的配置文件。经 FRP 转发时无需关闭 `transport.useCompression`，请让面向玩家的服务端/代理与客户端使用 6.0.4。
+3. 重启对应实例。首次启动生成 `plugins/Miku-ZSTD/config.yml`；代理与后端各有自己的配置文件。经 FRP 转发时无需关闭 `transport.useCompression`，请让面向玩家的服务端/代理与客户端统一使用 6.1.1。
 4. 使用配套客户端登录，并运行 `/mikuzstd status` 核对当前实例状态。需要图形监控时，再按权限说明执行 `/mikuzstd bar`。
 
 Paper / Folia 将原版压缩阈值设为 `-1` 时，只关闭本端压缩接管，命令与 BossBar 监控仍可使用，玩家连接继续按原版处理。后端监控不会自动包含代理出口流量。
@@ -54,8 +55,9 @@ Paper / Folia 将原版压缩阈值设为 `-1` 时，只关闭本端压缩接管
 ### 客户端
 
 1. 安装与 Minecraft 26.2 对应的 Fabric Loader、Fabric API。
-2. 将 `Miku-ZSTD-6.0.4-Fabric.jar` 放进该游戏实例的 `mods/`。
-3. 首次启动生成 `<游戏目录>/Miku-ZSTD/config.yml`。进入游戏后按 **F8** 切换下行统计 HUD，按键切换只在本次运行期间生效。
+2. 将 `Miku-ZSTD-6.1.1-Fabric.jar` 放进该游戏实例的 `mods/`。
+3. 首次启动生成 `<游戏目录>/Miku-ZSTD/config.yml`，同时开始写调试日志 `<游戏目录>/Miku-ZSTD/logs/zstd-debug.log`。进入游戏后按 **F8** 切换下行统计 HUD，按键切换只在本次运行期间生效。
+4. 连不上服务器（一直停在连接中）时，退出游戏后把上面那个 `zstd-debug.log` 发出来即可——协商、看门狗、切换确认的每一步都在里面，不需要再去翻 `latest.log`。
 
 旧版配置按既有规则尝试迁移，已有文件不会被默认模板覆盖。Velocity 通常使用上文的大写目录；旧注入目录迁移失败时会记日志并继续使用旧目录，请以迁移日志确认实际配置位置。
 
@@ -74,12 +76,23 @@ compression:
   batch_max_packets: 256
   batch_max_bytes: 0
 
+login:
+  answer_timeout_ms: 10000
+  late_answer_window_ms: 120000
+
 bossbar:
   format: "&a%players% &7人在用 &8| &f%raw% &7→ &a%wire% &8| 压缩率 &e%ratio%"
 
 logging:
-  debug: false
+  debug: true
+  file: "logs/zstd-debug.log"
+  max_file_mb: 8
+  keep_files: 2
+  console_debug: false
+  profiler: false
 ```
+
+服务端与代理的调试文件都在各自实例的 `plugins/Miku-ZSTD/logs/` 下；客户端在 `<游戏目录>/Miku-ZSTD/logs/` 下。
 
 | 配置项 | 默认值 | 作用 |
 |---|---|---|
@@ -89,17 +102,28 @@ logging:
 | `compression.batch_window_ms` | `50` | 上游只写不 flush 时的兜底时间，单位毫秒；正常批次随上游 flush 发出 |
 | `compression.batch_max_packets` | `256` | 每个压缩批次最多合并的包数；批次输出可能跨多个传输帧 |
 | `compression.batch_max_bytes` | `0` | 每个压缩批次的原始字节预算，范围 0–16777216；`0` 为不启用。用于大小差异极大的流量：包数上限对聊天小包与区块大包代表的字节量差两个数量级 |
+| `login.answer_timeout_ms` | `10000` | 等客户端协商应答的预算，范围 1000–120000 毫秒。超时后本端回落原版并照常放行登录（只影响这一轮是否走 zstd）；必须明显大于客户端模组的 2000ms 看门狗 |
+| `login.late_answer_window_ms` | `120000` | 协商定案后继续吞掉迟到应答的窗口，范围 5000–600000 毫秒（Velocity 端无此项）。窗口要盖住整个登录 + 配置阶段，否则玩家在资源包下载期间停留过久会被判为意外的查询应答而断连 |
 | `bossbar.format` | 示例所示 | 当前实例监控文本，支持 `&` 颜色代码 |
-| `logging.debug` | `false` | 排查协商、安装与连接问题时开启；Velocity 同时据此启停每 60 秒一次的带宽剖析 |
+| `logging.debug` | `true` | 把逐连接诊断（协商、切换确认、扣包/放行、安装锚点、看门狗）写进调试文件。默认开启；关闭后不建文件也不起线程 |
+| `logging.file` | `logs/zstd-debug.log` | 调试文件路径，相对各自数据目录；客户端相对游戏目录，默认 `Miku-ZSTD/logs/zstd-debug.log` |
+| `logging.max_file_mb` | `8` | 单文件上限，范围 1–128 MiB；超过即滚动为 `.1`、`.2` |
+| `logging.keep_files` | `2` | 保留的历史份数，范围 0–10；`0` 表示只保留当前文件（写满即截断） |
+| `logging.console_debug` | `false` | 同时把同一批调试行进控制台。默认关闭：控制台留给真正的告警 |
+| `logging.profiler` | `false` | Velocity 带宽剖析（每 60 秒一段，写进调试文件）；Paper 端无此项 |
 
 BossBar 占位符：`%players%` 为使用 zstd 通道的人数，`%raw%` 为原始下行带宽，`%wire%` 为压缩后带宽，`%ratio%` 为压缩后 / 原始的百分比；带宽值自带单位，空闲时压缩率显示 `--`。原始带宽包含包长度前缀与包体，线路带宽包含 Minecraft 外层长度；不包含 TCP、加密等额外开销。
 
-**升级已有配置：** 旧项 `compression.skip_compress_below_bytes` 已不生效，无需手动删除也不会改变连续压缩行为。已有文件保留原文、注释及未知旧键，不会被重写；新模板不再生成该项。新文件、空配置或缺少 `logging.debug` 时采用 `false`。已有文件明确写着 `debug: true` 时仍保留 `true`，升级不会替用户关闭。要关闭旧设置，请主动修改为 `false` 并按下文加载。
+**升级已有配置：** 旧项 `compression.skip_compress_below_bytes` 已不生效，无需手动删除也不会改变连续压缩行为。已有文件保留原文、注释及未知旧键，不会被重写；新模板不再生成该项。
+
+`logging.debug` 的**语义在 6.1.1 变了**：以前它表示"把 miku-zstd 这个 logger 调到 DEBUG、诊断进控制台"，现在表示"诊断写进调试文件"，且默认值从 `false` 改为 `true`。缺少该键时按新默认（开启）处理；旧文件里显式写着 `debug: false` 的，仍按 `false` 生效（不写文件），升级不会替你改主意。想恢复旧的"控制台也能看到"，加 `console_debug: true`。
+
+缺少 `login.answer_timeout_ms` / `login.late_answer_window_ms` 时取代码内默认值（10 秒 / 120 秒），不需要手动补键。`logging` 段新增的 `file` / `max_file_mb` / `keep_files` 缺省即用上表默认值，同样不需要补键。
 
 ### 修改后如何生效
 
-- **Velocity：** 有代理权限时运行 `/mikuzstd reload`。调试开关和监控文本即时读取；等级、窗口和批处理参数需新连接；线程数需重启代理。
-- **Paper / Folia：** 修改配置后重启服务端；本端命令仅有 `status`、`top`、`bar`。
+- **Velocity：** 有代理权限时运行 `/mikuzstd reload`。整个 `logging` 段（开关、路径、上限、份数、控制台镜像、剖析）与监控文本即时读取——换文件路径会立刻改写到新文件；等级、窗口和批处理参数需新连接；线程数需重启代理。
+- **Paper / Folia：** 修改配置后重启服务端；本端命令仅有 `status`、`top`、`bar`（`status` 会打印当前调试文件路径与大小）。
 - 不要通过调大兜底时间追求更高压缩率：它主要改变未主动 flush 的调用方等待时间。
 
 ### 客户端显示配置
@@ -107,9 +131,17 @@ BossBar 占位符：`%players%` 为使用 zstd 通道的人数，`%raw%` 为原�
 ```yaml
 display:
   hud_enabled: false
+
+logging:
+  debug: true
+  file: "Miku-ZSTD/logs/zstd-debug.log"
+  max_file_mb: 8
+  keep_files: 2
 ```
 
-该设置决定启动后的 HUD 默认状态。F8 仅临时切换显示，不写回配置；HUD 只显示下行，不统计原版上行。
+`display.hud_enabled` 决定启动后的 HUD 默认状态。F8 仅临时切换显示，不写回配置；HUD 只显示下行，不统计原版上行。
+
+`logging` 段决定客户端调试日志：`debug` 默认开启，路径相对游戏目录，超过 `max_file_mb` 会滚动并保留 `keep_files` 份历史。客户端没有 `console_debug` / `profiler` 两项——游戏里没有需要清屏的控制台；`latest.log` 只会多出一行指路信息。
 
 ## 命令
 
@@ -150,9 +182,19 @@ OP 属于后端权限。没有代理节点且已连接后端的玩家会把 `bar
 
 它们统计各自实例实际处理的连接与流量，观察的链路和使用 zstd 的连接集合不同。后端面板不会自动包含代理出口的数据；经过代理执行 `status`、`top` 也仍是在查询代理。
 
-### 升级后为什么还有调试日志？
+### 调试日志在哪里？出问题要发什么？
 
-默认关闭只影响新文件或缺省值，旧配置里的显式 `true` 保留。分别检查代理与后端自己的配置，再按对应端的加载方式应用。
+三端各有一份，默认就开着，都在自己的目录里：
+
+| 端 | 路径 |
+|---|---|
+| Paper / Folia | `plugins/Miku-ZSTD/logs/zstd-debug.log` |
+| Velocity | `plugins/Miku-ZSTD/logs/zstd-debug.log` |
+| Fabric 客户端 | `<游戏目录>/Miku-ZSTD/logs/zstd-debug.log` |
+
+玩家进不去服时，让他把客户端那一份发出来；服主再把服务端/代理的同名文件一起给出，两边的协商时间线一对就能定位是"查询没发出去""应答没回来"还是"客户端拒绝/版本不匹配"。文件带硬上界（默认 8 MiB × 3），不会写爆磁盘；写过的内容不会进控制台，所以控制台不会因此变吵。
+
+路径与上限由 `logging.file`、`logging.max_file_mb`、`logging.keep_files` 控制；`/mikuzstd status` 会显示当前实际路径与大小。想连控制台一起看，把 `logging.console_debug` 设为 `true`（Velocity 用 `/mikuzstd reload` 即时生效，Paper 需重启）。
 
 ### 为什么没有压缩效果？
 
@@ -160,7 +202,7 @@ OP 属于后端权限。没有代理节点且已连接后端的玩家会把 `bar
 
 ### 如何查看带宽剖析？
 
-在需要时开启代理 `logging.debug` 并重载；剖析按压缩批次的原始流字节大小分档，不是单个游戏包长度分布。排查结束后再关闭，持续积压时先降低等级或按实际核心余量调整线程数。
+把代理配置里的 `logging.profiler` 设为 `true` 再 `/mikuzstd reload`（默认关闭：它是分析工具，不是故障诊断）。输出在调试文件里，每 60 秒一段，按压缩批次的原始流字节大小分档，不是单个游戏包长度分布。排查结束后再关掉；持续积压时先降低等级或按实际核心余量调整线程数。
 
 ### 如何停用？
 

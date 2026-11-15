@@ -1,5 +1,6 @@
 package cn.miku.zstd;
 
+import mikumc.zstd.protocol.ZstdDebugLog;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -8,6 +9,8 @@ import java.nio.file.Files;
 
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 /**
  * 模组入口常量与初始化。
@@ -39,7 +42,54 @@ public final class MikuZstd {
         Path configPath = Paths.get("Miku-ZSTD", "config.yml");
         migrateLegacyConfig(configPath);
         ZstdConfig.load(configPath);
+        initDebugLog();
         detectKrypton();
+    }
+
+    /**
+     * 打开调试文件通道并写会话横幅。
+     *
+     * <p>放在配置读完之后、任何网络逻辑之前：协商、看门狗、切换确认的诊断才有地方落。
+     * 打开失败（目录只读、磁盘满）只降级为"不写文件"，游戏照常进出服。</p>
+     */
+    private static void initDebugLog() {
+        ZstdConfig cfg = ZstdConfig.INSTANCE;
+        ZstdDebugLog.configure(
+                Paths.get(cfg.debugFile),
+                cfg.debug,
+                cfg.debugMaxFileMb << 20,
+                cfg.debugKeepFiles,
+                null);
+        if (cfg.debug && ZstdDebugLog.file() != null) {
+            Map<String, String> facts = new LinkedHashMap<>();
+            facts.put("hud_enabled", String.valueOf(cfg.hudEnabled));
+            facts.put("krypton", kryptonState());
+            ZstdDebugLog.sessionHeader(modVersion(), "Fabric client", facts);
+            // 控制台只留这一行：玩家据此就能找到要发的文件。
+            LOGGER.info("[Zstd] 调试日志: {}（连不上服时把这个文件发出来）", ZstdDebugLog.file());
+        }
+    }
+
+    /** 模组版本；取不到时退回 "?"，不让日志初始化因为元数据问题失败。 */
+    private static String modVersion() {
+        try {
+            return net.fabricmc.loader.api.FabricLoader.getInstance()
+                    .getModContainer(MOD_ID)
+                    .map(container -> container.getMetadata().getVersion().getFriendlyString())
+                    .orElse("?");
+        } catch (Throwable t) {
+            return "?";
+        }
+    }
+
+    /** 是否装了 Krypton（只影响诊断口径：上行由谁处理）。 */
+    private static String kryptonState() {
+        try {
+            Class.forName("me.steinborn.krypton.mod.shared.network.compression.MinecraftCompressEncoder");
+            return "installed";
+        } catch (Throwable t) {
+            return "absent";
+        }
     }
 
     /**
@@ -54,7 +104,7 @@ public final class MikuZstd {
         } catch (ClassNotFoundException notInstalled) {
             // 未安装 Krypton：无需提示
         } catch (Throwable t) {
-            LOGGER.debug("[Zstd] Krypton 检测跳过: {}", t.toString());
+            ZstdDebugLog.d("[Zstd] Krypton 检测跳过: {}", t.toString());
         }
     }
 

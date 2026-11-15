@@ -4,6 +4,7 @@ import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.MessageToMessageDecoder;
 import mikumc.zstd.protocol.ZstdStepFrames;
+import mikumc.zstd.protocol.ZstdDebugLog;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -94,10 +95,11 @@ public final class ZstdSwitchConfirmSniffer extends MessageToMessageDecoder<Byte
         // 否则随后到达的带魔数真确认就没人识别，闸门只能等超时兜底。
         if (accepted) {
             ctx.pipeline().remove(this);
-            LOGGER.debug("[Zstd] switch confirmation received (txId={}) — releasing gate", txId);
+            ZstdDebugLog.d("[Zstd] switch confirmation received (txId={}) — releasing gate", txId);
         } else if (UNCONFIRMED_LOGGED.compareAndSet(false, true)) {
-            // 旧版模组客户端每条连接都会走到这里：只提示一次，否则开服/重载会刷屏
-            LOGGER.info("[Zstd] 客户端未回切换确认（不带魔数的应答）——旧版模组的正常行为，"
+            // 旧版模组客户端每条连接都会走到这里：写调试文件，控制台不出现——
+            // 它是正常的兼容路径，不是告警。
+            ZstdDebugLog.d("[Zstd] 客户端未回切换确认（不带魔数的应答）——旧版模组的正常行为，"
                     + "服务端将按兜底放行；本条只提示一次");
         }
     }

@@ -5,6 +5,7 @@ import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.MessageToMessageDecoder;
 import mikumc.zstd.protocol.ZstdNegotiateStatus;
 import mikumc.zstd.protocol.ZstdVarInts;
+import mikumc.zstd.protocol.ZstdDebugLog;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -121,7 +122,7 @@ public class ZstdNegotiateAnswerSniffer extends MessageToMessageDecoder<ByteBuf>
                     ZstdVarInts.readOr(packet, cursor, ZstdNegotiateStatus.FALLBACK));
         }
 
-        LOGGER.debug("[Zstd] negotiate 应答已在帧层捕获（txId={}, status={}, success={}）",
+        ZstdDebugLog.d("[Zstd] negotiate 应答已在帧层捕获（txId={}, status={}, success={}）",
                 txId, status, success);
         mgr.markNegotiateResponse(status, success);
         // 立即触发激活（若 SetCompression 已写出），省掉最长 100ms 的轮询等待
@@ -212,7 +213,7 @@ public class ZstdNegotiateAnswerSniffer extends MessageToMessageDecoder<ByteBuf>
                 inflater.end();
             }
         } catch (Throwable t) {
-            LOGGER.debug("[Zstd] 应答帧解压失败（忽略该帧）: {}", t.toString());
+            ZstdDebugLog.d("[Zstd] 应答帧解压失败（忽略该帧）: {}", t.toString());
             return null;
         }
     }

@@ -7,6 +7,7 @@ import io.netty.util.AttributeKey;
 import mikumc.zstd.protocol.ZstdCompressLock;
 import mikumc.zstd.protocol.ZstdTrafficCounter;
 import mikumc.zstd.protocol.ZstdVarInts;
+import mikumc.zstd.protocol.ZstdDebugLog;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -155,7 +156,7 @@ public class ZstdChannelManager {
             this.protocolMismatch = true;
             if (!clientAnswered) {
                 // 原版客户端 / 未安装模组：这是完全正常的预期行为，不是问题
-                LOGGER.debug("[Zstd] 客户端未识别 zstd:negotiate（未安装 Miku-ZSTD 模组），保持原版 zlib");
+                ZstdDebugLog.d("[Zstd] 客户端未识别 zstd:negotiate（未安装 Miku-ZSTD 模组），保持原版 zlib");
             } else if (MISMATCH_WARNED.compareAndSet(false, true)) {
                 // 真正值得上报的信号：客户端认识这个查询但拒绝了（多为版本不匹配）。
                 // 只报一次——若真是版本不匹配，它会命中每一条连接，逐条告警只会淹没日志。
@@ -165,7 +166,7 @@ public class ZstdChannelManager {
             }
         } else {
             this.clientReady = true;
-            LOGGER.debug("[Zstd] Negotiate 应答：status={} → 客户端就绪", s);
+            ZstdDebugLog.d("[Zstd] Negotiate 应答：status={} → 客户端就绪", s);
         }
     }
 
@@ -347,7 +348,7 @@ public class ZstdChannelManager {
     public boolean confirmSwitch(int txId) {
         var gate = switchGate;
         if (gate == null) {
-            LOGGER.debug("[Zstd] switch confirmation received after the gate was already released");
+            ZstdDebugLog.d("[Zstd] switch confirmation received after the gate was already released");
             return false;
         }
         return gate.confirm(txId);

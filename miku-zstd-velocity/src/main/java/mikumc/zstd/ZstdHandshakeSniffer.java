@@ -6,6 +6,7 @@ import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelPipeline;
 import io.netty.handler.codec.MessageToMessageDecoder;
 import mikumc.zstd.protocol.ZstdVarInts;
+import mikumc.zstd.protocol.ZstdDebugLog;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -63,7 +64,7 @@ public class ZstdHandshakeSniffer extends MessageToMessageDecoder<ByteBuf> {
         }
 
         Channel channel = ctx.channel();
-        LOGGER.debug("[Zstd] Sniffer detected Zstd client on {}", channel.remoteAddress());
+        ZstdDebugLog.d("[Zstd] Sniffer detected Zstd client on {}", channel.remoteAddress());
 
         ChannelPipeline p = channel.pipeline();
         try {
@@ -82,14 +83,14 @@ public class ZstdHandshakeSniffer extends MessageToMessageDecoder<ByteBuf> {
             // 该时刻客户端监听器必然就绪，与 Velocity 3.x 的原始时序一致。
             if (p.get("zstd_outbound_spy") == null && p.get("handler") != null) {
                 p.addBefore("handler", "zstd_outbound_spy", new ZstdHijacker());
-                LOGGER.debug("[Zstd] Sniffer injected spy before login processing; pipeline={}", p.names());
+                ZstdDebugLog.d("[Zstd] Sniffer injected spy before login processing; pipeline={}", p.names());
             }
             // 帧层应答嗅探：必须位于压缩解码器之前，否则离线模式下应答会被原版压缩
             // 解码器当作压缩帧丢弃（详见 ZstdNegotiateAnswerSniffer 的类注释）。
             // 协议 v8 只有 negotiate 一种应答，zstd:dict 通道已随训练字典一起删除。
             if (p.get("zstd-negotiate-answer") == null) {
                 p.addAfter(ctx.name(), "zstd-negotiate-answer", new ZstdNegotiateAnswerSniffer());
-                LOGGER.debug("[Zstd] Negotiate-answer sniffer installed at frame level");
+                ZstdDebugLog.d("[Zstd] Negotiate-answer sniffer installed at frame level");
             }
         } catch (Exception e) {
             LOGGER.error("[Zstd] Sniffer failed to inject spy, falling back to vanilla", e);

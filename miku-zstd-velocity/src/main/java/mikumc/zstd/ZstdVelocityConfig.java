@@ -31,7 +31,35 @@ public class ZstdVelocityConfig {
 
     /** 压缩线程池大小；<=0 表示自动（CPU 核心数 − 1，给服务端主逻辑留一个核） */
     public final int compressThreads;
+
+    /**
+     * 是否把逐连接诊断写进数据目录下的调试文件（默认<b>开启</b>）。
+     *
+     * <p>⚠️ 6.1.1 起语义改变：旧实现用反射把 {@code miku-zstd} 调到 DEBUG，即"诊断只进控制台"。
+     * 控制台是看告警的地方，每连接几十行会把真问题埋掉；现在诊断一律进文件，
+     * 想同时看控制台请开 {@link #consoleDebug}。</p>
+     */
     public final boolean debug;
+
+    /** 是否把调试行同时镜像到控制台（默认关闭）。 */
+    public final boolean consoleDebug;
+
+    /** 调试文件路径（相对数据目录）。 */
+    public final String debugFile;
+
+    /** 单个调试文件的字节上限（MiB）。 */
+    public final int debugMaxFileMb;
+
+    /** 调试文件保留的历史份数。 */
+    public final int debugKeepFiles;
+
+    /**
+     * 是否启用带宽剖析（每 60 秒一段，写进调试文件）。
+     *
+     * <p>⚠️ 它与 {@link #debug} 分开：剖析是"按帧长区间看字节花在哪"的分析工具，
+     * 不是故障诊断；跟着调试开关默认打开会让每个代理都不停地算分档统计。</p>
+     */
+    public final boolean profiler;
 
     /**
      * 兜底成帧窗口（毫秒）。
@@ -53,6 +81,15 @@ public class ZstdVelocityConfig {
     public final String bossbarFormat;
 
     /**
+     * 等客户端协商应答的预算（毫秒）。
+     *
+     * <p>⚠️ 旧实现写死 2 秒，且超时直接断开连接。客户端在进服瞬间忙两秒（加载区块、
+     * 初次解析整合包资源、一次 GC）就会 miss，代价是整条连接被踢——玩家看到的是
+     * "进不去"，两端日志只有一行 Connecting to。放宽到 10 秒后同一次延迟只退回原版。</p>
+     */
+    public final int answerTimeoutMs;
+
+    /**
      * ⚠️ <b>所有数值都经 {@link #clamp(int, int, int)} 夹取</b>，不接受越界值。
      *
      * <p>以前配置原样透传：{@code window_log: 60} 这类越界值会在构造
@@ -69,8 +106,16 @@ public class ZstdVelocityConfig {
         this.batchMaxPackets = clamp(getInt(c, "batch_max_packets", 256), 1, 4096);
         this.batchMaxBytes = clamp(getInt(c, "batch_max_bytes", 0), 0, 16 * 1024 * 1024);
 
+        Map<String, Object> lg = getMap(map, "login");
+        this.answerTimeoutMs = clamp(getInt(lg, "answer_timeout_ms", 10000), 1000, 120000);
+
         Map<String, Object> l = getMap(map, "logging");
-        this.debug = getBool(l, "debug", false);
+        this.debug = getBool(l, "debug", true);
+        this.consoleDebug = getBool(l, "console_debug", false);
+        this.debugFile = getString(l, "file", "logs/zstd-debug.log");
+        this.debugMaxFileMb = clamp(getInt(l, "max_file_mb", 8), 1, 128);
+        this.debugKeepFiles = clamp(getInt(l, "keep_files", 2), 0, 10);
+        this.profiler = getBool(l, "profiler", false);
 
         Map<String, Object> bb = getMap(map, "bossbar");
         this.bossbarFormat = getString(bb, "format", mikumc.zstd.protocol.ZstdBossBarFormat.DEFAULT_FORMAT);
@@ -173,6 +218,12 @@ public class ZstdVelocityConfig {
                       # 每批的原始字节预算，范围 0-16777216；0 = 不启用（只按包数收批）。
                       batch_max_bytes: 0
 
+                    login:
+                      # 等客户端协商应答的预算（毫秒，1000-120000，默认 10000）。
+                      # 超时后本端退回原版（照常进服，只是这一轮不走 zstd），不再直接断开连接。
+                      # 必须显著大于客户端 ZstdLoginNetworking 的看门狗（固定 2000ms）。
+                      answer_timeout_ms: 10000
+
                     bossbar:
                       # ── BossBar 实时监控文本（/mikuzstd bar 开关）──
                       # 支持 & 颜色代码，以及以下占位符：
@@ -184,9 +235,26 @@ public class ZstdVelocityConfig {
                       format: "&a%players% &7人在用 &8| &f%raw% &7\u2192 &a%wire% &8| 压缩率 &e%ratio%"
 
                     logging:
-                      # 调试日志开关：输出逐包诊断信息（协商、切换确认、扣包/放行、安装锚点）
-                      # 默认关闭；排查问题时再开启，已有配置不会被自动覆盖。
-                      debug: false
+                      # ── 调试日志（6.1.1 起默认开启，写文件、不刷控制台）──
+                      # 协商、切换确认、扣包/放行、安装锚点这些逐连接诊断会写进下面这个文件。
+                      # 出问题时把该文件直接发出来即可，不必再改代理的日志框架。
+                      debug: true
+
+                      # 调试文件路径（相对 plugins/Miku-ZSTD/）。
+                      file: "logs/zstd-debug.log"
+
+                      # 单个文件上限（MiB，1-128）与保留的历史份数（0-10）。
+                      # 超限即滚动：zstd-debug.log -> .1 -> .2 ...，总量有硬上界。
+                      max_file_mb: 8
+                      keep_files: 2
+
+                      # 是否同时把调试行打进代理控制台。默认关闭：
+                      # 控制台留给真正的告警，几十条每连接的行会把它们埋掉。
+                      console_debug: false
+
+                      # 带宽剖析（每 60 秒一段，按帧长区间统计字节去向）写进调试文件。
+                      # 默认关闭：它是分析工具，不是故障诊断，常开会白白消耗 CPU。
+                      profiler: false
                     """;
             Files.writeString(configPath, yaml, StandardCharsets.UTF_8);
         } catch (IOException e) {
