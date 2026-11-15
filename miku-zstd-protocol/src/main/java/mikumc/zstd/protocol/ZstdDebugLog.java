@@ -114,6 +114,12 @@ public final class ZstdDebugLog {
         }
         DROPPED.set(0);
         WRITTEN.set(0);
+        // 限速窗口属于"本次会话"：换了文件就重新计数，否则上一轮（reload 前/上一个进程）
+        // 用掉的额度会把新会话开头的几百行直接吞掉——症状是文件建出来了却是空的。
+        synchronized (RATE_LOCK) {
+            rateWindowStartMs = 0L;
+            rateWindowCount = 0;
+        }
         queue = new ArrayBlockingQueue<>(QUEUE_CAPACITY);
         enabled = true;
         startWriter(queue);
@@ -240,6 +246,12 @@ public final class ZstdDebugLog {
 
     private static void writerLoop(BlockingQueue<String> ownedQueue) {
         while (true) {
+            BlockingQueue<String> current = queue;
+            if (current != null && current != ownedQueue) {
+                // 已被新会话接管（configure 换了文件）：立刻退出，绝不能拿旧队列的行去写新文件。
+                // close 时 queue 为 null，此时仍需把剩余行写完，所以只在"换成另一个队列"时退出。
+                return;
+            }
             String line;
             try {
                 line = ownedQueue.poll(500L, TimeUnit.MILLISECONDS);

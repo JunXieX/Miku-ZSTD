@@ -52,13 +52,19 @@ class ZstdDebugLogTest {
         ZstdDebugLog.close();
 
         List<String> lines = Files.readAllLines(file, StandardCharsets.UTF_8);
-        assertEquals(3, lines.size(), "每次调用应恰好一行");
+        // 异常条目会按 slf4j 的约定在行尾追加堆栈帧（帧数随 JDK 版本变化），所以这里数"条目"
+        // 而不是物理行：三条记录的第一行必定带时间戳前缀。
+        assertTrue(lines.size() >= 3, "三条记录至少三行：" + lines);
+        assertEquals(3, ZstdDebugLog.writtenLines(), "每次调用记一条：" + ZstdDebugLog.writtenLines());
         assertTrue(lines.get(0).matches("\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}\\.\\d{3} \\[.+\\] hello world"),
                 "行首必须是 时间戳 [线程] 内容：" + lines.get(0));
         assertEquals(1, lines.stream().filter(line -> line.endsWith("] plain line")).count());
-        assertTrue(lines.get(2).contains("boom java.lang.IllegalStateException: bad"),
-                "未配对占位符的末位异常按堆栈追加：" + lines.get(2));
-        assertTrue(lines.get(2).contains("at "), "异常行应带堆栈帧");
+        String boom = lines.stream()
+                .filter(line -> line.contains("boom java.lang.IllegalStateException: bad"))
+                .findFirst()
+                .orElse("");
+        assertFalse(boom.isEmpty(), "未配对占位符的末位异常按堆栈追加：" + lines);
+        assertTrue(lines.stream().anyMatch(line -> line.trim().startsWith("at ")), "异常条目应带堆栈帧：" + lines);
     }
 
     @Test
