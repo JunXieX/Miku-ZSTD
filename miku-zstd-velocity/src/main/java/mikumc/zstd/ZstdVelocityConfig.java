@@ -33,12 +33,12 @@ public class ZstdVelocityConfig {
     public final int compressThreads;
 
     /**
-     * 旧配置里是否显式写着 {@code logging.debug=false}。
+     * 调试日志总开关（{@code logging.debug}，默认 {@code true}）。
      *
-     * <p>⚠️ 6.1.1 起调试日志<b>强制开启</b>：它不再是开关，写了也关不掉。这个字段
-     * <b>不参与任何行为</b>，只在启动时用来打一行"为什么不生效"的提示。</p>
+     * <p>关掉后不建文件、不写任何调试行；{@code /mikuzstd reload} 会让改动立即生效
+     * （关→关通道，开→重建文件并重置限速窗口）。</p>
      */
-    public final boolean legacyDebugIgnored;
+    public final boolean debug;
 
     /** 是否把调试行同时镜像到控制台（默认关闭）。 */
     public final boolean consoleDebug;
@@ -127,7 +127,8 @@ public class ZstdVelocityConfig {
         this.answerTimeoutMs = clamp(getInt(lg, "answer_timeout_ms", 10000), 1000, 120000);
 
         Map<String, Object> l = getMap(map, "logging");
-        this.legacyDebugIgnored = Boolean.FALSE.equals(l.get("debug"));
+        // 默认开启：代理端同样是"玩家卡住时唯一能事后拿到的证据"。
+        this.debug = getBool(l, "debug", true);
         this.consoleDebug = getBool(l, "console_debug", false);
         this.debugFile = getString(l, "file", "logs/zstd-debug.log");
         this.debugMaxFileMb = clamp(getInt(l, "max_file_mb", 8), 1, 128);
@@ -279,10 +280,14 @@ public class ZstdVelocityConfig {
                       format: "&a%players% &7人在用 &8| &f%raw% &7\u2192 &a%wire% &8| 压缩率 &e%ratio%"
 
                     logging:
-                      # ── 调试日志（6.1.1 起强制开启，写文件、不刷控制台）──
+                      # ── 调试日志（默认开启，写文件、不刷控制台）──
                       # 协商、切换确认、扣包/放行、安装锚点这些逐连接诊断会写进下面这个文件。
                       # 出问题时把该文件直接发出来即可，不必再改代理的日志框架。
-                      # ⚠️ 没有开关：旧版这里的 debug 键已移除，写了不生效、也不会被重写。
+
+                      # 调试日志总开关。默认开启；改成 false 后不建文件、不写任何调试行。
+                      # 关掉的同时也关掉了卡住取证里的 server.log（现场只剩 session.txt 的连接事实）。
+                      # 本项支持 /mikuzstd reload 热切换。
+                      debug: true
 
                       # 调试文件路径（相对 plugins/Miku-ZSTD/）。
                       file: "logs/zstd-debug.log"

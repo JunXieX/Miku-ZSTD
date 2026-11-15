@@ -134,9 +134,9 @@ public final class ZstdCommand {
 
     private void reload(CommandSource source) {
         ZstdVelocityConfig.reload();
-        // 让 logging 段的改动也生效（启动时只应用过一次）：路径/上限/份数在 reinitDebugLog 里，
-        // 控制台镜像在 applyDebugFromConfig 里。不重开的话，改完路径却仍写旧文件，
-        // 服主会以为新配置没被读到。
+        // 让 logging 段的改动也生效（启动时只应用过一次）：debug 开关、路径/上限/份数在
+        // reinitDebugLog 里（关→关通道，开→重建文件），控制台镜像在 applyDebugFromConfig 里。
+        // 不重开的话，改完路径却仍写旧文件、关掉开关却还在写，服主会以为新配置没被读到。
         if (plugin != null) {
             plugin.reinitDebugLog();
             plugin.applyDebugFromConfig();

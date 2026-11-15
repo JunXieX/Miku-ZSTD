@@ -192,8 +192,10 @@ public final class ZstdDebugLog {
     public static String statsLine() {
         Path target = file;
         if (target == null) {
-            // 6.1.1 起没有关闭开关，这里只剩"本端打开失败"这一种情况。
-            return "调试日志：关闭（未启用或写入失败）";
+            // 两种可能：配置里关掉了（logging.debug=false），或者本端打开失败（只读目录/磁盘满，
+            // 启动日志里有 WARN）。命令输出必须能区分这两件事，否则关掉的人会以为是自己配置没被读到。
+            // 打开失败时 enabled 同样是 false，两种状态这里分不开，所以一句话把两种原因都写出来。
+            return "调试日志：关闭（logging.debug=false，或本端打开失败——启动日志里有 WARN）";
         }
         long bytes;
         synchronized (FILE_LOCK) {

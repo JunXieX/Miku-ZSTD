@@ -597,6 +597,7 @@ jobs:
           EOF
           # 判定阈值压到 5s：默认 15s 只是为了让慢客户端不被误判，这里要的是"快出结论"。
           # 预取关闭：本用例要走"卡住探针"那一条，预取会把 txId 先占掉一次。
+          # logging 段刻意留空：本用例同时验证"不写 debug 键也默认有日志"。
           cat > plugins/Miku-ZSTD/config.yml <<'EOF'
           logging: {}
           login:

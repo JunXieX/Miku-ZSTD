@@ -328,6 +328,12 @@ public final class ZstdPaperDiag {
         session.stallBundle = writeServerSide(session, "卡住探针（协商查询发出后 " + age + "ms 无进展）");
         info("判定卡住：" + resolveName(session.channel) + " 已 " + age + "ms 未完成登录协商，现场="
                 + session.stallBundle);
+        if (ZstdDebugLog.file() == null) {
+            // 关掉 debug 是服主的权利，但他得知道这次现场里少了什么，
+            // 否则会以为"日志本来就该是空的"。
+            info("调试日志已关闭（logging.debug=false），本次现场只有 session.txt 的连接事实；"
+                    + "要拿到逐包时间线请把 logging.debug 打开");
+        }
         if (pullClientLog) {
             sendQuery(session.channel, ZstdDiagFrames.MODE_STALL);
         }
@@ -346,7 +352,9 @@ public final class ZstdPaperDiag {
                 facts.put("协商应答", mgr.isResponseReceived() ? "已收到" : "未收到");
                 facts.put("已激活zstd", mgr.isReplaced() ? "是" : "否");
             }
-            facts.put("本端调试日志", String.valueOf(ZstdDebugLog.file()));
+            // 关闭时 file() 是 null：直说"关掉了"，别让人以为是读失败。
+            facts.put("本端调试日志", ZstdDebugLog.file() == null
+                    ? "关闭（logging.debug=false）" : String.valueOf(ZstdDebugLog.file()));
             byte[] tail = ZstdDiagFrames.readTail(ZstdDebugLog.file(), maxKb << 10).data();
             return ZstdDiagStore.writeBundle(stallRoot, resolveName(session.channel),
                     System.currentTimeMillis(), tail, null, facts, keepBundles);

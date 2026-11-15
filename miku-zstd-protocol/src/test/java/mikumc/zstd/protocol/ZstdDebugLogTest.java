@@ -79,7 +79,9 @@ class ZstdDebugLogTest {
         }
         ZstdDebugLog.close();
         assertFalse(Files.exists(file), "关闭状态不应留下文件");
-        assertTrue(ZstdDebugLog.statsLine().contains("关闭"));
+        String stats = ZstdDebugLog.statsLine();
+        assertTrue(stats.contains("关闭"), "关闭态摘要：" + stats);
+        assertTrue(stats.contains("logging.debug"), "摘要要点明是哪个键关掉的：" + stats);
     }
 
     @Test
