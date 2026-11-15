@@ -23,10 +23,10 @@ public class ZstdConfig {
     public final boolean hudEnabled;
 
     /**
-     * 调试日志总开关（{@code logging.debug}，默认 {@code true}）。
+     * 调试日志总开关（{@code logging.debug}，默认 {@code false}）。
      *
-     * <p>关掉后不建文件、不写任何调试行，{@code latest.log} 也不再出现指路信息；
-     * 此时服务端的卡住取证会收到 {@code NO_LOG}（不会报错，只是没有内容可回传）。</p>
+     * <p>打开后逐连接诊断写进 {@code Miku-ZSTD/logs/zstd-debug.log}，连不上服时把该文件发出来即可；
+     * 关闭时服务端的卡住取证会收到 {@code NO_LOG}（不会报错，只是没有内容可回传）。</p>
      */
     public final boolean debug;
 
@@ -55,8 +55,8 @@ public class ZstdConfig {
         this.hudEnabled = getBool(display, "hud_enabled", false);
 
         Map<String, Object> logging = section(map, "logging");
-        // 默认开启："连不上服"这种现场只有客户端那份文件能说明问题。
-        this.debug = getBool(logging, "debug", true);
+        // 默认关闭：日志是排查工具，不是常驻开销。连不上服时改成 true 再复现一次。
+        this.debug = getBool(logging, "debug", false);
         this.debugFile = getString(logging, "file", "Miku-ZSTD/logs/zstd-debug.log");
         this.debugMaxFileMb = clamp(getInt(logging, "max_file_mb", 8), 1, 128);
         this.debugKeepFiles = clamp(getInt(logging, "keep_files", 2), 0, 10);
@@ -130,13 +130,14 @@ public class ZstdConfig {
                       hud_enabled: false
 
                     logging:
-                      # ── 调试日志（默认开启，写文件、不进 latest.log）──
+                      # ── 调试日志（默认关闭，打开后写文件、不进 latest.log）──
                       # 记协商、看门狗、切换确认、管线安装这些逐连接诊断。
                       # 连不上服/卡在连接协商时，把下面这个文件发出来即可。
 
-                      # 调试日志总开关。默认开启；改成 false 后不建文件、不写任何调试行，
-                      # 服务端索取日志时也只能收到"没有日志"（不会报错）。
-                      debug: true
+                      # 调试日志总开关。默认关闭：连不上服 / 卡在连接协商时改成 true 再复现一次。
+                      # 打开后协商、看门狗、切换确认、管线安装这些逐连接诊断写进下面这个文件；
+                      # 关闭时服务端索取日志只会收到"没有日志"（不会报错）。
+                      debug: false
 
                       # 文件路径（相对游戏目录）。默认 <游戏目录>/Miku-ZSTD/logs/zstd-debug.log
                       file: "Miku-ZSTD/logs/zstd-debug.log"
@@ -146,7 +147,7 @@ public class ZstdConfig {
                       keep_files: 2
 
                     diagnostics:
-                      # ── 卡住取证（6.1.1）──
+                      # ── 卡住取证（6.1.2）──
                       # 服务端发现你"名字进去了、人没进来"时，会向本机索取调试日志尾部。
                       # 一条连接最多被问两次（登录后预取一次 + 判定卡住时一次），
                       # 只发上面那个调试文件的尾部，不含聊天与账号信息。

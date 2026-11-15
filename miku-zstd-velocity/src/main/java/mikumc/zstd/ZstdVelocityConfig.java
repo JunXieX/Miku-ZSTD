@@ -33,10 +33,10 @@ public class ZstdVelocityConfig {
     public final int compressThreads;
 
     /**
-     * 调试日志总开关（{@code logging.debug}，默认 {@code true}）。
+     * 调试日志总开关（{@code logging.debug}，默认 {@code false}）。
      *
-     * <p>关掉后不建文件、不写任何调试行；{@code /mikuzstd reload} 会让改动立即生效
-     * （关→关通道，开→重建文件并重置限速窗口）。</p>
+     * <p>打开后逐连接诊断写进 {@code logs/zstd-debug.log}；{@code /mikuzstd reload}
+     * 让改动立即生效（关→关通道，开→重建文件并重置限速窗口），不必重启代理。</p>
      */
     public final boolean debug;
 
@@ -127,8 +127,8 @@ public class ZstdVelocityConfig {
         this.answerTimeoutMs = clamp(getInt(lg, "answer_timeout_ms", 10000), 1000, 120000);
 
         Map<String, Object> l = getMap(map, "logging");
-        // 默认开启：代理端同样是"玩家卡住时唯一能事后拿到的证据"。
-        this.debug = getBool(l, "debug", true);
+        // 默认关闭：日志是排查工具，不是常驻开销。排查前改成 true（reload 即生效）再复现。
+        this.debug = getBool(l, "debug", false);
         this.consoleDebug = getBool(l, "console_debug", false);
         this.debugFile = getString(l, "file", "logs/zstd-debug.log");
         this.debugMaxFileMb = clamp(getInt(l, "max_file_mb", 8), 1, 128);
@@ -251,10 +251,10 @@ public class ZstdVelocityConfig {
                       answer_timeout_ms: 10000
 
                     diagnostics:
-                      # ── 卡住会话自动取证（6.1.1）──
+                      # ── 卡住会话自动取证（6.1.2）──
                       # 玩家名已经确认、连接却始终没接上后端时，自动做两件事：
                       #   1) 把本端调试文件尾部与连接事实写进 logs/stall/<玩家>-<时间>/；
-                      #   2) 向该玩家的客户端要一份它自己的调试日志尾部（需客户端 6.1.1+）。
+                      #   2) 向该玩家的客户端要一份它自己的调试日志尾部（需客户端 6.1.2+）。
                       # 现场目录三件套：server.log / client.log.gz / session.txt。
                       enabled: true
                       # 判定阈值（毫秒，5000-120000）。太小会把慢客户端也当卡住。
@@ -280,14 +280,15 @@ public class ZstdVelocityConfig {
                       format: "&a%players% &7人在用 &8| &f%raw% &7\u2192 &a%wire% &8| 压缩率 &e%ratio%"
 
                     logging:
-                      # ── 调试日志（默认开启，写文件、不刷控制台）──
+                      # ── 调试日志（默认关闭，打开后写文件、不刷控制台）──
                       # 协商、切换确认、扣包/放行、安装锚点这些逐连接诊断会写进下面这个文件。
                       # 出问题时把该文件直接发出来即可，不必再改代理的日志框架。
 
-                      # 调试日志总开关。默认开启；改成 false 后不建文件、不写任何调试行。
-                      # 关掉的同时也关掉了卡住取证里的 server.log（现场只剩 session.txt 的连接事实）。
-                      # 本项支持 /mikuzstd reload 热切换。
-                      debug: true
+                      # 调试日志总开关。默认关闭：要排查（连不上服 / 卡在连接协商）时改成 true 再复现。
+                      # 打开后协商、切换确认、扣包/放行、安装锚点这些逐连接诊断写进下面这个文件，
+                      # 它同时也是卡住取证里 server.log 的唯一来源；关闭时现场只剩 session.txt 的连接事实。
+                      # 本项支持 /mikuzstd reload 热切换，不必重启代理。
+                      debug: false
 
                       # 调试文件路径（相对 plugins/Miku-ZSTD/）。
                       file: "logs/zstd-debug.log"

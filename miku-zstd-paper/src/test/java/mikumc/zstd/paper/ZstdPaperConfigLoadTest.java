@@ -39,13 +39,13 @@ class ZstdPaperConfigLoadTest {
     }
 
     @Test
-    @DisplayName("首次真实load：调试日志默认开启，模板带 debug 开关")
+    @DisplayName("首次真实load：调试日志默认关闭，模板带 debug 开关")
     void newTemplateHasDebugSwitch() throws IOException {
         Path file = directory.resolve("nested/config.yml");
         assertFalse(Files.exists(file));
         ZstdPaperConfig.load(file);
-        // 默认开启（不写也给日志），关掉要显式写 false；console_debug 仍是独立且默认关闭。
-        assertTrue(ZstdPaperConfig.INSTANCE.debug);
+        // 默认关闭（要排查时显式写 true），console_debug 仍是独立且默认关闭。
+        assertFalse(ZstdPaperConfig.INSTANCE.debug);
         assertFalse(ZstdPaperConfig.INSTANCE.consoleDebug);
         assertEquals("logs/zstd-debug.log", ZstdPaperConfig.INSTANCE.debugFile);
         assertEquals(8, ZstdPaperConfig.INSTANCE.debugMaxFileMb);
@@ -54,7 +54,7 @@ class ZstdPaperConfigLoadTest {
         try (Reader reader = Files.newBufferedReader(file, StandardCharsets.UTF_8)) {
             Map<?, ?> generated = new Yaml().load(reader);
             Map<?, ?> logging = (Map<?, ?>) generated.get("logging");
-            assertEquals(Boolean.TRUE, logging.get("debug"), "模板必须带开关且默认开启");
+            assertEquals(Boolean.FALSE, logging.get("debug"), "模板必须带开关且默认关闭");
             assertEquals(Boolean.FALSE, logging.get("console_debug"));
             assertEquals("logs/zstd-debug.log", logging.get("file"));
             assertEquals(8, ((Number) logging.get("max_file_mb")).intValue());
@@ -101,14 +101,14 @@ class ZstdPaperConfigLoadTest {
     }
 
     @Test
-    @DisplayName("debug: false 真的关掉日志，原文不被重写")
-    void debugFalseIsHonouredNotRewritten() throws IOException {
+    @DisplayName("debug: true 真的打开日志，原文不被重写")
+    void debugTrueIsHonouredNotRewritten() throws IOException {
         Path file = directory.resolve("config.yml");
-        String contents = "logging: {debug: false, keep_files: 5}\n";
+        String contents = "logging: {debug: true, keep_files: 5}\n";
         Files.writeString(file, contents, StandardCharsets.UTF_8);
         for (int i = 0; i < 2; i++) {
             ZstdPaperConfig.load(file);
-            assertFalse(ZstdPaperConfig.INSTANCE.debug, "关闭必须生效，不能只是提示一句");
+            assertTrue(ZstdPaperConfig.INSTANCE.debug, "默认关闭，写 true 必须真的打开");
             assertEquals(5, ZstdPaperConfig.INSTANCE.debugKeepFiles, "其它键照常生效");
             assertEquals(contents, Files.readString(file, StandardCharsets.UTF_8), "不得重写用户原文");
         }
@@ -146,7 +146,7 @@ class ZstdPaperConfigLoadTest {
         Files.writeString(file, contents, StandardCharsets.UTF_8);
         for (int i = 0; i < 2; i++) {
             ZstdPaperConfig.load(file);
-            assertTrue(ZstdPaperConfig.INSTANCE.debug, "缺 logging 段时按默认开启");
+            assertFalse(ZstdPaperConfig.INSTANCE.debug, "缺 logging 段时按默认关闭");
             assertEquals(contents, Files.readString(file, StandardCharsets.UTF_8));
         }
     }
@@ -201,14 +201,14 @@ class ZstdPaperConfigLoadTest {
         String contents = """
                 # 保留用户注释
                 compression: {level: 6, skip_compress_below_bytes: 65536}
-                logging: {debug: false}
+                logging: {debug: true}
                 custom-key: keep
                 """;
         Files.writeString(file, contents, StandardCharsets.UTF_8);
         for (int i = 0; i < 2; i++) {
             ZstdPaperConfig.load(file);
             assertEquals(6, ZstdPaperConfig.INSTANCE.level);
-            assertFalse(ZstdPaperConfig.INSTANCE.debug, "logging.debug: false 要真的关掉");
+            assertTrue(ZstdPaperConfig.INSTANCE.debug, "logging.debug: true 要真的打开");
             assertEquals(contents, Files.readString(file, StandardCharsets.UTF_8));
         }
     }

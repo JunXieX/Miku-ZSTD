@@ -127,8 +127,8 @@ public class MikuZstdVelocity {
      * <p>放在配置读完之后、任何依赖压缩管线的逻辑之前：后面握手嗅探、注入、
      * 协商应答的全部诊断才有地方落。打开失败（目录只读、磁盘满）只降级为"不写文件"。</p>
      *
-     * <p>由 {@code logging.debug} 决定（默认开启）：关掉后不建文件，{@code /mikuzstd reload}
-     * 可热切换；关闭时启动/重载日志里会明确提醒一句。</p>
+     * <p>由 {@code logging.debug} 决定（默认关闭）：只有显式打开才建文件，{@code /mikuzstd reload}
+     * 可热切换；打开失败（目录只读、磁盘满）只降级为不写文件。</p>
      */
     private void initDebugLog(Path dataDir) {
         ZstdVelocityConfig cfg = ZstdVelocityConfig.INSTANCE;
@@ -138,17 +138,13 @@ public class MikuZstdVelocity {
                 cfg.debugMaxFileMb << 20,
                 cfg.debugKeepFiles,
                 cfg.consoleDebug ? line -> logger.debug("{}", line) : null);
-        if (!cfg.debug) {
-            logger.info("[Zstd] 调试日志已关闭（logging.debug=false）：出问题将没有日志文件可查，"
-                    + "卡住取证也只有 session.txt 的连接事实");
-        }
         if (ZstdDebugLog.file() != null) {
             Map<String, String> facts = new LinkedHashMap<>();
             facts.put("compression", "level=" + cfg.level + " window_log=" + cfg.windowLog
                     + " threads=" + cfg.compressThreads + " batch=" + cfg.batchWindowMs + "ms/"
                     + cfg.batchMaxPackets + "packets/" + cfg.batchMaxBytes + "bytes");
             facts.put("login", "answer_timeout_ms=" + cfg.answerTimeoutMs);
-            facts.put("logging", "debug=" + cfg.debug + " console_debug=" + cfg.consoleDebug + " profiler=" + cfg.profiler
+            facts.put("logging", "console_debug=" + cfg.consoleDebug + " profiler=" + cfg.profiler
                     + " max_file_mb=" + cfg.debugMaxFileMb + " keep_files=" + cfg.debugKeepFiles);
             ZstdDebugLog.sessionHeader(BuildConstants.VERSION,
                     "Velocity " + String.valueOf(proxy.getVersion()), facts);

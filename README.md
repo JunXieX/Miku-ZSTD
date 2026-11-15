@@ -9,11 +9,11 @@
 - 对服务端到客户端的下行流量使用连续 Zstandard 压缩，同一连接保留压缩历史，待发数据随上游 flush 输出。
 - 支持代理入口与玩家直连两种部署形态；Paper 与 Folia 使用同一份 Paper 产物。
 - 提供状态、连接流量排行与 BossBar 监控；客户端按 F8 查看下行速率与压缩率。
-- 6.1.1 起调试日志**默认开启并写成文件**（服务端/代理为 `plugins/Miku-ZSTD/logs/zstd-debug.log`，客户端为 `<游戏目录>/Miku-ZSTD/logs/zstd-debug.log`），开关是 `logging.debug`，控制台口径不变；玩家进不去服时把该文件发出来即可定位。
-- 6.1.1 起**卡住会话自动取证**：玩家"名字进去了、人没进来"时，服务端在判定卡住的当下把本端调试文件尾部写成现场，并主动向该客户端索取它自己的日志尾部，落成 `plugins/Miku-ZSTD/logs/stall/<玩家>-<时间>/`（`server.log` + `client.log.gz` + `session.txt`）。不需要玩家知道文件在哪，也不需要他放弃重连后才想起来取证。
+- 6.1.2 起调试日志**默认关闭**，需要排查时把 `logging.debug` 改成 `true`（服务端/代理写 `plugins/Miku-ZSTD/logs/zstd-debug.log`，客户端写 `<游戏目录>/Miku-ZSTD/logs/zstd-debug.log`），控制台口径不变；玩家进不去服时让他打开开关复现一次、再把该文件发出来即可定位。
+- 6.1.2 起**卡住会话自动取证**：玩家"名字进去了、人没进来"时，服务端在判定卡住的当下把本端调试文件尾部写成现场，并主动向该客户端索取它自己的日志尾部，落成 `plugins/Miku-ZSTD/logs/stall/<玩家>-<时间>/`（`server.log` + `client.log.gz` + `session.txt`）。不需要玩家知道文件在哪，也不需要他放弃重连后才想起来取证。注意 `server.log` / `client.log.gz` 依赖 `logging.debug`：默认关闭时现场只有 `session.txt` 的连接事实。
 - 代理上 `/mikuzstd bar` 对后端同名命令的遮蔽：具备代理权限时在代理执行，否则已连接后端的玩家交由后端鉴权。
 - 关闭后端原版压缩时，仍保留 `/mikuzstd bar` 的执行与补全。
-- 6.1.1 把协商应答等待从写死的 3 秒（Paper）/ 2 秒（Velocity）改为可配置的 `login.answer_timeout_ms`（默认 10 秒），超时改为<b>先回落原版</b>而不是直接断开连接；客户端补上压缩管线看门狗，未观察到 SetCompression 时按原版应答，不再无限期等待。协商与激活的逐连接诊断统一写进调试文件（默认开启，单文件 8 MiB、保留 2 份历史），控制台只留启用/停用、激活成功与真正的告警。
+- 6.1.2 把协商应答等待从写死的 3 秒（Paper）/ 2 秒（Velocity）改为可配置的 `login.answer_timeout_ms`（默认 10 秒），超时改为<b>先回落原版</b>而不是直接断开连接；客户端补上压缩管线看门狗，未观察到 SetCompression 时按原版应答，不再无限期等待。协商与激活的逐连接诊断统一写进调试文件（默认关闭，打开后单文件 8 MiB、保留 2 份历史），控制台只留启用/停用、激活成功与真正的告警。
 - 6.1.0 新增分段耗时（`latency`）、往返探测（`ping`）与精确字节计数（`traffic`）三个诊断命令；`batch_max_packets` 默认提高到 256，新增默认关闭的 `batch_max_bytes` 字节预算。
 - 6.0.4 修复 Fabric + Krypton 在协商应答早于 SetCompression 时发出未封装登录包的问题；使用 FRP 转发仍可保持 `transport.useCompression=true`。
 - 6.0.2 起不再设置小包直存阈值，所有接管后的下行包都进入连续压缩流；旧协商协议的客户端协商不匹配时保持原版。
@@ -28,7 +28,7 @@
 | 客户端 | Minecraft 26.2 + Fabric | 当前构建使用 Fabric Loader 0.19.5、Fabric API 0.160.0+26.2 |
 | 代理 | Velocity 4.x | 当前真实服务器登录回归使用 4.3.1 |
 | 直连服务端 | Paper / Folia 26.2 | 当前构建基于 Paper 26.2；真实服务器登录回归使用 Paper 26.2 |
-| 配套文件 | Miku-ZSTD 服务端插件与 Fabric 模组 | 建议服务端与 Fabric 客户端统一使用 6.1.1；旧协议客户端协商不匹配时保持原版 |
+| 配套文件 | Miku-ZSTD 服务端插件与 Fabric 模组 | 建议服务端与 Fabric 客户端统一使用 6.1.2；旧协议客户端协商不匹配时保持原版 |
 
 以上是当前构建与回归基线，不代表其他游戏或代理版本已经逐一验证。
 
@@ -38,8 +38,8 @@
 
 | 场景 | 安装位置 | 监控范围 |
 |---|---|---|
-| 玩家通过 Velocity 进服 | 代理安装 `Miku-ZSTD-6.1.1-Velocity.jar`，玩家安装 Fabric 产物 | 代理实例处理的玩家下行连接 |
-| 玩家直连 Paper / Folia | 服务端安装 `Miku-ZSTD-6.1.1-Paper.jar`，玩家安装 Fabric 产物 | 该服务端实例处理的下行连接 |
+| 玩家通过 Velocity 进服 | 代理安装 `Miku-ZSTD-6.1.2-Velocity.jar`，玩家安装 Fabric 产物 | 代理实例处理的玩家下行连接 |
+| 玩家直连 Paper / Folia | 服务端安装 `Miku-ZSTD-6.1.2-Paper.jar`，玩家安装 Fabric 产物 | 该服务端实例处理的下行连接 |
 | 代理与后端均安装插件 | 按各自用途安装，分别配置与授权 | 两端统计独立，后端面板不会自动汇总代理的玩家出口 |
 
 代理架构只需代理插件与客户端模组即可覆盖玩家侧链路；后端 Paper 插件属于独立安装项。
@@ -56,7 +56,7 @@ Paper / Folia 将原版压缩阈值设为 `-1` 时，只关闭本端压缩接管
 ### 客户端
 
 1. 安装与 Minecraft 26.2 对应的 Fabric Loader、Fabric API。
-2. 将 `Miku-ZSTD-6.1.1-Fabric.jar` 放进该游戏实例的 `mods/`。
+2. 将 `Miku-ZSTD-6.1.2-Fabric.jar` 放进该游戏实例的 `mods/`。
 3. 首次启动生成 `<游戏目录>/Miku-ZSTD/config.yml`，同时开始写调试日志 `<游戏目录>/Miku-ZSTD/logs/zstd-debug.log`。进入游戏后按 **F8** 切换下行统计 HUD，按键切换只在本次运行期间生效。
 4. 连不上服务器（一直停在连接中）时，退出游戏后把上面那个 `zstd-debug.log` 发出来即可——协商、看门狗、切换确认的每一步都在里面，不需要再去翻 `latest.log`。
 
@@ -113,7 +113,7 @@ diagnostics:
 | `login.answer_timeout_ms` | `10000` | 等客户端协商应答的预算，范围 1000–120000 毫秒。超时后本端回落原版并照常放行登录（只影响这一轮是否走 zstd）；必须明显大于客户端模组的 2000ms 看门狗 |
 | `login.late_answer_window_ms` | `120000` | 协商定案后继续吞掉迟到应答的窗口，范围 5000–600000 毫秒（Velocity 端无此项）。窗口要盖住整个登录 + 配置阶段，否则玩家在资源包下载期间停留过久会被判为意外的查询应答而断连 |
 | `bossbar.format` | 示例所示 | 当前实例监控文本，支持 `&` 颜色代码 |
-| `logging.debug` | `true` | 调试日志总开关。设为 `false` 后不建文件、不写任何调试行，`/mikuzstd status` 显示关闭；代价是一旦玩家卡住，取证现场里只剩 `session.txt` 的连接事实 |
+| `logging.debug` | `false` | 调试日志总开关。**默认关闭**：打开后才有逐连接诊断；关闭时不建文件、不写任何调试行，`/mikuzstd status` 显示关闭，卡住取证的现场也只剩 `session.txt` 的连接事实 |
 | `logging.file` | `logs/zstd-debug.log` | 调试文件路径，相对各自数据目录；客户端相对游戏目录，默认 `Miku-ZSTD/logs/zstd-debug.log` |
 | `logging.max_file_mb` | `8` | 单文件上限，范围 1–128 MiB；超过即滚动为 `.1`、`.2` |
 | `logging.keep_files` | `2` | 保留的历史份数，范围 0–10；`0` 表示只保留当前文件（写满即截断） |
@@ -121,7 +121,7 @@ diagnostics:
 | `logging.profiler` | `false` | Velocity 带宽剖析（每 60 秒一段，写进调试文件）；Paper 端无此项 |
 | `diagnostics.enabled` | `true` | 卡住会话自动取证总开关。关掉它，玩家再卡住时只有各端调试文件可查，抓不到卡住那一侧的现场 |
 | `diagnostics.stall_detect_ms` | `15000` | 判定"卡住"的阈值，范围 5000–120000 毫秒；计时从协商查询**发出**那一刻算起。调小会更灵敏，也会把慢机器当卡住 |
-| `diagnostics.pull_client_log` | `true` | 卡住时向客户端索取它自己的调试日志尾部。客户端 6.1.1+ 才会应答 |
+| `diagnostics.pull_client_log` | `true` | 卡住时向客户端索取它自己的调试日志尾部。客户端 6.1.2+ 才会应答，且客户端也要打开 `logging.debug` 才有内容 |
 | `diagnostics.preflight` | `true` | 协商成功后 3 秒先取一次"上一轮尾巴"。客户端已经卡死时本次查询读不到东西，靠它把上一次的痕迹带上来 |
 | `diagnostics.max_kb` | `256` | 单次取尾部的上限（KiB，16–1024），同时是本端接受上限；解压另有 4 MiB 硬顶 |
 | `diagnostics.keep_bundles` | `20` | 保留的现场组数（1–100），超出按时间删最旧 |
@@ -130,9 +130,9 @@ BossBar 占位符：`%players%` 为使用 zstd 通道的人数，`%raw%` 为原�
 
 **升级已有配置：** 旧项 `compression.skip_compress_below_bytes` 已不生效，无需手动删除也不会改变连续压缩行为。已有文件保留原文、注释及未知旧键，不会被重写；新模板不再生成该项。
 
-`logging.debug` 是调试日志的**总开关，默认 `true`**：不写这个键也照样有日志，写 `false` 就不建文件、不写任何调试行，`/mikuzstd status` 会显示 `关闭（logging.debug=false，或本端打开失败——启动日志里有 WARN）`。关掉是允许的，但要把代价看清：定位"卡在连接协商中"那种现场，靠的就是这个文件，关掉之后卡住取证的 `server.log` 会是空的（`session.txt` 里仍有 txId、应答是否收到、是否已激活这三项，够判断是传输层没答还是客户端本地卡死，但看不到逐包时间线）。Velocity 上改完 `/mikuzstd reload` 立即生效；Paper 需要重启服。旧配置里原本就写着 `debug: false` 的，现在会**真的关掉**——如果之前是为了少写盘而关的，建议改回 `true`。想连控制台一起看，再加 `console_debug: true`。
+`logging.debug` 是调试日志的**总开关，默认 `false`**：日志是排查工具，不是常驻开销，所以开箱不写盘。要查问题时改成 `true` 再复现一次，`/mikuzstd status` 会显示 `调试日志：开启 → <路径>（大小，已写行数，丢弃行数）`；关闭状态下显示 `关闭（logging.debug=false，或本端打开失败——启动日志里有 WARN）`。打开后定位"卡在连接协商中"靠的就是这个文件，而关闭时卡住取证的 `server.log` 会是空的（`session.txt` 里仍有 txId、应答是否收到、是否已激活这三项，够判断是传输层没答还是客户端本地卡死，但看不到逐包时间线）。Velocity 上改完 `/mikuzstd reload` 立即生效；Paper 需要重启服。想连控制台一起看，再加 `console_debug: true`。
 
-缺少 `login.answer_timeout_ms` / `login.late_answer_window_ms` 时取代码内默认值（10 秒 / 120 秒），不需要手动补键。`logging` 段的 `file` / `max_file_mb` / `keep_files` 缺省即用上表默认值，同样不需要补键。
+缺少 `login.answer_timeout_ms` / `login.late_answer_window_ms` 时取代码内默认值（10 秒 / 120 秒），不需要手动补键。`logging` 段的 `debug` / `file` / `max_file_mb` / `keep_files` 缺省即用上表默认值（`debug` 缺省为关闭），同样不需要补键。
 
 ### 修改后如何生效
 
@@ -147,7 +147,7 @@ display:
   hud_enabled: false
 
 logging:
-  debug: true
+  debug: false
   file: "Miku-ZSTD/logs/zstd-debug.log"
   max_file_mb: 8
   keep_files: 2
@@ -159,7 +159,7 @@ diagnostics:
 
 `display.hud_enabled` 决定启动后的 HUD 默认状态。F8 仅临时切换显示，不写回配置；HUD 只显示下行，不统计原版上行。
 
-`logging` 段决定客户端调试日志：`debug` 默认 `true`，设成 `false` 就不建文件、不写调试行（改完需重启游戏）；路径相对游戏目录，超过 `max_file_mb` 会滚动并保留 `keep_files` 份历史。关掉客户端日志后，服务端的取证查询只会收到"没有日志"，不会有任何报错。客户端没有 `console_debug` / `profiler` 两项——游戏里没有需要清屏的控制台；`latest.log` 只会多出一行指路信息。
+`logging` 段决定客户端调试日志：`debug` **默认 `false`**，连不上服时改成 `true` 再复现一次（改完需重启游戏）；打开后路径相对游戏目录，超过 `max_file_mb` 会滚动并保留 `keep_files` 份历史。默认关闭状态下，服务端的取证查询只会收到"没有日志"，不会有任何报错。客户端没有 `console_debug` / `profiler` 两项——游戏里没有需要清屏的控制台；打开客户端日志时 `latest.log` 会多出一行指路信息。
 
 `diagnostics.send_client_log` 决定要不要应答服务端的取证查询：服务端发现你卡在"连接协商中"时，会向你索取上面那个调试文件的**尾部**（最多 `max_kb`），只发这一份文件的内容，不含聊天记录、不含账号信息。默认开着——真卡住的时候，玩家没法自己去翻文件、更不知道该发什么，而这份尾巴正是唯一能说明问题的东西。
 
@@ -204,7 +204,7 @@ OP 属于后端权限。没有代理节点且已连接后端的玩家会把 `bar
 
 ### 调试日志在哪里？出问题要发什么？
 
-三端各有一份，默认开启（`logging.debug`，可关闭），都在自己的目录里：
+三端各有一份，**默认不写**——先把自己那一端（或玩家那一端）的 `logging.debug` 改成 `true` 再复现一次，文件才会出现在各自目录里：
 
 | 端 | 路径 |
 |---|---|
@@ -212,11 +212,11 @@ OP 属于后端权限。没有代理节点且已连接后端的玩家会把 `bar
 | Velocity | `plugins/Miku-ZSTD/logs/zstd-debug.log` |
 | Fabric 客户端 | `<游戏目录>/Miku-ZSTD/logs/zstd-debug.log` |
 
-玩家进不去服时，让他把客户端那一份发出来；服主再把服务端/代理的同名文件一起给出，两边的协商时间线一对就能定位是"查询没发出去""应答没回来"还是"客户端拒绝/版本不匹配"。
+玩家进不去服时，让他把客户端配置里的 `logging.debug` 改成 `true`、重启游戏、复现一次，再把客户端那一份发出来；服主同时打开服务端/代理那一端，两边的协商时间线一对就能定位是"查询没发出去""应答没回来"还是"客户端拒绝/版本不匹配"。
 
 如果玩家卡在"连接协商中"（名字进去了、人没进来），服务端会自己动手，见下一节：多数情况下不需要再找玩家要文件。文件带硬上界（默认 8 MiB × 3），不会写爆磁盘；写过的内容不会进控制台，所以控制台不会因此变吵。
 
-路径与上限由 `logging.file`、`logging.max_file_mb`、`logging.keep_files` 控制；`/mikuzstd status` 会显示当前实际路径与大小。要彻底不写日志，把 `logging.debug` 设为 `false`（Velocity 改完 `/mikuzstd reload`，Paper 需重启）；磁盘不可写时会降级为不写并打一条 WARN。想连控制台一起看，把 `logging.console_debug` 设为 `true`。
+路径与上限由 `logging.file`、`logging.max_file_mb`、`logging.keep_files` 控制；`/mikuzstd status` 会显示开关状态、当前实际路径与大小。打开/关闭都是 `logging.debug`（Velocity 改完 `/mikuzstd reload` 即时生效，Paper 与客户端需重启）；磁盘不可写时会降级为不写并打一条 WARN。想连控制台一起看，把 `logging.console_debug` 设为 `true`。
 
 ### 卡住的时候，插件会自动收上来什么？
 
@@ -229,9 +229,11 @@ OP 属于后端权限。没有代理节点且已连接后端的玩家会把 `bar
 
 | 文件 | 内容 |
 |---|---|
-| `server.log` | 判定卡住时本端调试文件的尾部（默认 256 KiB） |
-| `client.log.gz` | 客户端回传的调试日志尾部（gzip 原样，`gunzip` 后是纯文本） |
-| `session.txt` | 判定模式（卡住探针 / 预取）、远端地址、协商各阶段状态、回传大小与解压后大小 |
+| `server.log` | 判定卡住时本端调试文件的尾部（默认 256 KiB）。**`logging.debug` 关闭时为空** |
+| `client.log.gz` | 客户端回传的调试日志尾部（gzip 原样，`gunzip` 后是纯文本）。客户端 `logging.debug` 关闭时不生成 |
+| `session.txt` | 判定模式（卡住探针 / 预取）、远端地址、协商各阶段状态、本端调试日志开关状态、回传大小与解压后大小 |
+
+**默认配置下真正有内容的只有 `session.txt`**——6.1.2 起 `logging.debug` 默认关闭，此时 `server.log` 是空文件、`client.log.gz` 不会生成。想拿到完整时间线，就在复现前把服务端与客户端的开关都打开；只想知道"卡在哪一侧"，`session.txt` 里那三项（协商 txId、应答是否收到、是否已激活）已经够了。
 
 判定阈值默认 15 秒，从协商查询**发出**那一刻算起——不是从连接建立算起，否则慢机器进服时握手多花几秒就会被误判。已经进服的连接立即退出判定，所以正常玩家不会产生目录。
 
@@ -239,8 +241,8 @@ OP 属于后端权限。没有代理节点且已连接后端的玩家会把 `bar
 
 这条链路的边界要清楚：
 
-- 只有服务端能发起（登录阶段客户端不能主动发消息），所以必须有一端装着 6.1.1+ 的插件；
-- 客户端 6.1.0 及更早版本不认识这个通道，回的是"未回传"——现场里照样有 `server.log`，只是没有 `client.log.gz`；
+- 只有服务端能发起（登录阶段客户端不能主动发消息），所以必须有一端装着 6.1.2+ 的插件；
+- 客户端 6.1.0 及更早版本不认识这个通道，回的是"未回传"——现场里照样有 `session.txt`，只是没有 `client.log.gz`；
 - 客户端把 `diagnostics.send_client_log` 关掉时同理；
 - 一条连接最多被问两次（预取一次、判定卡住一次），查询本身也走登录通道，不新增端口或常驻连接。
 

@@ -246,8 +246,8 @@ public class MikuZstdPaper extends JavaPlugin {
      * <p>顺序很重要：配置一读完就建通道，后面挂钩、注入、协商的诊断才有地方落。
      * 通道建立失败（目录只读、磁盘满）只降级为"不写文件"，功能照旧。</p>
      *
-     * <p>由 {@code logging.debug} 决定（默认开启）：关掉后不建文件，卡住取证的
-     * {@code server.log} 会空着，所以关闭时启动日志里会明确提醒一句。</p>
+     * <p>由 {@code logging.debug} 决定（默认关闭）：只有显式打开才建文件，打开失败
+     * （目录只读、磁盘满）会打一条 WARN 并降级为不写，功能照旧。</p>
      *
      * <p>控制台口径由 {@code logging.console_debug} 单独决定：为 true 时才把同一批行镜像进
      * 控制台（沿用 log4j2 反射把 logger 调到 DEBUG，失败则退回 INFO 直写）。</p>
@@ -260,10 +260,6 @@ public class MikuZstdPaper extends JavaPlugin {
                 cfg.debugMaxFileMb << 20,
                 cfg.debugKeepFiles,
                 cfg.consoleDebug ? line -> LOGGER.debug("{}", line) : null);
-        if (!cfg.debug) {
-            LOGGER.info("[Zstd] 调试日志已关闭（logging.debug=false）：出问题将没有日志文件可查，"
-                    + "卡住取证也只有 session.txt 的连接事实");
-        }
         if (ZstdDebugLog.file() != null) {
             Map<String, String> facts = new LinkedHashMap<>();
             facts.put("compression", "level=" + cfg.level + " window_log=" + cfg.windowLog
@@ -271,7 +267,7 @@ public class MikuZstdPaper extends JavaPlugin {
                     + cfg.batchMaxPackets + "packets/" + cfg.batchMaxBytes + "bytes");
             facts.put("login", "answer_timeout_ms=" + cfg.answerTimeoutMs
                     + " late_answer_window_ms=" + cfg.lateAnswerWindowMs);
-            facts.put("logging", "debug=" + cfg.debug + " console_debug=" + cfg.consoleDebug
+            facts.put("logging", "console_debug=" + cfg.consoleDebug
                     + " max_file_mb=" + cfg.debugMaxFileMb + " keep_files=" + cfg.debugKeepFiles);
             facts.put("world", "online_mode 与 network-compression-threshold 见 status 子命令");
             ZstdDebugLog.sessionHeader(getPluginMeta().getVersion(), platformName(), facts);

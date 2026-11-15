@@ -52,8 +52,8 @@ public final class MikuZstd {
      * <p>放在配置读完之后、任何网络逻辑之前：协商、看门狗、切换确认的诊断才有地方落。
      * 打开失败（目录只读、磁盘满）只降级为"不写文件"，游戏照常进出服。</p>
      *
-     * <p>由 {@code logging.debug} 决定（默认开启）：关掉后不建文件，服务端的取证查询
-     * 只会收到"没有日志"；改完需要重启游戏生效。</p>
+     * <p>由 {@code logging.debug} 决定（默认关闭）：打开才建文件，服务端的取证查询
+     * 才有内容可回传；改完需要重启游戏生效。</p>
      */
     private static void initDebugLog() {
         ZstdConfig cfg = ZstdConfig.INSTANCE;
@@ -63,10 +63,6 @@ public final class MikuZstd {
                 cfg.debugMaxFileMb << 20,
                 cfg.debugKeepFiles,
                 null);
-        if (!cfg.debug) {
-            LOGGER.info("[Zstd] 调试日志已关闭（logging.debug=false）：连不上服时将没有文件可发，"
-                    + "服务端也拿不到你的日志");
-        }
         if (ZstdDebugLog.file() != null) {
             Map<String, String> facts = new LinkedHashMap<>();
             facts.put("hud_enabled", String.valueOf(cfg.hudEnabled));
