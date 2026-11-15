@@ -5,6 +5,7 @@ import io.netty.channel.Channel;
 import io.netty.channel.ChannelId;
 import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import java.io.IOException;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -149,8 +150,14 @@ public final class ZstdPaperDiag {
         }
     }
 
-    /** 由 {@code AsyncPlayerPreLoginEvent} 记录名字与地址的对应关系（卡住时才知道是谁）。 */
-    public static void onPreLogin(String name, InetSocketAddress address) {
+    /**
+     * 由 {@code AsyncPlayerPreLoginEvent} 记录名字与地址的对应关系（卡住时才知道是谁）。
+     *
+     * <p>⚠️ 这里收 {@link InetAddress} 而不是 {@link InetSocketAddress}：该事件给的是
+     * 纯地址（没有端口），而 {@code PlayerJoinEvent} 与连接层拿到的是带端口的 socket 地址。
+     * 两者归一化到"主机地址字符串"才能对上号——端口在登录链路上每连接都不同，不能参与匹配。</p>
+     */
+    public static void onPreLogin(String name, InetAddress address) {
         if (!enabled || name == null || address == null) {
             return;
         }
@@ -409,9 +416,14 @@ public final class ZstdPaperDiag {
         return "unknown";
     }
 
+    /** 归一化到主机地址：登录事件给 {@link InetAddress}，连接/进服给 {@link InetSocketAddress}。 */
     private static String hostOf(Object address) {
-        if (address instanceof InetSocketAddress socket && socket.getAddress() != null) {
-            return socket.getAddress().getHostAddress();
+        if (address instanceof InetSocketAddress socket) {
+            InetAddress resolved = socket.getAddress();
+            return resolved == null ? socket.getHostString() : resolved.getHostAddress();
+        }
+        if (address instanceof InetAddress ip) {
+            return ip.getHostAddress();
         }
         return null;
     }
