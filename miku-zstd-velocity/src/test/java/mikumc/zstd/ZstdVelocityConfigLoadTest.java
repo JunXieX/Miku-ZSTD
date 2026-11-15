@@ -19,6 +19,7 @@ import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class ZstdVelocityConfigLoadTest {
@@ -67,6 +68,14 @@ class ZstdVelocityConfigLoadTest {
             assertEquals("logs/zstd-debug.log", logging.get("file"));
             assertEquals(8, ((Number) logging.get("max_file_mb")).intValue());
             assertEquals(2, ((Number) logging.get("keep_files")).intValue());
+            Map<?, ?> diagnostics = (Map<?, ?>) generated.get("diagnostics");
+            assertNotNull(diagnostics, "模板应生成 diagnostics 段");
+            assertEquals(Boolean.TRUE, diagnostics.get("enabled"));
+            assertEquals(15000, ((Number) diagnostics.get("stall_detect_ms")).intValue());
+            assertEquals(Boolean.TRUE, diagnostics.get("pull_client_log"));
+            assertEquals(Boolean.TRUE, diagnostics.get("preflight"));
+            assertEquals(256, ((Number) diagnostics.get("max_kb")).intValue());
+            assertEquals(20, ((Number) diagnostics.get("keep_bundles")).intValue());
         }
         String generated = Files.readString(file, StandardCharsets.UTF_8);
         assertFalse(generated.contains("skip_compress_below_bytes"), "新模板不再生成旧直存阈值");

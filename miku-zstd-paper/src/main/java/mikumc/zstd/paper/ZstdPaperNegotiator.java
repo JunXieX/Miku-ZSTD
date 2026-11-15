@@ -129,9 +129,20 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
                 // 诊断应答（预取/卡住探针）与协商应答一样，绝不能漏给原版登录监听器：
                 // 它不认识这两个 txId，会把"卡住但还有救"的连接直接按 unexpected query response 断开。
                 if (m != null && m.isDiagTxId(answerTx)) {
-                    byte[] diagPayload = readBytes(msg, "data", "payload", "contents");
+                    // ⚠️ 取证链路上的任何异常都不能冒泡：channelRead 抛出会走 exceptionCaught，
+                    // 默认行为是记一条日志再关连接 —— 诊断自己把"还有救"的连接关掉，是最糟的结果。
+                    byte[] diagPayload = null;
+                    try {
+                        diagPayload = readBytes(msg, "data", "payload", "contents");
+                    } catch (Throwable t) {
+                        ZstdDebugLog.d("[Zstd] diag 应答读取失败（忽略）: {}", t.toString());
+                    }
                     io.netty.util.ReferenceCountUtil.release(msg);
-                    ZstdPaperDiag.onAnswer(ctx.channel(), answerTx, diagPayload);
+                    try {
+                        ZstdPaperDiag.onAnswer(ctx.channel(), answerTx, diagPayload);
+                    } catch (Throwable t) {
+                        ZstdDebugLog.d("[Zstd] diag 应答处理失败（忽略）: {}", t.toString());
+                    }
                     return;
                 }
                 if (m != null && (answerTx == m.getNegotiateTxId()
@@ -192,9 +203,18 @@ public class ZstdPaperNegotiator extends ChannelDuplexHandler {
             if (cn.contains("Query") || cn.contains("Plugin")) {
                 int tx = readInt(msg, "transactionId", "id", "transactionID");
                 if (tx != 0 && mgr.isDiagTxId(tx)) {
-                    byte[] diagPayload = readBytes(msg, "data", "payload", "contents");
+                    byte[] diagPayload = null;
+                    try {
+                        diagPayload = readBytes(msg, "data", "payload", "contents");
+                    } catch (Throwable t) {
+                        ZstdDebugLog.d("[Zstd] diag 应答读取失败（忽略）: {}", t.toString());
+                    }
                     io.netty.util.ReferenceCountUtil.release(msg);
-                    ZstdPaperDiag.onAnswer(ctx.channel(), tx, diagPayload);
+                    try {
+                        ZstdPaperDiag.onAnswer(ctx.channel(), tx, diagPayload);
+                    } catch (Throwable t) {
+                        ZstdDebugLog.d("[Zstd] diag 应答处理失败（忽略）: {}", t.toString());
+                    }
                     return;
                 }
                 if (tx != 0 && tx == mgr.getNegotiateTxId()) {

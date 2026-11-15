@@ -708,10 +708,18 @@ jobs:
           # （ZstdSwitchGate.RELEASE_TIMEOUT_MS），到点照常放行、登录完成，幽灵会自愈。
           deadline = time.time() + 40
           while time.time() < deadline:
-              ln = rv(sock)
-              body = recvn(sock, ln)
+              try:
+                  ln = rv(sock)
+                  body = recvn(sock, ln)
+              except EOFError:
+                  # 服务端没发断开包就直接关了连接：这不是我们发起的，必须留证据。
+                  print("  EOF without disconnect packet (server closed the socket)")
+                  disconnected = True
+                  break
               packet = vanilla_packet(body, threshold)
               pid, pos = dv(packet, 0)
+              if pid != 0x04:
+                  print("  rx pid=0x%02x len=%d" % (pid, len(packet)))
               if pid == 0x03:
                   threshold, _ = dv(packet, pos)
                   print("  SetCompression threshold=%d" % threshold)
@@ -737,6 +745,9 @@ jobs:
                       send(sock, varint(0x02) + varint(tx) + b"\x01" + answer, threshold)
                       diag_answered += 1
                       print("  diag answered mode=%d payload=%dB raw=%dB" % (mode, len(packed), len(FAKE_LOG)))
+                      # 拿到探针就够了：再读下去会撞上原版 30 秒登录超时（"Took too long to log in"），
+                      # 那条断开包还会被协商器的扣包窗口吃掉，客户端只能看到 EOF。
+                      break
                   else:
                       send(sock, varint(0x02) + varint(tx) + b"\x00", threshold)
               elif pid == 0x00:
@@ -773,9 +784,16 @@ jobs:
           sys.exit(0 if ok else 1)
           PY
       - name: Verify bundle on disk
+        if: always()
         run: |
           set -euo pipefail
           cd server
+          echo "----- server.log tail -----"
+          tail -60 server.log || true
+          echo "----- plugin data dir -----"
+          ls -R plugins/Miku-ZSTD || true
+          echo "----- debug log tail -----"
+          tail -40 plugins/Miku-ZSTD/logs/zstd-debug.log 2>/dev/null || true
           echo "----- stall bundles -----"
           ls -R plugins/Miku-ZSTD/logs/stall || true
           test -f plugins/Miku-ZSTD/logs/zstd-debug.log || { echo "调试文件没有生成"; exit 1; }
